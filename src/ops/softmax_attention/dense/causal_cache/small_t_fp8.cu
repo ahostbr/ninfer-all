@@ -47,7 +47,7 @@ void launch_fp8_partial(const Tensor& q, CacheInput input, const Tensor& positio
             constexpr int MinBlocks = TokenTile == 1 ? 2 : 1;
             // k_fp8(Bc*D) + k_b16(2*Bc*D) + v_fp8(Bc*D) + v_f16(2*Bc*D) = 6*Bc*D bytes; a compact
             // stage widens V into k_b16 (kCausalSmallTCompactKV), 4*Bc*D bytes.
-            constexpr std::size_t DynamicBytes =
+            static constexpr std::size_t DynamicBytes =
                 (kCausalSmallTCompactKV<RowTiles, KeyBlock, 6 * KeyBlock * kCausalHeadDim,
                                         TuringShapes>
                      ? 4u

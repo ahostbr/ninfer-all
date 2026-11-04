@@ -536,7 +536,8 @@ void draft_confidence_test(const char* artifact) {
                         const auto& record = *found;
                         std::cout << " at " << record.logprob << ", speculative " << expected[j][at]
                                   << " at ";
-                        const auto* top = std::find(record.top_ids.begin(), record.top_ids.end(),
+                        // Fork change W3: std::array iterators are not pointers under MSVC.
+                        const auto top = std::find(record.top_ids.begin(), record.top_ids.end(),
                                                     expected[j][at]);
                         if (top == record.top_ids.end()) {
                             std::cout << "none of the top " << record.top_ids.size();

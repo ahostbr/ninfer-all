@@ -514,7 +514,9 @@ void causal_attention_small_t_load_modules(std::int32_t q_heads, std::int32_t kv
     // One unit per width, geometry and input holds every INT8-family storage
     // (small_t_i8_w<N>_h<H>_<input>.cu), so a unit's module serves them all.
     with_causal_geometry(q_heads, kv_heads, [&]<typename Geometry>() {
-        constexpr int kWidest  = Geometry::ModelQHeads == 24 ? 8 : 6;
+        // Fork change W2 (docs/fork/WINDOWS_PORT.md): MSVC C3495 rejects the nested lambdas that use a local
+        // constexpr; a static one is not captured.
+        static constexpr int kWidest = Geometry::ModelQHeads == 24 ? 8 : 6;
         const auto load_widths = [&]<typename CacheInput>(std::int32_t last) {
             CausalSmallTInvocation invocation{};
             invocation.load_module_only = true;

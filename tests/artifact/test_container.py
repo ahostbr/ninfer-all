@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import struct
 
@@ -219,3 +220,29 @@ def test_an_artifact_is_one_file_unless_a_limit_splits_it():
     assert same_start == start and len(directory.files) == 1
     with pytest.raises(ArtifactError):
         layout_directory("small.ninfer", description, 1 << 64)
+
+
+def test_extending_without_a_zero_fill_writes_the_same_artifact(tmp_path, monkeypatch):
+    """`extend` (SetEndOfFile on Windows) leaves the same bytes as `os.ftruncate`."""
+    from uuid import UUID
+
+    from tools.artifact import writer as writer_module
+
+    monkeypatch.setattr(writer_module, "uuid4", lambda: UUID(int=7))
+    for part in ("extend", "ftruncate"):
+        if part == "ftruncate":
+            monkeypatch.setattr(writer_module, "extend", os.ftruncate)
+        _small(tmp_path / f"{part}.ninfer")
+    assert (tmp_path / "extend.ninfer").read_bytes() == (tmp_path / "ftruncate.ninfer").read_bytes()
+
+    # a file extended past what is written reads zeros and has the asked length
+    fd = os.open(tmp_path / "grown", os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0))
+    try:
+        from tools.artifact.file_io import extend
+
+        extend(fd, 1 << 20)
+        assert os.fstat(fd).st_size == 1 << 20
+        os.lseek(fd, 1 << 19, os.SEEK_SET)
+        assert os.read(fd, 4) == b"\0\0\0\0"
+    finally:
+        os.close(fd)

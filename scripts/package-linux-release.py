@@ -231,15 +231,12 @@ def main():
     for source, destination in (
         (repo / 'LICENSE', 'LICENSE'),
         (repo / 'docs/release-archive-linux.md', 'README.md'),
-        (repo / 'scripts/run.sh', 'run.sh'), (repo / 'scripts/download-model.sh', 'download-model.sh'),
+        (repo / 'scripts/run.sh', 'run.sh'),
     ):
         shutil.copy2(source, package / destination)
     distro = dict(line.split('=', 1) for line in Path('/etc/os-release').read_text().splitlines()
                   if '=' in line)
-    if distro.get('ID', '').strip('"') == 'debian' and distro.get('VERSION_ID', '').strip('"') == '13':
-        shutil.copy2(repo / 'docker/entrypoint.sh', package / 'entrypoint.sh')
-        dockerfile = (repo / 'docker/release.Dockerfile').read_text()
-        (package / 'Dockerfile').write_text(dockerfile.replace('cuda>=13.0', f"cuda>={cuda.split('.')[0]}.0"))
+    # Fork cut N19: docker/ is removed, so no entrypoint or Dockerfile is packaged.
     patch_note = cuda_root / 'ninfer-toolchain-patches.txt'
     patches = patch_note.read_text() if patch_note.exists() else ''
     info = dict(toolchain_patches=patches, source_revision=revision, modified_sources=modified, version=version,

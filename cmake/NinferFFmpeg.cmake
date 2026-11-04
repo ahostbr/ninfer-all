@@ -10,13 +10,13 @@ include(${CMAKE_CURRENT_LIST_DIR}/MediaSources.cmake)
 # --exclude-libs, so these symbols stay inside it. Windows builds take vcpkg's FFmpeg DLLs
 # (cmake/FindFFMPEG.cmake).
 set(NINFER_MEDIA_SOURCES_DIR "${PROJECT_SOURCE_DIR}/third_party/media-sources" CACHE PATH
-    "Directory with the FFmpeg and dav1d release archives (scripts/fetch-media-sources.sh)")
+    "Directory with the FFmpeg and dav1d release archives (fork cut N02: place the archives by hand)")
 foreach(_ninfer_source IN LISTS NINFER_MEDIA_SOURCES)
   if(NOT EXISTS "${NINFER_MEDIA_SOURCES_DIR}/${NINFER_${_ninfer_source}_ARCHIVE}")
     message(FATAL_ERROR
       "${NINFER_MEDIA_SOURCES_DIR}/${NINFER_${_ninfer_source}_ARCHIVE} is missing. Run "
-      "scripts/fetch-media-sources.sh, or set NINFER_MEDIA_SOURCES_DIR to a directory that holds "
-      "the archives cmake/MediaSources.cmake pins.")
+      "Place the archives by hand (fork cut N02: nothing downloads them), or set "
+      "NINFER_MEDIA_SOURCES_DIR to a directory that holds the archives cmake/MediaSources.cmake pins.")
   endif()
 endforeach()
 

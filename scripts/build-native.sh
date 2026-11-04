@@ -56,7 +56,7 @@ media_sources="${NINFER_MEDIA_SOURCES:-$PWD/third_party/media-sources}"
 
 case "${1:-}" in
   configure)
-    scripts/fetch-media-sources.sh "$media_sources"
+    # Fork cut N02: the media archives must already be in $media_sources; nothing is downloaded.
     cmake -S . -B "$build_dir" -G Ninja -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_CUDA_ARCHITECTURES="$arch" -DBUILD_TESTING="$tests" -DNINFER_MULTICALL="$multicall" \
       -DNINFER_MEDIA_SOURCES_DIR="$media_sources" \

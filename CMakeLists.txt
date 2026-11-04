@@ -172,11 +172,11 @@ endif()
 option(NINFER_DIRECTSTORAGE
        "On Windows, offer --disk-kv-directstorage: disk-tier restores through DirectStorage" OFF)
 if(WIN32 AND NINFER_DIRECTSTORAGE)
-  include(FetchContent)
-  FetchContent_Declare(directstorage
-    URL "https://www.nuget.org/api/v2/package/Microsoft.Direct3D.DirectStorage/1.3.0"
-    DOWNLOAD_NAME "directstorage.1.3.0.zip")
-  FetchContent_MakeAvailable(directstorage)
+  # Fork cut N01 (docs/fork/NETWORK_AUDIT.md): this block fetched the DirectStorage runtime from
+  # nuget.org at configure time. A build never downloads, so the option is refused.
+  message(FATAL_ERROR
+    "NINFER_DIRECTSTORAGE is disabled in this fork: it fetched the runtime from nuget.org at "
+    "configure time, and a build here never downloads anything")
   add_library(ninfer_directstorage INTERFACE)
   target_include_directories(ninfer_directstorage INTERFACE
     "${directstorage_SOURCE_DIR}/native/include")

@@ -1,16 +1,19 @@
-"""Named tensors of a Hugging Face safetensors release, read by byte range into one local file.
+"""Named tensors of a safetensors release, read by byte range from LOCAL files into one file.
+
+Fork cut N20 (docs/fork/NETWORK_AUDIT.md): upstream read these tensors from huggingface.co (the
+index, each shard's header and the matching bytes, by HTTP range requests, with HF_TOKEN). This build
+opens no connection: `main` reads a directory that already holds the release's index and shards.
 
 A converter source can need a few small tensors of a release whose shards it does not otherwise
 read, such as DeepSeek-V4.1's routing bias of image positions, one vector per block spread over
-43 of its 48 shards. This reads the release's index, each needed shard's header and the matching
-tensors' bytes, nothing else, and writes them, as stored, into one safetensors file:
+43 of its 48 shards. This reads the index, each needed shard's header and the matching tensors'
+bytes, nothing else, and writes them, as stored, into one safetensors file:
 
-    python -m tools.convert.fetch_tensors deepseek-ai/DeepSeek-V4.1-Flash-1017 \\
-        --revision 1bae0e1088993b9b82de08f59de5be5a34e42170 \\
+    python -m tools.convert.fetch_tensors RELEASE_DIR \\
         --match 'layers.*.ffn.gate.bias_vl' --out models/deepseek-v4.1/bias_vl.safetensors
 
-`--match` takes fnmatch patterns over the tensor names (repeatable). HF_TOKEN in the environment
-authorizes a gated repository; it is sent to huggingface.co only.
+`--match` takes fnmatch patterns over the tensor names (repeatable). The Coder GGUF carries the same
+bias as `blk.N.exp_probs_b_vl.bias`; tools/convert/bias_vl_from_gguf.py writes the file from that.
 """
 
 from __future__ import annotations
@@ -18,45 +21,21 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import json
-import os
 from pathlib import Path
 import struct
-import urllib.parse
-import urllib.request
 from typing import Callable
 
-ENDPOINT = "https://huggingface.co"
 INDEX = "model.safetensors.index.json"
 
 # read(file, begin, end) -> the file's bytes [begin, end)
 Reader = Callable[[str, int, int], bytes]
 
 
-class _NoAuthOnRedirect(urllib.request.HTTPRedirectHandler):
-    """The hub redirects file reads to its storage hosts: the token stays with the hub."""
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        new = super().redirect_request(req, fp, code, msg, headers, newurl)
-        if new is not None and urllib.parse.urlsplit(newurl).hostname != \
-                urllib.parse.urlsplit(req.full_url).hostname:
-            new.remove_header("Authorization")
-        return new
-
-
-def _hub_get(repo: str, revision: str, file: str, byte_range: tuple[int, int] | None = None):
-    url = f"{ENDPOINT}/{repo}/resolve/{urllib.parse.quote(revision)}/{urllib.parse.quote(file)}"
-    request = urllib.request.Request(url)
-    if byte_range is not None:
-        request.add_header("Range", f"bytes={byte_range[0]}-{byte_range[1] - 1}")
-    if os.environ.get("HF_TOKEN"):
-        request.add_header("Authorization", f"Bearer {os.environ['HF_TOKEN']}")
-    with urllib.request.build_opener(_NoAuthOnRedirect).open(request, timeout=120) as response:
-        return response.read()
-
-
-def hub_reader(repo: str, revision: str) -> Reader:
+def local_reader(directory: Path) -> Reader:
     def read(file: str, begin: int, end: int) -> bytes:
-        data = _hub_get(repo, revision, file, (begin, end))
+        with open(directory / file, "rb") as stream:
+            stream.seek(begin)
+            data = stream.read(end - begin)
         if len(data) != end - begin:
             raise OSError(f"{file}: asked for bytes {begin}..{end}, got {len(data)} bytes")
         return data
@@ -107,15 +86,13 @@ def write_safetensors(path: Path, tensors: dict[str, tuple[dict, bytes]],
 
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("repo")
-    parser.add_argument("--revision", required=True, help="the release's commit")
+    parser.add_argument("release_dir", type=Path, help="a directory with the index and the shards")
     parser.add_argument("--match", action="append", required=True, metavar="PATTERN")
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args(argv)
-    read = hub_reader(args.repo, args.revision)
-    index = json.loads(_hub_get(args.repo, args.revision, INDEX))
-    tensors = fetch(read, index, args.match)
-    write_safetensors(args.out, tensors, {"repo": args.repo, "revision": args.revision})
+    index = json.loads((args.release_dir / INDEX).read_text())
+    tensors = fetch(local_reader(args.release_dir), index, args.match)
+    write_safetensors(args.out, tensors, {"source": str(args.release_dir)})
     total = sum(len(data) for _, data in tensors.values())
     print(f"wrote {args.out}: {len(tensors)} tensors, {total} bytes", flush=True)
 

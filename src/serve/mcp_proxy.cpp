@@ -173,6 +173,11 @@ McpProxyRequest parse_mcp_proxy_target(const std::string& url) {
         host_part = host_part.substr(1, host_part.size() - 2);
     }
     if (host_part.empty()) { return reject("proxy target url has no host"); }
+    // Fork cut N11 (docs/fork/NETWORK_AUDIT.md): the relay reaches this PC only. The url comes from
+    // the browser page, so any other host would make this server a request forwarder for it.
+    if (host_part != "127.0.0.1" && host_part != "localhost" && host_part != "::1") {
+        return reject("proxy target must be 127.0.0.1, localhost or ::1: this build relays to this PC only");
+    }
 
     McpProxyRequest request;
     request.ok = true;

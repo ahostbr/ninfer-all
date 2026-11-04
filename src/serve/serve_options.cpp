@@ -512,7 +512,8 @@ std::string serve_usage_text(const char* argv0) {
            "                                choices:[]\n"
            "\n"
            "NETWORK & LIMITS\n"
-           "  --host H                      listen address (default 127.0.0.1)\n"
+           "  --host H                      listen address: 127.0.0.1, localhost or ::1\n"
+           "                                (default 127.0.0.1; this build listens on this PC only)\n"
            "  --port N                      listen port (default 8080)\n"
            "  --stats-port N                also serve /health, /stats, /v1/load and /metrics\n"
            "                                on port N with a worker of their own (default off)\n"
@@ -674,6 +675,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         // `else if` one block deeper and stops compiling at 128 (C1061).
         if (arg == "--host") {
             options.host = require_value("--host");
+            // Fork cut N30 (docs/fork/NETWORK_AUDIT.md): this build listens on this PC only.
+            if (options.host != "127.0.0.1" && options.host != "localhost" && options.host != "::1") {
+                throw std::invalid_argument(
+                    "--host must be 127.0.0.1, localhost or ::1: this build listens on this PC only");
+            }
             continue;
         }
         if (arg == "--port") {

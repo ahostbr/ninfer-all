@@ -77,6 +77,17 @@ if(NINFER_ARCH_BLACKWELL AND CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.1)
     "sm_120a kernels")
 endif()
 
+# cl 19.38 (toolset 14.38, VS 2022 17.8) constant-folds the overflow flag of core::wide_add
+# (src/core/wide_math.h) wrongly at /O2: (2^128 - 1) + 1 reports no overflow, and
+# ninfer_wide_math_test fails. cl 19.44 (toolset 14.44, the one docs/build-windows.md names) does not.
+# A plain vcvars64.bat of a VS 2022 install that also has 14.44 selects 14.38, so refuse it and name
+# the fix instead of building a tree whose arithmetic helpers are not trusted.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 19.40)
+  message(FATAL_ERROR
+    "MSVC ${CMAKE_CXX_COMPILER_VERSION} miscompiles core::wide_add; use toolset 14.44 or newer "
+    "(vcvars64.bat -vcvars_ver=14.44)")
+endif()
+
 # NINFER_SM8X_COMPAT gates every Ampere/early-Ada compatibility path. ninfer_ops also sets it
 # PUBLIC for its own consumers, but that link is PRIVATE through ninfer_engine, so apps and tests
 # would not otherwise see it. Defining it globally keeps a single consistent answer for every

@@ -1,6 +1,6 @@
 # Source releases of the media decoders that Linux builds link statically (cmake/NinferFFmpeg.cmake).
-# scripts/fetch-media-sources.sh downloads them and checks these digests; the build itself never
-# downloads anything. FFmpeg's archive is verified against the FFmpeg release signing key
+# Fork cut N02: nothing downloads them (scripts/fetch-media-sources.sh is removed); place the archives
+# by hand and the build checks these digests. The build itself never downloads anything. FFmpeg's archive is verified against the FFmpeg release signing key
 # FCF986EA15E6E293A5644F10B4322F04D67658D8 and dav1d's against the VideoLAN release signing key
 # 65F7C6B4206BD057A7EB73787180713BE58D1ADC before a digest is pinned here.
 #

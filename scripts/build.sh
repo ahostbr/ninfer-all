@@ -94,8 +94,8 @@ if (( benchmarks )); then benchmarks_option=ON; fi
 
 runtime=OFF
 if [[ "$package" == 1 ]]; then runtime=ON; fi
-# FFmpeg and dav1d are compiled from their pinned release archives (cmake/MediaSources.cmake).
-scripts/fetch-media-sources.sh
+# FFmpeg and dav1d are compiled from their pinned release archives (cmake/MediaSources.cmake),
+# which must already be in third_party/media-sources. Fork cut N02: nothing is downloaded.
 cmake -S . -B "$build_dir" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="$arch" -DNINFER_SHARED_RUNTIME="$runtime" \
       -DNINFER_BUILD_BENCHMARKS="$benchmarks_option"
 if [[ -n "$target" ]]; then

@@ -416,6 +416,40 @@ struct HybridExpertOptions {
     bool adaptive_cache = false;
     std::filesystem::path routing_profile; // initial per-layer expert counts for this artifact
     std::filesystem::path record_profile; // write accumulated counts at request boundaries
+
+    // DeepSeek-V4.1 only (T0833): experiments in how host or disk experts reach the GPU, each an
+    // A/B switch that is off by default; the NINFER_DS_* environment variable beside each (1|on|true
+    // or 0|off|false, an unsigned integer for the numbers) overrides the option.
+    //  - prefetch_ahead (NINFER_DS_PREFETCH_AHEAD): a wide prompt call queues the next block's
+    //    expert copies behind its own before it waits for them, and the executor names that block
+    //    from the pass's real order (the long-prompt skip changes it).
+    //  - cache_settle (NINFER_DS_CACHE_SETTLE): once a prompt is in, its routes feed the expert tier
+    //    and swap rounds run at once (for at most cache_settle_ms, NINFER_DS_CACHE_SETTLE_MS) instead
+    //    of over the first decode passes; and once the Engine idles after a request, for at most
+    //    cache_settle_idle_ms (NINFER_DS_CACHE_SETTLE_IDLE_MS).
+    //  - short_prompt (NINFER_DS_SHORT_PROMPT): a prompt of at most short_prompt_tokens new tokens
+    //    (NINFER_DS_SHORT_PROMPT_TOKENS) runs in rows of eight, which take a decode call's narrow
+    //    expert path (the cache and the CPU share) instead of the wide one.
+    //  - profile_weights (NINFER_DS_PROFILE_WEIGHTS): --expert-profile counts also give the expert
+    //    tier its starting counts, not only the cache its first contents.
+    bool deepseek_prefetch_ahead = false;
+    bool deepseek_cache_settle   = false;
+    std::uint32_t deepseek_cache_settle_ms      = 400;
+    std::uint32_t deepseek_cache_settle_idle_ms = 6000;
+    bool deepseek_short_prompt = false;
+    std::uint32_t deepseek_short_prompt_tokens = 96;
+    bool deepseek_profile_weights = false;
+    // Whether any of these differs from its default (for families that take none of them).
+    [[nodiscard]] bool deepseek_delivery_requested() const noexcept {
+        const HybridExpertOptions defaults{};
+        return deepseek_prefetch_ahead != defaults.deepseek_prefetch_ahead ||
+               deepseek_cache_settle != defaults.deepseek_cache_settle ||
+               deepseek_short_prompt != defaults.deepseek_short_prompt ||
+               deepseek_profile_weights != defaults.deepseek_profile_weights ||
+               deepseek_cache_settle_ms != defaults.deepseek_cache_settle_ms ||
+               deepseek_cache_settle_idle_ms != defaults.deepseek_cache_settle_idle_ms ||
+               deepseek_short_prompt_tokens != defaults.deepseek_short_prompt_tokens;
+    }
 };
 
 // The n-gram table of Qwen3.8-Flash-Next's per-layer embedding: the model artifact's own rows, or

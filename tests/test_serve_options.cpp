@@ -675,6 +675,34 @@ int main() {
         (void)parse({"ninfer-serve", "model.ninfer", "--deepseek-prompt-skip", "yes"});
     } catch (const std::invalid_argument&) { invalid_skip_rejected = true; }
     failures += check(invalid_skip_rejected, "--deepseek-prompt-skip accepted a value other than on|off");
+    {
+        // T0833: the DeepSeek-V4.1 delivery experiments, off by default.
+        const auto base = parse({"ninfer-serve", "model.ninfer", "--expert-residency", "host"});
+        failures += check(!base.hybrid_experts.deepseek_delivery_requested(),
+                          "the --deepseek-* delivery experiments are not off by default (serve)");
+        const auto all = parse({"ninfer-serve", "model.ninfer", "--expert-residency", "host",
+                                "--deepseek-prefetch-ahead", "on", "--deepseek-cache-settle", "on",
+                                "--deepseek-cache-settle-ms", "250", "--deepseek-cache-settle-idle-ms", "0",
+                                "--deepseek-short-prompt", "on", "--deepseek-short-prompt-tokens", "192",
+                                "--deepseek-profile-weights", "on"});
+        failures += check(all.hybrid_experts.deepseek_prefetch_ahead && all.hybrid_experts.deepseek_cache_settle &&
+                              all.hybrid_experts.deepseek_short_prompt && all.hybrid_experts.deepseek_profile_weights &&
+                              all.hybrid_experts.deepseek_cache_settle_ms == 250 &&
+                              all.hybrid_experts.deepseek_cache_settle_idle_ms == 0 &&
+                              all.hybrid_experts.deepseek_short_prompt_tokens == 192,
+                          "the --deepseek-* delivery experiments did not reach serving options");
+        for (const auto& bad : std::vector<std::vector<std::string>>{
+                 {"--deepseek-prefetch-ahead", "yes"}, {"--deepseek-short-prompt", "1"},
+                 {"--deepseek-cache-settle-ms", "600001"}, {"--deepseek-short-prompt-tokens", "0"}}) {
+            bool rejected = false;
+            try {
+                std::vector<std::string> argv{"ninfer-serve", "model.ninfer", "--expert-residency", "host"};
+                argv.insert(argv.end(), bad.begin(), bad.end());
+                (void)parse(argv);
+            } catch (const std::invalid_argument&) { rejected = true; }
+            failures += check(rejected, (bad[0] + " accepted " + bad[1]).c_str());
+        }
+    }
     failures += check(configured.media_cache_bytes == (256ULL << 20) &&
                           configured.media_live_bytes == (512ULL << 20) &&
                           configured.media_preprocess_threads == 6,

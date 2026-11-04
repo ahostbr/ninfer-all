@@ -59,6 +59,19 @@ nothing (`src/runtime/engine/deepseek_v41_core.cpp:315`); the expert cache then 
 a profile. A profile remapped through the list would need writing (not done); it is a warm-up speed-up, not
 a correctness matter.
 
+**`--expert-profile` for this pack (T0833, engine side).** The file is JSON, `{"version": 1,
+"artifact_id": "<32 hex digits>", "counts": [[...192 counts...] x 40]}`, read by position: row `L`,
+column `j` is kept expert `j` of layer `L`, the order the converter stored them in (so Strata's
+`expert-profile.bin`, a bare `u32` array of the same shape, converts row for row with no remapping).
+The reader accepts 40 rows, or up to 8 more (Strata's file carries rows for the drafter's layers
+after the text layers'; they are ignored), and refuses anything else naming what differs: the
+artifact identity (both are printed), the row count, or the layer whose width is not 192. The
+startup log prints `expert profile <path> read for artifact <id>: 40 layers of 192 experts`, and a
+refusal for the wrong identity prints the one the artifact has (`recorded for artifact 'A', this one
+is 'B'`), so a script can take it from a first run with any profile. Counts only place the cache's first contents;
+`--deepseek-profile-weights on` (T0833) also gives them to the expert tier as its starting counts,
+so the seeded experts are not the coldest ones the first decode passes see.
+
 **Checked** (`python -I` with the repo's own parser, no network): `validate` OK, `engram_constants` OK,
 `engram_table_source` OK (768,022,850 x 256, `gguf_iq4_nl`), `build_model(text)` OK (962 parameters, router
 `(192, 5120)`, `gate_up (884736, 5120)`, `down (983040, 2304)`), `build_model(text, vision)` OK (1261

@@ -29,21 +29,39 @@ struct Builtin {
 
 } // namespace
 
+std::string expert_profile_artifact_id(const artifact::ArtifactId& artifact) { return identity(artifact); }
+
 ExpertRouteCounts read_expert_profile(const std::filesystem::path& path,
-    const artifact::ArtifactId& artifact, std::span<const std::size_t> experts) {
+    const artifact::ArtifactId& artifact, std::span<const std::size_t> experts,
+    std::size_t spare_rows) {
     std::ifstream file(path);
     if (!file) { throw std::runtime_error("cannot read expert profile " + path.string()); }
     const auto data = nlohmann::json::parse(file);
-    if (!data.is_object() || data.value("version", 0) != 1 ||
-        data.value("artifact_id", std::string{}) != identity(artifact) || !data.contains("counts") ||
-        !data["counts"].is_array() || data["counts"].size() != experts.size()) {
-        throw std::invalid_argument("expert profile does not describe this artifact's layers");
+    const std::string where = "expert profile " + path.string() + ": ";
+    if (!data.is_object() || data.value("version", 0) != 1 || !data.contains("counts") ||
+        !data["counts"].is_array()) {
+        throw std::invalid_argument(where + "not a version 1 profile with a counts array");
+    }
+    if (data.value("artifact_id", std::string{}) != identity(artifact)) {
+        throw std::invalid_argument(where + "recorded for artifact '" +
+                                    data.value("artifact_id", std::string{}) + "', this one is '" +
+                                    identity(artifact) + "'");
+    }
+    const std::size_t rows = data["counts"].size();
+    if (rows < experts.size() || rows > experts.size() + spare_rows) {
+        throw std::invalid_argument(where + std::to_string(rows) + " layers, the model has " +
+                                    std::to_string(experts.size()) +
+                                    (spare_rows ? " (and up to " + std::to_string(spare_rows) +
+                                                      " more rows are ignored)"
+                                                : std::string{}));
     }
     ExpertRouteCounts out(experts.size());
     for (std::size_t layer = 0; layer < experts.size(); ++layer) {
         const auto& values = data["counts"][layer];
         if (!values.is_array() || values.size() != experts[layer]) {
-            throw std::invalid_argument("expert profile bank width differs from the model");
+            throw std::invalid_argument(where + "layer " + std::to_string(layer) + " has " +
+                                        std::to_string(values.is_array() ? values.size() : 0) +
+                                        " experts, the model's has " + std::to_string(experts[layer]));
         }
         for (const auto& value : values) {
             if (!value.is_number_unsigned()) {

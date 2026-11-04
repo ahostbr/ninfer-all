@@ -247,12 +247,14 @@ int run(DeviceContext& device, bool disk, std::uint64_t cache, const std::filesy
 // narrow calls between them, no cache: the second span prefetches every layer after the first
 // while the layer before it runs, through the decode pass, and a layer's repeated calls and its
 // prefetched bank serve every miss.
-int span_prefetch(DeviceContext& device, bool disk, const std::filesystem::path& path) {
+int span_prefetch(DeviceContext& device, bool disk, const std::filesystem::path& path,
+                  bool ahead = false) {
     Fixture fixture(disk, path);
     ExpertDeliveryOptions options;
     options.pair_capacity = kPairs;
     options.cache_bytes   = 0;
     options.staging_bytes = 4096;
+    options.prefetch_ahead = ahead; // T0833: queued before the wait (host experts), else as post work
     ExpertDelivery delivery(device.rank(0), fixture.paths, std::move(fixture.layers), options);
     DeviceBuffer wide(kPairs * 4), narrow(kPairs * 4), failures(8), visited(8);
     failures.fill();
@@ -294,9 +296,122 @@ int span_prefetch(DeviceContext& device, bool disk, const std::filesystem::path&
     const auto reuses     = after.bank_reuses - before.bank_reuses;
     const bool ok = !bad && count == std::uint64_t(5) * kLayers * kPairs &&
                     prefetched == kLayers - 1 && reuses == std::uint64_t(2 * kLayers - 1) * kExperts;
-    std::printf("%s span prefetch bad=%llu pairs=%llu prefetched=%llu bank_reuses=%llu %s\n",
-                disk ? "disk" : "host", bad, count, (unsigned long long)prefetched,
-                (unsigned long long)reuses, ok ? "PASS" : "FAIL");
+    std::printf("%s span prefetch%s bad=%llu pairs=%llu prefetched=%llu bank_reuses=%llu %s\n",
+                disk ? "disk" : "host", ahead ? " ahead" : "", bad, count,
+                (unsigned long long)prefetched, (unsigned long long)reuses, ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// T0833 prefetch_ahead with the executor's names for the next layer: the very first sweep, before
+// any order was learned, already prefetches every layer but the last, and a layer's repeated calls
+// and its prefetched bank serve every miss. A hint to a layer out of order is followed (0 to 2, 2
+// to 1, 1 to 3) and a hint cleared (-1) falls back to nothing learned.
+int hint_prefetch(DeviceContext& device, bool disk, const std::filesystem::path& path) {
+    Fixture fixture(disk, path);
+    ExpertDeliveryOptions options;
+    options.pair_capacity  = kPairs;
+    options.cache_bytes    = 0;
+    options.staging_bytes  = 4096;
+    options.prefetch_ahead = true;
+    ExpertDelivery delivery(device.rank(0), fixture.paths, std::move(fixture.layers), options);
+    DeviceBuffer wide(kPairs * 4), failures(8), visited(8);
+    failures.fill();
+    visited.fill();
+    std::vector<std::int32_t> routes(kPairs);
+    for (int p = 0; p < kPairs; ++p) { routes[p] = p % kExperts; }
+    wide.copy_from_host(routes.data(), wide.bytes);
+    const auto call = [&](int l) {
+        const auto* pairs = static_cast<const std::int32_t*>(wide.p);
+        const auto c      = delivery.begin(l, pairs, kPairs, device.stream);
+        inspect<<<kPairs, 32, 0, device.stream>>>(delivery.tables(l), c.cached_ids, kPairs, l,
+            static_cast<unsigned long long*>(failures.p), static_cast<unsigned long long*>(visited.p));
+        delivery.await(device.stream);
+        inspect<<<kPairs, 32, 0, device.stream>>>(delivery.tables(l), c.missing_ids, kPairs, l,
+            static_cast<unsigned long long*>(failures.p), static_cast<unsigned long long*>(visited.p));
+        CUDA_CHECK(cudaGetLastError());
+    };
+    delivery.hint_next(0, 2);
+    delivery.hint_next(2, 1);
+    delivery.hint_next(1, 3);
+    for (const int l : {0, 0, 2, 2, 1, 1, 3, 3}) { call(l); }
+    delivery.drain();
+    const auto stats = delivery.stats();
+    unsigned long long bad = 0, count = 0;
+    failures.copy_to_host(&bad, 8);
+    visited.copy_to_host(&count, 8);
+    // Three layers are prefetched (2, 1, 3), so each of their first calls finds its bank: the
+    // reuses are those layers' two calls each, and layer 0's second call.
+    const bool ok = !bad && count == std::uint64_t(8) * kPairs && stats.prefetched_layers == 3 &&
+                    stats.bank_reuses == std::uint64_t(7) * kExperts;
+    std::printf("%s hint prefetch bad=%llu pairs=%llu prefetched=%llu bank_reuses=%llu %s\n",
+                disk ? "disk" : "host", bad, count, (unsigned long long)stats.prefetched_layers,
+                (unsigned long long)stats.bank_reuses, ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// T0833 cache settle: narrow passes fill the cache with the experts 0-4 of every layer; a prompt's
+// wide calls then route experts 8-15 almost alone. settle() feeds those counts to the tier and
+// swaps the hot experts into the cache's free slots (and over the cold ones where it is full),
+// copying them in with the compute stream idle; every table entry must still read its expert's
+// bytes, and a narrow call to the hot experts then hits.
+int settle_cache(DeviceContext& device, bool disk, const std::filesystem::path& path) {
+    Fixture fixture(disk, path);
+    ExpertDeliveryOptions options;
+    options.pair_capacity     = kPairs;
+    options.cache_bytes       = 6ULL << 20;
+    options.staging_bytes     = 4096;
+    options.track_wide_counts = true;
+    ExpertDelivery delivery(device.rank(0), fixture.paths, std::move(fixture.layers), options);
+    DeviceBuffer wide(kPairs * 4), narrow(kPairs * 4), hot(kPairs * 4), failures(8), visited(8);
+    failures.fill();
+    visited.fill();
+    std::vector<std::int32_t> routes(kPairs);
+    for (int p = 0; p < kPairs; ++p) { routes[p] = p < kExperts ? p : 8 + p % 8; }
+    wide.copy_from_host(routes.data(), wide.bytes);
+    for (int p = 0; p < kPairs; ++p) { routes[p] = p % 5; }
+    narrow.copy_from_host(routes.data(), narrow.bytes);
+    for (int p = 0; p < kPairs; ++p) { routes[p] = 8 + p % 2; }
+    hot.copy_from_host(routes.data(), hot.bytes);
+    // `n` pairs of the buffer: the narrow and hot calls route few, so the experts' counts stay low.
+    const auto call = [&](int l, const DeviceBuffer& ids, int n = kPairs) {
+        const auto* pairs = static_cast<const std::int32_t*>(ids.p);
+        const auto c      = delivery.begin(l, pairs, n, device.stream);
+        inspect<<<n, 32, 0, device.stream>>>(delivery.tables(l), c.cached_ids, n, l,
+            static_cast<unsigned long long*>(failures.p), static_cast<unsigned long long*>(visited.p));
+        delivery.await(device.stream);
+        inspect<<<n, 32, 0, device.stream>>>(delivery.tables(l), c.missing_ids, n, l,
+            static_cast<unsigned long long*>(failures.p), static_cast<unsigned long long*>(visited.p));
+        CUDA_CHECK(cudaGetLastError());
+    };
+    delivery.prime(nullptr);
+    for (int pass = 0; pass < 3; ++pass) {
+        for (int l = 0; l < kLayers; ++l) { call(l, narrow, 10); }
+    }
+    for (int l = 0; l < kLayers; ++l) { call(l, wide); }
+    delivery.drain();
+    const auto before = delivery.stats();
+    const auto result = delivery.settle(2000);
+    // The prompt's counts were consumed: a second settle has nothing to feed.
+    const auto again = delivery.settle(2000);
+    const auto between = delivery.stats();
+    for (int l = 0; l < kLayers; ++l) { call(l, hot, 4); }
+    delivery.drain();
+    const auto after = delivery.stats();
+    // A settle with a cancelled caller runs no round.
+    const auto cancelled = delivery.settle(2000, [] { return true; });
+    unsigned long long bad = 0, count = 0;
+    failures.copy_to_host(&bad, 8);
+    visited.copy_to_host(&count, 8);
+    const bool ok = !bad && result.fed && result.rounds >= 1 && result.swaps > 0 && !again.fed &&
+                    between.admissions > before.admissions && after.hits > between.hits &&
+                    cancelled.rounds == 0 && cancelled.stop == ExpertSettle::Stop::Cancelled;
+    std::printf("%s cache settle bad=%llu pairs=%llu rounds=%u swaps=%llu fed=%d again=%u/%llu "
+                "admissions=%llu->%llu hot hits=%llu->%llu stop=%s cancelled=%u %s\n",
+                disk ? "disk" : "host", bad, count, result.rounds, (unsigned long long)result.swaps,
+                int(result.fed), again.rounds, (unsigned long long)again.swaps,
+                (unsigned long long)before.admissions, (unsigned long long)between.admissions,
+                (unsigned long long)between.hits, (unsigned long long)after.hits,
+                stop_name(result.stop), cancelled.rounds, ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
 
@@ -1049,6 +1164,9 @@ int main(int argc, char** argv) {
             failures += elastic_cache(device, disk, path);
             failures += lent_banks(device, disk, path);
             failures += span_prefetch(device, disk, path);
+            failures += span_prefetch(device, disk, path, true);
+            failures += hint_prefetch(device, disk, path);
+            failures += settle_cache(device, disk, path);
             failures += lent_landing(device, disk, path);
         }
         failures += failure_control(device, path, false);

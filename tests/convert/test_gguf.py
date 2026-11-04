@@ -268,3 +268,61 @@ def test_qwen35_vision_name_map_has_composite_and_no_deepstack_surprises():
         qwen35_vision_name_map(
             1, hidden_size=8, patch_size=4, temporal_patch_size=3
         )
+
+
+def test_gguf_file_reads_equal_a_memory_map_byte_for_byte(tmp_path):
+    from tools.convert.sources.gguf import GGUFFile
+
+    rng = np.random.default_rng(7)
+    matrix = rng.standard_normal((40, 64)).astype(np.float16)
+    path = tmp_path / "model.gguf"
+    _write_gguf(path, {"a": matrix, "b": matrix[::-1].copy()})
+
+    reference = np.memmap(path, dtype=np.uint8, mode="r")
+    with GGUFFile(path) as file:
+        for name in ("a", "b"):
+            info = file.info(name)
+            start = file.data_offset + info.offset
+            assert np.array_equal(file.tensor_bytes(name), reference[start : start + info.nbytes])
+            assert np.array_equal(
+                file.tensor_bytes(name, 3, 1000), reference[start + 3 : start + 1000]
+            )
+        assert not hasattr(file, "_map")
+        # a row range of BF16-shaped words equals the same slice of the whole read
+        assert np.array_equal(
+            np.frombuffer(file.tensor_bytes("a", 128, 128 * 5), dtype="<f2"),
+            matrix.reshape(-1)[64:320],
+        )
+        with pytest.raises(ValueError):
+            file.tensor_bytes("a", 0, matrix.nbytes + 1)
+    del reference
+
+
+def test_gguf_block_rows_gather_scattered_rows_without_the_span(tmp_path):
+    from tools.convert.sources.gguf import GGUFFile
+
+    rng = np.random.default_rng(11)
+    rows = 300
+    data = rng.integers(0, 256, size=(rows, 18 * 2), dtype=np.uint8)  # Q8-like width is not needed
+    # Q8_0 rows: 64 columns = 2 blocks of 34 bytes
+    q8 = gguf.quants.quantize(rng.standard_normal((rows, 64)).astype(np.float32),
+                              gguf.GGMLQuantizationType.Q8_0)
+    path = tmp_path / "q8.gguf"
+    writer = gguf.GGUFWriter(str(path), "test")
+    writer.add_tensor("w", q8, raw_dtype=gguf.GGMLQuantizationType.Q8_0)
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+    del data
+
+    index = np.array([299, 0, 1, 2, 150, 151, 5, 5, 298], dtype=np.int64)
+    with GGUFFile(path) as file:
+        whole = file.read_blocks("w")
+        assert np.array_equal(file.read_block_rows("w", index), whole[index])
+        assert file.read_block_rows("w", np.arange(10, 20)).shape == (10, whole.shape[1])
+        assert file.read_block_rows("w", np.array([], dtype=np.int64)).shape == (0, whole.shape[1])
+        with pytest.raises(ValueError):
+            file.read_block_rows("w", np.array([rows]))
+        bf = None
+    del bf

@@ -44,9 +44,10 @@ struct Fixture {
 int run() {
     Fixture fixture;
     refused<std::invalid_argument>([&] { (void)ninfer::FileReadQueue::open(fixture.paths, false, 0); });
+    for (const bool refill : {false, true}) {
     for (const bool direct : {false, true}) {
         for (const std::size_t depth : {1U, 5U, 64U}) {
-            auto queue = ninfer::FileReadQueue::open(fixture.paths, direct, depth);
+            auto queue = ninfer::FileReadQueue::open(fixture.paths, direct, depth, refill);
             if (!queue) {
                 std::cout << "SKIP native file queue: unavailable on this OS or disabled by sandbox\n";
                 return 77;
@@ -79,6 +80,26 @@ int run() {
             const std::array<ninfer::QueuedFileRead, 3> invalid{{
                 {0, 17, output[0]}, {1, fixture.bytes.size() - 5, output[1]}, {0, 70000, output[2]}}};
             refused<std::runtime_error>([&] { queue->read(invalid); });
+            // A failure in the middle of a batch much longer than the depth: the reads after it
+            // are not started (refill) or are in a group already (not), the ones in flight drain,
+            // and the queue serves the next batch.
+            {
+                std::vector<std::vector<std::uint8_t>> longer(60);
+                std::vector<ninfer::QueuedFileRead> middle;
+                for (std::size_t i = 0; i < longer.size(); ++i) {
+                    longer[i].resize(300 + i);
+                    const std::uint64_t offset = i == 20 ? fixture.bytes.size() - 7 : 100 + i * 13;
+                    middle.push_back({i % 2, offset, longer[i]});
+                }
+                refused<std::runtime_error>([&] { queue->read(middle); });
+                middle[20].offset = 55;
+                queue->read(middle);
+                for (const auto& read : middle) {
+                    require(std::equal(read.destination.begin(), read.destination.end(),
+                                       fixture.bytes.begin() + read.offset),
+                            "a batch after a mid-batch failure read wrongly");
+                }
+            }
             queue->read(reads);
             for (const auto& read : reads) {
                 require(std::equal(read.destination.begin(), read.destination.end(),
@@ -87,8 +108,10 @@ int run() {
             const ninfer::QueuedFileRead bad_file{2, 0, output[0]};
             refused<std::invalid_argument>([&] { queue->read(std::span(&bad_file, 1)); });
             queue->read({});
-            std::cout << queue->backend() << " direct=" << direct << " depth=" << depth << " PASS\n";
+            std::cout << queue->backend() << " refill=" << refill << " direct=" << direct
+                      << " depth=" << depth << " PASS\n";
         }
+    }
     }
     return 0;
 }

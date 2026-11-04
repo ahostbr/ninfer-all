@@ -42,7 +42,7 @@ void launch_nvfp4_partial(const Tensor& q, CacheInput input, const Tensor& posit
                 RowTiles <= 2 ||
                 kCausalSmallTCompactKV<RowTiles, KeyBlock, 5 * KeyBlock * kCausalHeadDim,
                                        TuringShapes>;
-            constexpr std::size_t DynamicBytes = (Compact ? 3u : 5u) * KeyBlock * kCausalHeadDim;
+            static constexpr std::size_t DynamicBytes = (Compact ? 3u : 5u) * KeyBlock * kCausalHeadDim;
             static_assert(kCausalSmallTQuantizedFixedBytes<RowTiles, KeyBlock> + DynamicBytes <=
                           shape_max_shared_bytes_per_block(TuringShapes));
             using KernelInput = CacheInput;

@@ -71,7 +71,12 @@ endif()
 # test included. With 12.9 the NVFP4 small-T attention kernels still go wrong, with no change in
 # the sources: a wide verification's split reduce reads from a wild address, and two requests
 # decoded together over an NVFP4 KV cache draw from corrupt logits. CUDA 13.1 builds them correctly.
-if(NINFER_ARCH_BLACKWELL AND CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.1)
+# Fork change W1 (docs/fork/WINDOWS_PORT.md): this machine builds with CUDA 13.0.2 because 13.2.51
+# miscompiles the sm_120 IQ kernels (Ryan, via Sentinel). Upstream qualified 13.1+ only; the escape
+# hatch below is OFF by default and a build that uses it is UNVERIFIED on a GPU until its tests run.
+option(NINFER_ALLOW_CUDA_13_0 "Allow CUDA 13.0 for a 120a build (not qualified upstream)" OFF)
+if(NINFER_ARCH_BLACKWELL AND CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.1
+   AND NOT (NINFER_ALLOW_CUDA_13_0 AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.0))
   message(FATAL_ERROR
     "A build with 120a needs CUDA 13.1 or newer; CUDA ${CMAKE_CUDA_COMPILER_VERSION} miscompiles "
     "sm_120a kernels")

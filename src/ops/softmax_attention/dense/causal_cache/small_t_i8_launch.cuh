@@ -94,7 +94,7 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
         auto launch = [&]<int WarpsPerCta, int MinBlocksPerSm, int KeyBlock, bool DynamicArena,
                           int QkSplit = 1, bool EarlyFetch = false>() {
             const dim3 grid(q.ne[1] / Geometry::GroupSize, splits, invocation.batch_size);
-            constexpr std::size_t kDynamicBytes =
+            static constexpr std::size_t kDynamicBytes =
                 DynamicArena ? static_cast<std::size_t>(4 * KeyBlock * kCausalHeadDim) : 0u;
             auto issue_pv = [&]<bool PackedValues, KvKeyCoding Keys, bool PvF16>() {
                 if constexpr (DynamicArena) {

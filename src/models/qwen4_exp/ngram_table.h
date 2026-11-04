@@ -20,6 +20,7 @@
 #include <filesystem>
 #include <memory>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace ninfer::models::qwen4_exp {
@@ -38,6 +39,10 @@ struct NgramTableLayout {
     std::uint64_t rows      = 0; // addressable rows
 };
 
+// A row id that addresses no row: submit() fills its output with zero bytes and reads nothing.
+// The caller says "this row is never used" (DeepSeek-V4.1 skips an image token's Engram rows).
+inline constexpr std::uint64_t kNgramSkipRow = ~std::uint64_t{0};
+
 struct NgramReadOptions {
     NgramResidency residency = NgramResidency::Disk;
     NgramIo io               = NgramIo::Buffered;
@@ -47,6 +52,12 @@ struct NgramReadOptions {
     std::vector<std::uint32_t> hot_rows;
     bool lock           = false; // keep the resident rows in physical memory
     std::uint32_t depth = 64;    // reads in flight
+    // A row id repeated in a batch is looked up and read once; the later copies are copied from
+    // the first one's output when the batch completes (bytes unchanged).
+    bool dedupe = false;
+    // The OS read queue starts the next read of a batch as each one finishes, rather than after
+    // each group of `depth` (FileReadQueue's refill mode).
+    bool refill = false;
 };
 
 class NgramTableReader {
@@ -93,6 +104,14 @@ public:
 
     // The counters of every finished batch; any thread may read them.
     [[nodiscard]] NgramTableStats counters() const;
+    // Rows served by copying an earlier row of their batch (NgramReadOptions::dedupe), and rows
+    // given as kNgramSkipRow, over all batches submitted so far; any thread may read them.
+    [[nodiscard]] std::uint64_t deduped_rows() const noexcept {
+        return deduped_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint64_t skipped_rows() const noexcept {
+        return skipped_.load(std::memory_order_relaxed);
+    }
 
 private:
     struct File;
@@ -107,6 +126,7 @@ private:
     void load(std::uint64_t first, std::uint64_t count, std::uint8_t* destination) const;
     void load_resident();
     void load_hot();
+    void find_repeats(std::span<const std::uint64_t> row_ids);
     [[nodiscard]] std::int64_t hot_slot(std::uint64_t row) const noexcept;
 
     NgramTableLayout layout_;
@@ -130,10 +150,15 @@ private:
     std::vector<std::uint32_t> admissions_;
     std::span<const std::uint64_t> batch_ids_;
     std::span<std::uint8_t> batch_out_;
+    // dedupe: the batch's repeated rows as (index, index of the first copy), filled at wait(); the
+    // table that finds them (an open-addressing hash of batch indices, one more than the index).
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> copies_;
+    std::vector<std::uint32_t> dedupe_table_;
     std::chrono::steady_clock::time_point batch_start_;
     bool pending_ = false;
 
     std::atomic<std::uint64_t> rows_{0}, resident_hits_{0}, batches_{0}, latency_ns_{0};
+    std::atomic<std::uint64_t> deduped_{0}, skipped_{0};
     std::array<std::atomic<std::uint64_t>, NgramTableStats::kLatencyBuckets> histogram_{};
 };
 

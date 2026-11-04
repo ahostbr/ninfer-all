@@ -371,6 +371,43 @@ addresses and copies them to the device:
   table in RAM (`--ngram-lock` pins it). The table is 103.0 GiB, so `ram` and host experts together
   need about 210 GiB of RAM.
 
+### The Engram read experiments
+
+Four switches, each off by default, A/B experiments on how the rows are read (none changes a byte
+of them). Each has an environment variable for bench scripts, which wins over the option and takes
+`1`, `on`, `true`, `0`, `off` or `false` (anything else is refused at startup); the startup log
+says which are on. Nothing here was run on a GPU: the tests are CPU-only, and the effect on tokens a
+second is to be measured (one arm each, three runs).
+
+- **`--deepseek-engram-dedupe on` (`NINFER_DS_ENGRAM_DEDUPE`).** A repeated row of a pass is looked
+  up and read once, and its later copies are copied from the first when the batch completes
+  (`NgramReadOptions::dedupe`); the rows of image tokens, which `engram_gate` skips, are not read
+  and come out as zeros (`kNgramSkipRow`). Code and structured prompts repeat n-grams heavily, so
+  the file reads fall by the repeats; text-only prompts have no image rows to skip.
+- **`--deepseek-engram-overlap pass|ahead` (`NINFER_DS_ENGRAM_OVERLAP`).** Today the host hashes
+  the pass's tokens, reads every block's rows, copies them and only then launches the pass, so the
+  GPU idles through the reads. With `pass`, one background thread reads each Engram block's rows
+  (the layer-1 block first, then the layer-14 block) while the stream runs the layers before them: just before a block's
+  layer the stream stops at a host function until that block's read is done, then copies the rows.
+  It is enqueued the same way inside a CUDA graph, so decode replays keep it. A prompt pass takes
+  one of two extra buffer sets in turn (decode keeps the original), so the host does not wait for
+  the previous pass to finish before it reads for the next. `ahead` adds a third set and, in the
+  prompt path, reads the next chunk's rows while this chunk computes (the core passes the next
+  chunk's tokens to `Executor::forward`); that chunk takes them if its tokens and the sequence's
+  history are the same, else reads its own. A failed read is raised by `check_experts()`, after the
+  pass. The extra buffers are logged at startup (about 100 MiB of each kind per set for a 16,384-token
+  span). Expect a hidden wait of about 0.5 ms at block 1 and several ms at block 14 for decode; the
+  fraction of a token that is is the Engram wait the counters report.
+- **`--file-read-refill on` (`NINFER_FILE_READ_REFILL`).** `FileReadQueue::read` waited for each
+  group of `depth` reads to finish before starting the next group, so one slow read idled the other
+  slots. With refill each slot takes the next read as soon as it completes; a failure still stops
+  new reads and drains the ones in flight before it is raised. It reaches the Engram reader's queue
+  (Windows buffered reads and direct reads, Linux io_uring), not the expert files' queue.
+- **`--deepseek-engram-default-cache on` (`NINFER_DS_ENGRAM_DEFAULT_CACHE`).** With `disk`
+  residency and no `--ngram-ram-mib`, the reader keeps a clock-evicting row cache of a 64th of the
+  available RAM at startup, between 16 and 256 MiB (Strata's rule; the Coder run's 1024 MiB from
+  `--ngram-ram-mib 1024` is larger and wins when given).
+
 ## The DSpark drafter
 
 DeepSeek-V4.1-Flash-1017 ships DSpark, a drafter of three blocks of the backbone's shape. Two

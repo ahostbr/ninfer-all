@@ -8,6 +8,7 @@
 #include "core/weight_view.h"
 #include "models/deepseek_v41/cpu_experts.h"
 #include "models/deepseek_v41/delivery_plan.h"
+#include "models/deepseek_v41/engram_flight.h"
 #include "models/deepseek_v41/kernels.h"
 #include "models/deepseek_v41/prompt_skip.h"
 #include "models/deepseek_v41/vision.h"
@@ -340,6 +341,31 @@ struct Executor::Impl {
     std::unique_ptr<CudaCompletionEvent> engram_copied;
     DeviceBuffer d_engram;
     std::vector<std::uint64_t> engram_scratch;
+    // T0833, options.engram_tuning.overlap != Off: the sets of buffers a pass's Engram rows travel
+    // in. Set 0 is the buffers above (the decode and verification graphs bake their addresses in);
+    // prompt passes take the others by turns (two, or three under Ahead), so a pass's host buffers
+    // are not rewritten while the pass before it computes, and under Ahead the next chunk's rows are
+    // read into the idle set while this chunk computes. A set's rows are read in the background, one
+    // job per Engram block, and the stream waits for a block just before its layer.
+    struct EngramSet {
+        PinnedHostBuffer* ids                           = nullptr;
+        PinnedHostBuffer* rows                          = nullptr;
+        void* dev                                       = nullptr;
+        CudaCompletionEvent* free                       = nullptr; // after the last pass using the set
+        std::vector<std::unique_ptr<EngramSlot>> slots; // one per Engram block
+        std::vector<std::uint8_t> collected; // blocks whose wait and copy this pass has enqueued
+        bool issued = false;                 // reads posted, the pass using them not yet ended
+        std::uint64_t key = 0;               // what the rows are of (a prefetch), 0: not keyed
+        std::unique_ptr<PinnedHostBuffer> own_ids, own_rows;
+        DeviceBuffer own_dev;
+        std::unique_ptr<CudaCompletionEvent> own_free;
+    };
+    std::array<EngramSet, 4> eg_sets;
+    std::uint32_t eg_prompt_sets = 0; // sets 1..eg_prompt_sets are the prompt passes'
+    EngramSet* eg_cur = nullptr;      // the set the pass being enqueued reads
+    std::uint32_t eg_turn = 0;        // prompt passes taken
+    std::span<const std::int32_t> eg_ahead; // forward(): the next prompt call's tokens, until read
+    std::unique_ptr<EngramFetcher> eg_fetcher; // after `engram`: stops before the reader goes
     // One sequence's rings and tails, the state a branch pass returns to.
     DeviceBuffer branch_state;
     // The vision tower, and a prompt step's images: their rows' flags (pinned, then on the
@@ -608,6 +634,34 @@ struct Executor::Impl {
             d_engram      = DeviceBuffer(engram_rows * kEngramRowBytes);
             engram_copied = std::make_unique<CudaCompletionEvent>(device);
             engram_scratch.resize(engram_rows);
+            if (options.engram_tuning.overlap != EngramOverlap::Off) {
+                const std::size_t blocks = hasher.rows_per_token() / hasher.columns();
+                eg_prompt_sets = options.engram_tuning.overlap == EngramOverlap::Ahead ? 3 : 2;
+                const std::size_t sets = 1 + eg_prompt_sets;
+                eg_fetcher = std::make_unique<EngramFetcher>();
+                for (std::size_t i = 0; i < sets; ++i) {
+                    EngramSet& set = eg_sets[i];
+                    if (i == 0) {
+                        set.ids  = h_engram_ids.get();
+                        set.rows = h_engram_rows.get();
+                        set.dev  = d_engram.p;
+                        set.free = engram_copied.get();
+                    } else {
+                        set.own_ids  = std::make_unique<PinnedHostBuffer>(engram_rows * 8);
+                        set.own_rows = std::make_unique<PinnedHostBuffer>(engram_rows * kEngramRowBytes);
+                        set.own_dev  = DeviceBuffer(engram_rows * kEngramRowBytes);
+                        set.own_free = std::make_unique<CudaCompletionEvent>(device);
+                        set.ids      = set.own_ids.get();
+                        set.rows     = set.own_rows.get();
+                        set.dev      = set.own_dev.p;
+                        set.free     = set.own_free.get();
+                    }
+                    for (std::size_t b = 0; b < blocks; ++b) {
+                        set.slots.push_back(std::make_unique<EngramSlot>());
+                    }
+                    set.collected.assign(blocks, 1);
+                }
+            }
         }
         if (options.vision_max_patches > 0) { plan_vision(rows); }
         span_borrow_bytes = growing && span_tokens != 0 ? span_buffers(span_tokens) : 0;
@@ -1155,7 +1209,8 @@ struct Executor::Impl {
     }
 
     ~Impl() {
-        if (delivery || growing) { cudaStreamSynchronize(stream); }
+        if (delivery || growing || eg_fetcher) { cudaStreamSynchronize(stream); }
+        eg_fetcher.reset(); // its jobs read through `engram` and fill the sets' buffers
         for (std::size_t r = 1; r < expert_peers.size(); ++r) {
             if (expert_peers[r].stream == nullptr) { continue; }
             RankBinding bind(device, r);
@@ -1452,11 +1507,27 @@ struct Executor::Impl {
     // after the sequence's `history` (advanced when `advance`).
     void read_engram(std::span<const std::int32_t> tokens, std::span<const std::uint32_t> owners,
                      std::span<EngramHasher::History> history_of, bool advance,
-                     std::span<const std::uint8_t> dead = {}) {
+                     std::span<const std::uint8_t> dead = {}, bool prompt = false) {
         if (!engram) { return; }
         const std::size_t t = tokens.size();
         const std::uint32_t per = hasher.rows_per_token(), columns = hasher.columns();
         const std::size_t blocks = per / columns;
+        EngramSet* set = nullptr;
+        std::uint64_t key = 0;
+        if (options.engram_tuning.overlap != EngramOverlap::Off) {
+            set = prompt_set(prompt);
+            if (prompt) {
+                ++eg_turn;
+                if (options.engram_tuning.overlap == EngramOverlap::Ahead && dead.empty()) {
+                    key = engram_batch_key({history_of[0].ids, history_of[0].count}, tokens);
+                    if (set->issued && set->key == key) { // read while the chunk before computed
+                        set->collected.assign(blocks, 0);
+                        eg_cur = set;
+                        return;
+                    }
+                }
+            }
+        }
         for (std::size_t r = 0; r < t;) {
             // Consecutive rows of one sequence hash together.
             std::size_t end = r + 1;
@@ -1465,19 +1536,107 @@ struct Executor::Impl {
                         advance, dead.empty() ? dead : dead.subspan(r, end - r));
             r = end;
         }
+        if (set != nullptr) {
+            post_engram(*set, tokens.size(), dead, key);
+            return;
+        }
         engram_copied->synchronize();
         auto* ids = static_cast<std::uint64_t*>(h_engram_ids->data());
-        for (std::size_t b = 0; b < blocks; ++b) {
-            for (std::size_t r = 0; r < t; ++r) {
-                std::memcpy(ids + (b * t + r) * columns, engram_scratch.data() + r * per + b * columns,
-                            columns * 8);
-            }
-        }
+        layout_engram_ids(engram_scratch, t, per, columns, dead, options.engram_tuning.dedupe,
+                          qwen4_exp::kNgramSkipRow, ids);
         const std::size_t n = t * per;
         engram->read_rows({ids, n}, {static_cast<std::uint8_t*>(h_engram_rows->data()), n * kEngramRowBytes});
         CUDA_CHECK(cudaMemcpyAsync(d_engram.p, h_engram_rows->data(), n * kEngramRowBytes,
                                    cudaMemcpyHostToDevice, stream));
         engram_copied->record(stream);
+    }
+
+    // ---- Overlapped Engram reads (EngramOverlap::Pass and Ahead) ---------------------------------
+
+    // The set a pass reads: set 0 for decoding and verifying, else a prompt pass's, the next of
+    // the prompt sets in turn.
+    [[nodiscard]] EngramSet* prompt_set(bool prompt) {
+        return prompt ? &eg_sets[1 + eg_turn % eg_prompt_sets] : &eg_sets[0];
+    }
+
+    // Queues the reads of the rows in engram_scratch (t tokens) into `set`, a job for each block,
+    // block 0 first: its rows are wanted first. The set's last pass has finished (free), and so
+    // have the jobs of a prefetch it never served.
+    void post_engram(EngramSet& set, std::size_t t, std::span<const std::uint8_t> dead,
+                     std::uint64_t key) {
+        const std::uint32_t per = hasher.rows_per_token(), columns = hasher.columns();
+        const std::size_t blocks = per / columns, block_rows = t * columns;
+        set.free->synchronize();
+        for (auto& slot : set.slots) { slot->wait(); }
+        auto* ids = static_cast<std::uint64_t*>(set.ids->data());
+        layout_engram_ids(engram_scratch, t, per, columns, dead, options.engram_tuning.dedupe,
+                          qwen4_exp::kNgramSkipRow, ids);
+        set.collected.assign(blocks, 0);
+        set.issued = true;
+        set.key    = key;
+        for (std::size_t b = 0; b < blocks; ++b) {
+            auto* from = ids + b * block_rows;
+            auto* to   = static_cast<std::uint8_t*>(set.rows->data()) + b * block_rows * kEngramRowBytes;
+            eg_fetcher->post(*set.slots[b], [reader = engram.get(), from, to, block_rows] {
+                reader->read_rows({from, block_rows}, {to, block_rows * kEngramRowBytes});
+            });
+        }
+    }
+
+    // The enqueued wait and copy of a block's rows, just before its layer: the stream stops at the
+    // slot until the background read has finished (a host function that touches no CUDA call), then
+    // copies the block's rows over. Once a pass, whether captured in a graph or not.
+    static void CUDART_CB wait_engram_slot(void* slot) { static_cast<EngramSlot*>(slot)->wait(); }
+
+    void collect_engram(EngramSet& set, int block, std::size_t block_rows) {
+        if (set.collected[std::size_t(block)] != 0) { return; }
+        set.collected[std::size_t(block)] = 1;
+        const std::size_t from = std::size_t(block) * block_rows * kEngramRowBytes;
+        CUDA_CHECK(cudaLaunchHostFunc(stream, &wait_engram_slot, set.slots[std::size_t(block)].get()));
+        CUDA_CHECK(cudaMemcpyAsync(static_cast<std::uint8_t*>(set.dev) + from,
+                                   static_cast<const std::uint8_t*>(set.rows->data()) + from,
+                                   block_rows * kEngramRowBytes, cudaMemcpyHostToDevice, stream));
+    }
+
+    // The pass reading the set has been enqueued whole: its buffers are free once the stream
+    // reaches this point.
+    void end_engram_pass() noexcept {
+        if (eg_cur == nullptr) { return; }
+        try {
+            eg_cur->free->record(stream);
+        } catch (...) {}
+        eg_cur->issued = false;
+        eg_cur         = nullptr;
+    }
+
+    struct EngramPass {
+        Impl& impl;
+        ~EngramPass() { impl.end_engram_pass(); }
+    };
+
+    // Reads the rows of the tokens of the call that follows a prompt call (`ahead`, at the
+    // sequence's position after it) into the set that call will take, while this one computes. Run
+    // once the prompt call's own rows are queued, with the sequence's history past them.
+    void prefetch_engram(std::uint32_t sequence, std::span<const std::int32_t> ahead) {
+        if (!engram || options.engram_tuning.overlap != EngramOverlap::Ahead || ahead.empty() ||
+            ahead.size() > staging_rows() || sequence >= options.sequences || !step_images.empty()) {
+            return;
+        }
+        EngramHasher::History history = histories[sequence];
+        const std::uint64_t key       = engram_batch_key({history.ids, history.count}, ahead);
+        EngramSet& set                = *prompt_set(true);
+        if (set.issued && set.key == key) { return; }
+        hasher.rows(history, ahead, engram_scratch.data(), false);
+        post_engram(set, ahead.size(), {}, key);
+    }
+
+    // Rethrows a background read's failure, once; a pass whose rows failed ran on stale ones.
+    void check_engram() {
+        for (EngramSet& set : eg_sets) {
+            for (auto& slot : set.slots) {
+                if (const auto error = slot->take_error()) { std::rethrow_exception(error); }
+            }
+        }
     }
 
     void advance_history(std::uint32_t sequence, std::span<const std::int32_t> tokens,
@@ -1540,7 +1699,12 @@ struct Executor::Impl {
         const int rows    = t * columns;
         const std::size_t block = std::size_t(s.staged ? s.staged : t) * columns;
         Tensor e          = alloc_bf16(columns * int(config.engram.head_dim), t);
-        kernels::engram_rows(static_cast<const std::uint8_t*>(d_engram.p) +
+        const void* device_rows = d_engram.p;
+        if (eg_cur != nullptr) {
+            collect_engram(*eg_cur, p.engram, block);
+            device_rows = eg_cur->dev;
+        }
+        kernels::engram_rows(static_cast<const std::uint8_t*>(device_rows) +
                                  (std::size_t(p.engram) * block + std::size_t(s.row) * columns) *
                                      kEngramRowBytes,
                              rows, static_cast<__nv_bfloat16*>(e.data), stream);
@@ -2508,7 +2672,9 @@ struct Executor::Impl {
         StepImages kept{*this};
         stage(tokens, pos, {});
         stage_images(images, t);
-        read_engram_rows(tokens, std::vector<std::uint32_t>(std::size_t(t), sequence), true, step_dead);
+        read_engram_rows(tokens, std::vector<std::uint32_t>(std::size_t(t), sequence), true, step_dead,
+                         true);
+        EngramPass engram_pass{*this};
         Pass s;
         s.t            = t;
         s.chunk        = true;
@@ -2560,8 +2726,10 @@ struct Executor::Impl {
                 const int half = (n / 2 + c - 1) / c * c;
                 const auto first_images = slice_images(images, 0, std::size_t(half));
                 const auto last_images  = slice_images(images, std::size_t(half), std::size_t(n));
+                const auto ahead = std::exchange(eg_ahead, {}); // follows the second half
                 forward(sequence, tokens.first(std::size_t(half)), 0, 0, first_images,
                         std::uint32_t(std::min(skip, half)));
+                eg_ahead = ahead;
                 forward(sequence, tokens.subspan(std::size_t(half)), logit_rows, 0, last_images,
                         std::uint32_t(std::max(0, skip - half)));
                 return;
@@ -2580,7 +2748,9 @@ struct Executor::Impl {
         StepImages kept{*this};
         stage(tokens, pos, {});
         stage_images(images, n);
-        read_engram_rows(tokens, std::vector<std::uint32_t>(std::size_t(n), sequence), true, step_dead);
+        read_engram_rows(tokens, std::vector<std::uint32_t>(std::size_t(n), sequence), true, step_dead,
+                         true);
+        EngramPass engram_pass{*this};
         workspace->reset();
         auto scope = workspace->scope();
         auto* h    = static_cast<float*>(span_alloc(std::size_t(n) * streams * hidden * 4));
@@ -2669,7 +2839,7 @@ struct Executor::Impl {
 
     // The Engram rows of a pass whose row r belongs to owners[r], from that sequence's history.
     void read_engram_rows(std::span<const std::int32_t> tokens, std::span<const std::uint32_t> owners,
-                          bool advance, std::span<const std::uint8_t> dead = {}) {
+                          bool advance, std::span<const std::uint8_t> dead = {}, bool prompt = false) {
         if (!engram) { return; }
         std::vector<EngramHasher::History> view(tokens.size());
         // Each run of rows of one sequence continues that sequence's history; a verification's
@@ -2681,12 +2851,15 @@ struct Executor::Impl {
             view[r] = histories[owners[r]];
             r       = end;
         }
-        read_engram(tokens, owners, view, false, dead);
+        read_engram(tokens, owners, view, false, dead, prompt);
         if (advance) {
             for (std::size_t i = 0; i < tokens.size(); ++i) {
                 advance_history(owners[i], tokens.subspan(i, 1),
                                 dead.empty() ? dead : dead.subspan(i, 1));
             }
+        }
+        if (prompt && advance && !eg_ahead.empty()) {
+            prefetch_engram(owners[0], std::exchange(eg_ahead, {}));
         }
     }
 
@@ -2711,6 +2884,7 @@ struct Executor::Impl {
         for (int i = 0; i < b; ++i) { back(sequences[i], positions[sequences[i]] + 1); }
         stage(tokens, pos, seq);
         read_engram_rows(tokens, sequences, true);
+        EngramPass engram_pass{*this};
         Pass s;
         s.t          = b;
         s.logit_rows = b;
@@ -2780,6 +2954,7 @@ struct Executor::Impl {
         for (int j = 0; j < n; ++j) { back(sequences[j], positions[sequences[j]] + row_widths[j]); }
         stage(tokens, pos, seq);
         read_engram_rows(tokens, owners, false);
+        EngramPass engram_pass{*this};
         Pass s;
         s.t          = rows;
         s.logit_rows = rows;
@@ -3069,6 +3244,13 @@ ExecutorMemory Executor::memory() const noexcept {
                           .workspace_bytes = impl_->workspace_bytes,
                           .span_borrow_bytes = impl_->span_borrow_bytes,
                           .engram_resident_bytes = impl_->engram ? impl_->engram->resident_bytes() : 0,
+                          .engram_overlap_device_bytes =
+                              std::uint64_t(impl_->eg_prompt_sets) * impl_->d_engram.bytes,
+                          .engram_overlap_pinned_bytes =
+                              impl_->eg_prompt_sets == 0
+                                  ? 0
+                                  : std::uint64_t(impl_->eg_prompt_sets) *
+                                        (impl_->h_engram_rows->size() + impl_->h_engram_ids->size()),
                           .vision_encode_bytes = impl_->tower ? impl_->tower->workspace_bytes() : 0,
                           .vision_owned_bytes  = impl_->vision_owned_bytes(),
                           .experts = impl_->delivery ? impl_->delivery->memory() : ExpertDeliveryMemory{}};
@@ -3099,6 +3281,7 @@ void Executor::warm_up() {
 }
 
 void Executor::check_experts() const {
+    if (impl_->eg_fetcher) { impl_->check_engram(); }
     if (impl_->delivery) { impl_->delivery->check(); }
     for (std::size_t r = 1; r < impl_->expert_peers.size(); ++r) {
         impl_->expert_peers[r].delivery->check();
@@ -3160,14 +3343,21 @@ ExpertSettle Executor::settle_experts(double max_ms, const std::function<bool()>
 
 void Executor::forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,
                        std::uint32_t logit_rows, std::span<const ImageRows> images,
-                       std::uint32_t skip_rows) {
+                       std::uint32_t skip_rows, std::span<const std::int32_t> ahead) {
     // A call of decode width may leave no logits: a short prompt's rows steps (delivery_plan.h)
     // keep them for the step that ends the prompt.
     if (logit_rows == 0 && !(skip_rows > 0 && skip_rows >= tokens.size()) &&
         tokens.size() > kShortPromptRows) {
         throw std::invalid_argument("deepseek_v41 forward: no logit rows");
     }
-    impl_->forward(sequence, tokens, logit_rows, 0, images, skip_rows);
+    impl_->eg_ahead = ahead;
+    try {
+        impl_->forward(sequence, tokens, logit_rows, 0, images, skip_rows);
+    } catch (...) {
+        impl_->eg_ahead = {};
+        throw;
+    }
+    impl_->eg_ahead = {};
 }
 
 bool Executor::vision() const noexcept { return impl_->tower != nullptr; }

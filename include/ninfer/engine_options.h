@@ -462,6 +462,20 @@ struct NgramTableOptions {
     // Disk, RamHot: cached/resident rows and their index take at most this RAM. Empty takes
     // zero for Disk and 4 GiB for RamHot. Ram always loads the whole table.
     std::optional<std::uint64_t> ram_budget_bytes;
+    // DeepSeek-V4.1's Engram read path, speed experiments to A/B (T0833); all off by default, and
+    // an environment variable (NINFER_DS_ENGRAM_DEDUPE, NINFER_DS_ENGRAM_OVERLAP,
+    // NINFER_FILE_READ_REFILL, NINFER_DS_ENGRAM_DEFAULT_CACHE: 1/on/true or 0/off/false) overrides
+    // each. None changes a byte of the rows.
+    // Read a repeated row of a batch once, and leave out the rows of image tokens (no layer uses
+    // them).
+    bool engram_dedupe = false;
+    EngramOverlap engram_overlap = EngramOverlap::Off;
+    // The OS read queue starts a read as each one finishes instead of after each group of
+    // --ngram-io-depth.
+    bool read_refill = false;
+    // Disk residency with no --ngram-ram-mib: a row cache of 1/64 of the available RAM, 16 to
+    // 256 MiB (Strata's rule).
+    bool engram_default_cache = false;
     // RamHot: the hot-row profile (ninfer-ngram-profile) the rows are chosen by.
     std::filesystem::path hot_profile;
     // Ram, RamHot: lock the resident rows into physical memory (mlock, VirtualLock).

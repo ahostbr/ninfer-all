@@ -3,6 +3,7 @@
 // The Qwen3.8-Flash-Next n-gram table options that ninfer, ninfer-serve and ninfer-perplexity
 // share: where the table comes from, where its rows live and how they are read.
 
+#include "models/deepseek_v41/engram_tuning.h"
 #include "ninfer/engine_options.h"
 #include "ninfer/model_enums.h"
 
@@ -35,6 +36,25 @@ inline constexpr const char* kNgramTableHelp =
     "  --ngram-ram-mib N             disk, ram-hot: RAM for rows and their index\n"
     "                                (disk default 0/off; ram-hot default 4096)\n"
     "  --ngram-lock                  ram, ram-hot: lock the rows in physical memory\n"
+    "  --deepseek-engram-dedupe on|off\n"
+    "                                DeepSeek-V4.1: read a repeated Engram row of a pass\n"
+    "                                once and skip image tokens' rows (default off;\n"
+    "                                NINFER_DS_ENGRAM_DEDUPE=0|1 overrides)\n"
+    "  --deepseek-engram-overlap off|pass|ahead\n"
+    "                                DeepSeek-V4.1: read a pass's Engram rows in the\n"
+    "                                background and wait for each block just before its\n"
+    "                                layer (pass); also read the next prompt chunk's rows\n"
+    "                                while this one computes (ahead). Default off;\n"
+    "                                NINFER_DS_ENGRAM_OVERLAP overrides\n"
+    "  --file-read-refill on|off     DeepSeek-V4.1 Engram rows on Windows/Linux native\n"
+    "                                queues: start the next read as each finishes, not\n"
+    "                                after each group of --ngram-io-depth (default off;\n"
+    "                                NINFER_FILE_READ_REFILL=0|1 overrides)\n"
+    "  --deepseek-engram-default-cache on|off\n"
+    "                                DeepSeek-V4.1, disk residency with no\n"
+    "                                --ngram-ram-mib: a row cache of 1/64 of the\n"
+    "                                available RAM, 16 to 256 MiB (default off;\n"
+    "                                NINFER_DS_ENGRAM_DEFAULT_CACHE=0|1 overrides)\n"
     "  --no-ngram-table              run Qwen3.8-Flash-Next without its n-gram table,\n"
     "                                DeepSeek-V4.1 without its Engram table.\n"
     "                                Non-standard experimental mode: the model was\n"
@@ -98,6 +118,14 @@ bool parse_ngram_table_option(std::string_view option, NgramTableOptions& out, V
             << 20U;
     } else if (option == "--ngram-lock") {
         out.lock = true;
+    } else if (option == "--deepseek-engram-dedupe") {
+        out.engram_dedupe = models::deepseek_v41::parse_switch(option, std::string(value()));
+    } else if (option == "--deepseek-engram-overlap") {
+        out.engram_overlap = models::deepseek_v41::parse_overlap(option, std::string(value()));
+    } else if (option == "--file-read-refill") {
+        out.read_refill = models::deepseek_v41::parse_switch(option, std::string(value()));
+    } else if (option == "--deepseek-engram-default-cache") {
+        out.engram_default_cache = models::deepseek_v41::parse_switch(option, std::string(value()));
     } else {
         return false;
     }

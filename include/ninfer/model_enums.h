@@ -129,4 +129,14 @@ enum class NgramIo : std::uint8_t {
     Mapped,
 };
 
+// DeepSeek-V4.1: when a pass's Engram rows are read relative to the pass that uses them.
+enum class EngramOverlap : std::uint8_t {
+    // Every block's rows are read and copied to the device, then the pass runs.
+    Off,
+    // The rows are read in the background; the pass waits for a block's rows just before its layer.
+    Pass,
+    // Pass, and a prompt chunk's rows are also read while the chunk before it computes.
+    Ahead,
+};
+
 } // namespace ninfer

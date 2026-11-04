@@ -125,14 +125,6 @@ std::string serve_usage_text(const char* argv0) {
            "                                the integer tensor-core kernel, not the 8-column\n"
            "                                vector one (default off; NINFER_DS_IQ1M_MATRIX=0|1\n"
            "                                overrides)\n"
-           "  --deepseek-iq1m-codes12 on|off\n"
-           "                                DeepSeek-V4.1 decode: IQ1_M experts read through a\n"
-           "                                12-bit table of ready weights (default off;\n"
-           "                                NINFER_DS_IQ1M_CODES12=0|1 overrides)\n"
-           "  --deepseek-fused-swiglu on|off\n"
-           "                                DeepSeek-V4.1 decode: routed gate, up and clamped\n"
-           "                                SwiGLU in one kernel (default off;\n"
-           "                                NINFER_DS_FUSED_SWIGLU=0|1 overrides)\n"
            "  --prefill-chunk N             prefill chunk in tokens, a multiple of 128\n"
            "                                (default 1024; 4096 for native MoE experts\n"
            "                                in host memory or files); with an int8 or\n"
@@ -776,28 +768,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 options.deepseek_iq1m_matrix = false;
             } else {
                 throw std::invalid_argument("--deepseek-iq1m-matrix accepts on or off");
-            }
-            continue;
-        }
-        if (arg == "--deepseek-iq1m-codes12") {
-            const std::string_view value = require_value("--deepseek-iq1m-codes12");
-            if (value == "on") {
-                options.deepseek_iq1m_codes12 = true;
-            } else if (value == "off") {
-                options.deepseek_iq1m_codes12 = false;
-            } else {
-                throw std::invalid_argument("--deepseek-iq1m-codes12 accepts on or off");
-            }
-            continue;
-        }
-        if (arg == "--deepseek-fused-swiglu") {
-            const std::string_view value = require_value("--deepseek-fused-swiglu");
-            if (value == "on") {
-                options.deepseek_fused_swiglu = true;
-            } else if (value == "off") {
-                options.deepseek_fused_swiglu = false;
-            } else {
-                throw std::invalid_argument("--deepseek-fused-swiglu accepts on or off");
             }
             continue;
         }

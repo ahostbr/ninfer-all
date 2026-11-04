@@ -71,20 +71,14 @@ int run_tests() {
     {
         // The T0833 kernel switches: off by default, on|off only.
         const auto defaults = parse({"ninfer-cli", "model.ninfer", "--prompt", "x"});
-        failures += check(!defaults.deepseek_iq1m_matrix && !defaults.deepseek_iq1m_codes12 &&
-                              !defaults.deepseek_fused_swiglu,
-                          "a DeepSeek kernel switch is on by default");
+        failures += check(!defaults.deepseek_iq1m_matrix, "a DeepSeek kernel switch is on by default");
         const auto on = parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
-                               "--deepseek-iq1m-matrix", "on", "--deepseek-iq1m-codes12", "on",
-                               "--deepseek-fused-swiglu", "on"});
-        failures += check(on.deepseek_iq1m_matrix && on.deepseek_iq1m_codes12 &&
-                              on.deepseek_fused_swiglu,
-                          "a DeepSeek kernel switch was not parsed as on");
+                               "--deepseek-iq1m-matrix", "on"});
+        failures += check(on.deepseek_iq1m_matrix, "a DeepSeek kernel switch was not parsed as on");
         const auto off = parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
                                 "--deepseek-iq1m-matrix", "on", "--deepseek-iq1m-matrix", "off"});
         failures += check(!off.deepseek_iq1m_matrix, "a DeepSeek kernel switch was not parsed as off");
-        for (const char* flag : {"--deepseek-iq1m-matrix", "--deepseek-iq1m-codes12",
-                                 "--deepseek-fused-swiglu"}) {
+        for (const char* flag : {"--deepseek-iq1m-matrix"}) {
             failures += check(rejects([&] {
                                   (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", flag,
                                                "yes"});

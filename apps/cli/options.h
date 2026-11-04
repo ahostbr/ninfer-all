@@ -31,8 +31,6 @@ struct Options {
     std::uint32_t prefill_chunk  = 0; // 0: the Engine's automatic chunk
     bool deepseek_prompt_skip    = false; // --deepseek-prompt-skip
     bool deepseek_iq1m_matrix    = false; // --deepseek-iq1m-matrix
-    bool deepseek_iq1m_codes12   = false; // --deepseek-iq1m-codes12
-    bool deepseek_fused_swiglu   = false; // --deepseek-fused-swiglu
     int device                   = 0;
     // Several ids split the model's layers into one pipeline stage per device, the first also
     // holding the embedding, head and round state. Empty means use `device`.

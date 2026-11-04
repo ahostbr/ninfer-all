@@ -353,10 +353,7 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
     }
     // The kernel A/B switches (kernel_switches.h): a flag or its environment variable, which wins.
     executor.kernels = models::deepseek_v41::resolve_kernel_switches(
-        {.iq1m_matrix  = options.deepseek_iq1m_matrix,
-         .iq1m_codes12 = options.deepseek_iq1m_codes12,
-         .fused_swiglu = options.deepseek_fused_swiglu,
-         .dense_cublas = options.prefill_cublas});
+        {.iq1m_matrix = options.deepseek_iq1m_matrix});
     // Causal scoring keeps no context between requests.
     executor.checkpoints = options.context_cache.enabled &&
                            options.purpose == EnginePurpose::Generation;
@@ -454,10 +451,6 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
                       iq1m_banks, model->expert_banks().size());
         report(k.iq1m_matrix, "IQ1_M wide MoE product (integer tensor cores, calls of over 8 tokens)",
                iq1m_text);
-        report(k.iq1m_codes12, "IQ1_M 12-bit decode table (decode and verification kernels)",
-               iq1m_text);
-        report(k.fused_swiglu, "fused routed gate/up/clamped SwiGLU (decode and verification)", "");
-        report(k.dense_cublas, "dense prompt GEMMs through cuBLAS BF16 (--prefill-cublas)", "");
     }
     if (!executor.expert_split.empty()) {
         const std::uint32_t experts = model->config().num_experts;

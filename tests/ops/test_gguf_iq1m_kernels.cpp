@@ -1,21 +1,14 @@
-// The T0833 kernel switches' GPU kernels over IQ1_M expert banks (src/ops/linear/gguf), at the
-// DeepSeek-V4.1 geometries' shapes; needs a device (exit 77 without one):
-//  1. the IQ1_M MoE matrix kernel (--deepseek-iq1m-matrix) against an FP64 product of the exactly
-//     dequantized weights, within the bound the activation's q8_1 rounding allows, and against the
-//     8-column vector kernel it replaces (both within that bound of the truth, so within twice of
-//     each other); moe_matrix_supported says no unless asked, and yes when asked on a device that
-//     has integer tensor cores.
-//  2. the 12-bit code table (--deepseek-iq1m-codes12): moe_vector_product with it gives every bit of
-//     the plain decoder's, at chunks of 1, 2 and 4 tokens.
-//  3. the fused clamped SwiGLU (--deepseek-fused-swiglu): moe_vector_clamped_swiglu equals the bits
-//     of moe_vector_product's FP32 rows through the CPU's clamped SwiGLU (the mirror of
-//     kernels::clamped_swiglu), with and without the code table.
+// The IQ1_M MoE matrix kernel (--deepseek-iq1m-matrix, src/ops/linear/gguf) at the DeepSeek-V4.1
+// geometries' shapes; needs a device (exit 77 without one): against an FP64 product of the exactly
+// dequantized weights, within the bound the activation's q8_1 rounding allows, and against the
+// 8-column vector kernel it replaces (both within that bound of the truth, so within twice of each
+// other); moe_matrix_supported says no unless asked, and yes when asked on a device that has
+// integer tensor cores.
 
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "core/weight.h"
 #include "ops/linear/gguf/ggml_bridge.h"
-#include "ops/moe_experts/gguf_expert_cpu.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -133,7 +126,6 @@ std::vector<__nv_bfloat16> random_bf16(std::size_t count, std::mt19937& rng) {
     return out;
 }
 
-// 1. The matrix kernel.
 void test_matrix(std::mt19937& rng) {
     const int experts = 6, rows = 256, k = 1024, pairs = 48;
     Bank bank(rows, k, experts, 3, rng);
@@ -204,78 +196,6 @@ void test_matrix(std::mt19937& rng) {
                                   std::to_string(worst_pair) + ")");
 }
 
-// 2 and 3. The code table and the fused clamped SwiGLU, at the decode widths.
-void test_decode_kernels(std::mt19937& rng) {
-    const int experts = 8, width = 128, k = 1024, top_k = 3;
-    Bank parent(2 * width, k, experts, 4, rng); // [gate; up]
-    for (const int tokens : {1, 2, 4}) {
-        const int pairs = tokens * top_k;
-        std::vector<std::int32_t> ids;
-        for (int t = 0; t < tokens; ++t) {
-            std::vector<int> pool(static_cast<std::size_t>(experts));
-            for (int e = 0; e < experts; ++e) { pool[std::size_t(e)] = e; }
-            std::shuffle(pool.begin(), pool.end(), rng);
-            for (int j = 0; j < top_k; ++j) { ids.push_back(pool[std::size_t(j)]); }
-        }
-        Routes routes(ids, experts);
-        const auto x = random_bf16(std::size_t(tokens) * k, rng);
-        DeviceBuffer d_x(x.size() * 2);
-        d_x.copy_from_host(x.data(), x.size() * 2);
-        DeviceBuffer d_act(gguf::vector_activation_bytes(k, tokens));
-        gguf::quantize_vector_activation(static_cast<const __nv_bfloat16*>(d_x.p), k, tokens, nullptr,
-                                         d_act.p, nullptr);
-        const int max_active = std::min(pairs, experts);
-        const std::string label = " at " + std::to_string(tokens) + " token(s)";
-
-        const auto product = [&](bool codes12) {
-            DeviceBuffer d_rows(std::size_t(pairs) * 2 * width * 4);
-            check_cuda(cudaMemset(d_rows.p, 0, d_rows.bytes), "zero rows");
-            gguf::MoeOutput out;
-            out.f32 = static_cast<float*>(d_rows.p);
-            gguf::moe_vector_product(gguf::GgmlType::IQ1_M, parent.view(), routes.routing, max_active,
-                                     top_k, top_k, d_act.p, tokens, out, tokens, nullptr, codes12);
-            check_cuda(cudaDeviceSynchronize(), "vector product");
-            std::vector<float> host(std::size_t(pairs) * 2 * width);
-            d_rows.copy_to_host(host.data(), host.size() * 4);
-            return host;
-        };
-        const auto plain = product(false);
-        const auto coded = product(true);
-        expect(std::memcmp(plain.data(), coded.data(), plain.size() * 4) == 0,
-               "IQ1_M 12-bit code table gives the plain decoder's bits" + label);
-
-        // The fused kernel against the unfused rows through the CPU's clamped SwiGLU.
-        std::uniform_real_distribution<float> factor(0.25f, 1.5f);
-        std::vector<float> scale(static_cast<std::size_t>(tokens));
-        for (auto& s : scale) { s = factor(rng); }
-        DeviceBuffer d_scale(scale.size() * 4);
-        d_scale.copy_from_host(scale.data(), scale.size() * 4);
-        const float limit = 10.0f;
-        for (const bool codes12 : {false, true}) {
-            DeviceBuffer d_middle(std::size_t(pairs) * width * 2);
-            check_cuda(cudaMemset(d_middle.p, 0, d_middle.bytes), "zero middles");
-            gguf::moe_vector_clamped_swiglu(gguf::GgmlType::IQ1_M, parent.view(), routes.routing,
-                                            max_active, top_k, d_act.p, tokens,
-                                            static_cast<__nv_bfloat16*>(d_middle.p),
-                                            static_cast<const float*>(d_scale.p), top_k, limit,
-                                            tokens, nullptr, codes12);
-            check_cuda(cudaDeviceSynchronize(), "fused swiglu");
-            std::vector<std::uint16_t> got(std::size_t(pairs) * width);
-            d_middle.copy_to_host(got.data(), got.size() * 2);
-            std::vector<std::uint16_t> want(got.size());
-            for (int p = 0; p < pairs; ++p) {
-                const float* row = plain.data() + std::size_t(p) * 2 * width;
-                ops::gguf_cpu_clamped_swiglu_bf16(row, row + width, std::size_t(width),
-                                                  scale[std::size_t(p / top_k)], limit,
-                                                  want.data() + std::size_t(p) * width,
-                                                  ops::GgufCpuBackend::Automatic);
-            }
-            expect(got == want, std::string("fused clamped SwiGLU equals the unfused rows' ") +
-                                    "(codes12 " + (codes12 ? "on" : "off") + ")" + label);
-        }
-    }
-}
-
 } // namespace
 
 int main() {
@@ -287,7 +207,6 @@ int main() {
     try {
         std::mt19937 rng(20261104);
         test_matrix(rng);
-        test_decode_kernels(rng);
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';
         return 1;

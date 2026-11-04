@@ -229,31 +229,15 @@ struct MoeOutput {
 // first projection, the pair's own middle (column_group = 1) for the second. `max_active` bounds
 // *routing.active_count (min(pairs, experts)); `chunk` is how many of an expert's columns share one
 // pass over its rows (1, 2, 4 or 8).
-//
-// `iq1m_codes12` (IQ1_M with a chunk of 1, 2 or 4 only; --deepseek-iq1m-codes12) reads the weights
-// through a 12-bit table of ready int8 words in shared memory; the products are the same bits.
 void moe_vector_product(GgmlType type, const MoeTable& table, const MoeRouting& routing,
                         int max_active, int column_group, int per_token, const void* activation,
-                        int columns, const MoeOutput& out, int chunk, cudaStream_t stream,
-                        bool iq1m_codes12 = false);
+                        int columns, const MoeOutput& out, int chunk, cudaStream_t stream);
 // silu(gate . x) * (up . x) of each pair into out [pairs][rows] (BF16): gate and up are two tables
 // of one block type.
 void moe_vector_swiglu(GgmlType type, const MoeTable& gate, const MoeTable& up,
                        const MoeRouting& routing, int max_active, int column_group,
                        const void* activation, int columns, __nv_bfloat16* out, int chunk,
                        cudaStream_t stream, GateActivation gate_activation = GateActivation::Silu);
-
-// DeepSeek-V4.1's routed gate and up rows in one kernel: pair p's `out` row (BF16 [pairs][gate_up.rows
-// / 2]) is the clamped SwiGLU, silu(min(g, limit)) * min(max(u, -limit), limit), of its gate row
-// product g and up row product u of the parent `gate_up` ([gate; up], rows = 2 * width), each first
-// multiplied by scale[p / per_token] (when given) and rounded to BF16: bit for bit what
-// moe_vector_product's FP32 rows and kernels::clamped_swiglu make of them. Only the pairs of the
-// routing's active experts are written. `chunk` and `iq1m_codes12` are moe_vector_product's.
-void moe_vector_clamped_swiglu(GgmlType type, const MoeTable& gate_up, const MoeRouting& routing,
-                               int max_active, int column_group, const void* activation,
-                               int columns, __nv_bfloat16* out, const float* scale, int per_token,
-                               float limit, int chunk, cudaStream_t stream,
-                               bool iq1m_codes12 = false);
 
 // One decode or verification call's experts (up to 8 tokens) in few launches: moe_decode_up writes
 // silu(gate . x) * (up . x) of every listed pair to `middle`, quantizing its tokens' BF16 inputs

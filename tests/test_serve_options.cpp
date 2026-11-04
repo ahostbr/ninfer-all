@@ -693,16 +693,11 @@ int main() {
     {
         // The T0833 kernel switches: off by default, on|off only.
         const auto defaults = parse({"ninfer-serve", "model.ninfer"});
-        failures += check(!defaults.deepseek_iq1m_matrix && !defaults.deepseek_iq1m_codes12 &&
-                              !defaults.deepseek_fused_swiglu,
-                          "a DeepSeek kernel switch is on by default");
-        const auto on = parse({"ninfer-serve", "model.ninfer", "--deepseek-iq1m-matrix", "on",
-                               "--deepseek-iq1m-codes12", "on", "--deepseek-fused-swiglu", "on"});
-        failures += check(on.deepseek_iq1m_matrix && on.deepseek_iq1m_codes12 &&
-                              on.deepseek_fused_swiglu,
+        failures += check(!defaults.deepseek_iq1m_matrix, "a DeepSeek kernel switch is on by default");
+        const auto on = parse({"ninfer-serve", "model.ninfer", "--deepseek-iq1m-matrix", "on"});
+        failures += check(on.deepseek_iq1m_matrix,
                           "a DeepSeek kernel switch did not reach serving options");
-        for (const char* flag : {"--deepseek-iq1m-matrix", "--deepseek-iq1m-codes12",
-                                 "--deepseek-fused-swiglu"}) {
+        for (const char* flag : {"--deepseek-iq1m-matrix"}) {
             bool rejected = false;
             try {
                 (void)parse({"ninfer-serve", "model.ninfer", flag, "yes"});

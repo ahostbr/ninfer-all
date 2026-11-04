@@ -314,27 +314,19 @@ the startup log names the artifact identity a profile must carry.
 
 ### Kernel switches for the GPU bench
 
-Four more switches exist to be measured against their absence on the GPU (T0833); each is a flag
-of its own, default off, with a startup line that says `ON` or `off`, and an environment variable
-for bench scripts (`1`, `on`, `true` or `0`, `off`, `false`; anything else stops the start; the
-variable wins over the flag). Whatever does not win is removed afterwards. None was run on a GPU
-when it was written; the expected effects below are estimates for the Coder pack on an RTX 5090.
+One more switch exists to be measured against its absence on the GPU (T0833): a flag of its own,
+default off, with a startup line that says `ON` or `off`, and an environment variable for bench
+scripts (`1`, `on`, `true` or `0`, `off`, `false`; anything else stops the start; the variable wins
+over the flag). Whatever does not win is removed afterwards.
 
 | Flag | Environment | What it changes | Same bits? |
 |---|---|---|---|
 | `--deepseek-iq1m-matrix on` | `NINFER_DS_IQ1M_MATRIX` | The IQ1_M routed experts (about 45 % of the Coder's expert bytes) of a call of more than 8 tokens run on the integer tensor-core kernel, through an IQ1_M tile loader added to the vendored ggml MMQ (`mmq-load-tiles.cuh`, shared with its test as `iq1m_tile.h`): int8 weights 8c-7 or 8c-9 and one factor `d(2s+1)/8` per 16 values, the layout IQ2_XS uses, over an activation without per-32 sums. Without it IQ1_M prompts re-decode each weight row once per 8 columns. | No: the integer dot is exact and the same, but the float sums run in a different order from the vector kernel's, as for every other type. Each pair's value still does not depend on the other pairs. |
-| `--deepseek-iq1m-codes12 on` | `NINFER_DS_IQ1M_CODES12` | Decode and verification kernels (chunks of 1, 2 and 4) read IQ1_M through a table of 4,096 entries (grid index and delta sign) of ready weights, 32 KiB of shared memory, instead of expanding the grid word per group. | Yes. |
-| `--deepseek-fused-swiglu on` | `NINFER_DS_FUSED_SWIGLU` | At decode and verification widths the routed gate and up rows and the clamped SwiGLU run in one kernel (`moe_vector_clamped_swiglu`), saving the memset, the activation kernel and the FP32 rows' write and read. | Yes: the epilogue is `ops/common/clamped_swiglu.h`, tested against the CPU mirror. |
-| `--prefill-cublas` | `NINFER_DS_PREFILL_CUBLAS` | The dense prompt GEMMs (attention and shared-expert projections, over 64 columns) dequantize their GGUF weights to BF16 and run through cuBLAS instead of the integer kernel. | No: weights round to BF16, and cuBLAS may choose another split for another width, so prompt splits no longer give identical bits. Measure its perplexity. |
 
-Expected effects: `--deepseek-iq1m-matrix` helps only if prompts are limited by the vector
+Expected effect: `--deepseek-iq1m-matrix` helps only if prompts are limited by the vector
 kernel's compute; if the copy of the experts is the limit (about 56 ms a layer at an assumed 25
 GB/s against roughly 60 ms of measured layer time at 2,048 tokens) it does nothing, and it
-should be measured at `--prefill-chunk 4096`, where copies are shared by more rows. The decode
-switches are small: a few launches in a block (fused) and a few percent of the IQ1_M expert
-kernels' time (codes12), against occupancy given up for the table. `--prefill-cublas` probably
-loses against the integer kernel on Blackwell (BF16 tensor cores run at half the int8 rate and
-the dequantize pass is weight-sized); it is wired because the question is cheap to ask.
+should be measured at `--prefill-chunk 4096`, where copies are shared by more rows.
 
 ## The Engram table
 

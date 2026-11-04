@@ -1243,8 +1243,7 @@ struct Executor::Impl {
         const auto product = [&](const Weight& m) {
             const ops::detail::GgufShape shape{m.qtype, m.n, m.k};
             gguf_scratch = std::max(gguf_scratch,
-                                    ops::detail::gguf_project_workspace_bytes({&shape, 1}, 1, int(t),
-                                                                options.kernels.dense_cublas));
+                                    ops::detail::gguf_project_workspace_bytes({&shape, 1}, 1, int(t)));
         };
         const auto block_products = [&](const LayerPlan& p) {
             for (const Weight& m : p.query_kv) { product(m); }
@@ -1293,8 +1292,7 @@ struct Executor::Impl {
             rows.n      = std::min<int>(head.n, vocab);
             const ops::detail::GgufShape hs{rows.qtype, rows.n, rows.k};
             gguf_scratch = std::max(gguf_scratch,
-                                    ops::detail::gguf_project_workspace_bytes({&hs, 1}, 1, kHeadRows,
-                                                                options.kernels.dense_cublas));
+                                    ops::detail::gguf_project_workspace_bytes({&hs, 1}, 1, kHeadRows));
         }
         std::size_t allocations = 0;
         const auto sum = [&](std::initializer_list<std::size_t> sizes) {
@@ -1398,7 +1396,7 @@ struct Executor::Impl {
             products[i].row      = row + rows;
             rows += parts[i].n;
         }
-        ops::detail::gguf_project(x, products, *workspace, stream, options.kernels.dense_cublas);
+        ops::detail::gguf_project(x, products, *workspace, stream);
         if (guard) { kernels::unscale_columns(out + row, stride, rows, t, scale, stream); }
     }
     void project(Tensor& x, const Weight& w, float* out, int stride, int row = 0) {
@@ -1416,8 +1414,7 @@ struct Executor::Impl {
         ops::detail::GgufProduct product;
         product.weight = &w;
         product.out    = &out;
-        ops::detail::gguf_project(x, {&product, 1}, *workspace, stream,
-                                  options.kernels.dense_cublas);
+        ops::detail::gguf_project(x, {&product, 1}, *workspace, stream);
         if (guard) {
             kernels::unscale_columns(static_cast<__nv_bfloat16*>(out.data), w.n, w.n, t, scale, stream);
         }
@@ -2025,8 +2022,7 @@ struct Executor::Impl {
                 parts[i].row      = rows;
                 rows += p.shared_gate_up[i].n;
             }
-            ops::detail::gguf_project(x, {parts, p.shared_gate_up.size()}, *workspace, stream,
-                                      options.kernels.dense_cublas);
+            ops::detail::gguf_project(x, {parts, p.shared_gate_up.size()}, *workspace, stream);
             Tensor middle = alloc_bf16(width, t);
             kernels::clamped_swiglu(gu, 2 * width, t, width, config.swiglu_limit, scale, 1,
                                     static_cast<__nv_bfloat16*>(middle.data), width, stream);
@@ -2066,10 +2062,7 @@ struct Executor::Impl {
             const int chunk = t <= 1 ? 1 : t <= 2 ? 2 : t <= 4 ? 4 : 8;
             void* act2      = take(gguf::vector_activation_bytes(w, pairs));
             CUDA_CHECK(cudaMemsetAsync(fixed, 0, std::size_t(t) * hidden * 8, on));
-            // The fused SwiGLU writes the middles of the stage's pairs and nothing else reads gu.
-            if (!options.kernels.fused_swiglu) {
-                CUDA_CHECK(cudaMemsetAsync(gu, 0, std::size_t(pairs) * 2 * w * 4, on));
-            }
+            CUDA_CHECK(cudaMemsetAsync(gu, 0, std::size_t(pairs) * 2 * w * 4, on));
             gguf::MoeOutput rows;
             rows.f32 = gu;
             gguf::MoeOutput out;
@@ -2079,19 +2072,13 @@ struct Executor::Impl {
                 gguf::MoeRouting part = routing;
                 part.active_count     = set;
                 part.active           = set + 1;
-                if (options.kernels.fused_swiglu) {
-                    gguf::moe_vector_clamped_swiglu(p.gate_up_type, gate_up, part, max_active, k,
-                                                    xq, t, middle, scale, k, config.swiglu_limit,
-                                                    chunk, on, options.kernels.iq1m_codes12);
-                } else {
-                    gguf::moe_vector_product(p.gate_up_type, gate_up, part, max_active, k, k, xq,
-                                             t, rows, chunk, on, options.kernels.iq1m_codes12);
-                    kernels::clamped_swiglu(gu, 2 * w, pairs, w, config.swiglu_limit, scale, k,
-                                            middle, w, on);
-                }
+                gguf::moe_vector_product(p.gate_up_type, gate_up, part, max_active, k, k, xq, t,
+                                         rows, chunk, on);
+                kernels::clamped_swiglu(gu, 2 * w, pairs, w, config.swiglu_limit, scale, k, middle,
+                                        w, on);
                 gguf::quantize_vector_activation(middle, w, pairs, nullptr, act2, on);
                 gguf::moe_vector_product(p.down_type, down, part, max_active, 1, k, act2, pairs,
-                                         out, chunk, on, options.kernels.iq1m_codes12);
+                                         out, chunk, on);
             };
             compute(call.cached_experts);
             from.await(on);
@@ -2284,29 +2271,20 @@ struct Executor::Impl {
             void* act2 = workspace->alloc_bytes(gguf::vector_activation_bytes(w, pairs)).data;
             auto* fixed = alloc<unsigned long long>(std::size_t(t) * hidden);
             CUDA_CHECK(cudaMemsetAsync(fixed, 0, std::size_t(t) * hidden * 8, stream));
-            // The fused SwiGLU writes the middles of the stage's pairs and nothing else reads gu.
-            if (!options.kernels.fused_swiglu) {
-                CUDA_CHECK(cudaMemsetAsync(gu, 0, std::size_t(pairs) * 2 * w * 4, stream));
-            }
+            CUDA_CHECK(cudaMemsetAsync(gu, 0, std::size_t(pairs) * 2 * w * 4, stream));
             gguf::MoeOutput rows;
             rows.f32 = gu;
             gguf::MoeOutput out;
             out.weighted = fixed;
             out.weights  = weights;
             const auto compute = [&](const gguf::MoeRouting& part) {
-                if (options.kernels.fused_swiglu) {
-                    gguf::moe_vector_clamped_swiglu(p.gate_up_type, gate_up, part, max_active, k,
-                                                    xq, t, middle, scale, k, config.swiglu_limit,
-                                                    chunk, stream, options.kernels.iq1m_codes12);
-                } else {
-                    gguf::moe_vector_product(p.gate_up_type, gate_up, part, max_active, k, k, xq,
-                                             t, rows, chunk, stream, options.kernels.iq1m_codes12);
-                    kernels::clamped_swiglu(gu, 2 * w, pairs, w, config.swiglu_limit, scale, k,
-                                            middle, w, stream);
-                }
+                gguf::moe_vector_product(p.gate_up_type, gate_up, part, max_active, k, k, xq, t,
+                                         rows, chunk, stream);
+                kernels::clamped_swiglu(gu, 2 * w, pairs, w, config.swiglu_limit, scale, k, middle,
+                                        w, stream);
                 gguf::quantize_vector_activation(middle, w, pairs, nullptr, act2, stream);
                 gguf::moe_vector_product(p.down_type, down, part, max_active, 1, k, act2, pairs,
-                                         out, chunk, stream, options.kernels.iq1m_codes12);
+                                         out, chunk, stream);
             };
             if (call) {
                 // Both stages add to the same exact fixed-point sum, each over its experts of the

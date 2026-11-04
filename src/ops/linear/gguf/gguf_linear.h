@@ -52,24 +52,14 @@ struct GgufShape {
 
 // Transient bytes gguf_project needs for these products (one K) at every width in
 // [min_tokens, max_tokens].
-//
-// `dequantize_wide` (see gguf_project) makes room for the dequantize-and-GEMM route at every width
-// past kDequantizedVectorColumns, as for a type without an integer kernel.
 [[nodiscard]] std::size_t gguf_project_workspace_bytes(std::span<const GgufShape> shapes,
                                                        std::int32_t min_tokens,
-                                                       std::int32_t max_tokens,
-                                                       bool dequantize_wide = false);
+                                                       std::int32_t max_tokens);
 
 // Runs every product against one BF16 activation x [K,T], quantizing x once per activation layout
 // (and once more per distinct input gather).
-//
-// `dequantize_wide` (--prefill-cublas for DeepSeek-V4.1): past 64 columns every product, whatever
-// its type, dequantizes its weight to BF16 a slab of rows at a time and runs a cuBLAS BF16 GEMM
-// with an FP32 accumulator, the route a type without an integer kernel takes, in place of the
-// integer tensor-core kernel. The activation then stays BF16 (no q8_1 rounding) and the weight
-// rounds to BF16: a quality trade measured by perplexity, off by default.
 void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
-                  WorkspaceArena& workspace, cudaStream_t stream, bool dequantize_wide = false);
+                  WorkspaceArena& workspace, cudaStream_t stream);
 
 void gguf_linear(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& workspace,
                  cudaStream_t stream);

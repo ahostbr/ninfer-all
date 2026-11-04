@@ -392,8 +392,6 @@ int main(int argc, char** argv) {
         engine_options.prefill_chunk            = cli.prefill_chunk;
         engine_options.deepseek_prompt_skip     = cli.deepseek_prompt_skip;
         engine_options.deepseek_iq1m_matrix     = cli.deepseek_iq1m_matrix;
-        engine_options.deepseek_iq1m_codes12    = cli.deepseek_iq1m_codes12;
-        engine_options.deepseek_fused_swiglu    = cli.deepseek_fused_swiglu;
         engine_options.kv_cache                 = cli.kv_cache;
         engine_options.speculative              = cli.speculative;
         engine_options.enable_vision            = cli.enable_vision;

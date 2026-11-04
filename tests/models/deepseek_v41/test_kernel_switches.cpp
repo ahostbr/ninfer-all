@@ -56,9 +56,7 @@ int main() {
 
     // The defaults are all off.
     const KernelSwitches defaults;
-    check(!defaults.iq1m_matrix && !defaults.iq1m_codes12 && !defaults.fused_swiglu &&
-              !defaults.dense_cublas,
-          "a kernel switch is on by default");
+    check(!defaults.iq1m_matrix, "a kernel switch is on by default");
     if (failures == 0) { std::cout << "kernel switches: all checks passed\n"; }
     return failures == 0 ? 0 : 1;
 }

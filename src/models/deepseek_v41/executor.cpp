@@ -1541,6 +1541,7 @@ struct Executor::Impl {
         }
         if (set != nullptr) {
             post_engram(*set, tokens.size(), dead, key);
+            eg_cur = set; // the layers wait on and copy this set's rows (collect_engram)
             return;
         }
         engram_copied->synchronize();
@@ -1706,6 +1707,10 @@ struct Executor::Impl {
         if (eg_cur != nullptr) {
             collect_engram(*eg_cur, p.engram, block);
             device_rows = eg_cur->dev;
+        } else if (options.engram_tuning.overlap != EngramOverlap::Off) {
+            // The overlapped reads land in a set's buffers, never in d_engram: a pass that
+            // reaches here without its set would compute on uninitialised rows.
+            throw std::logic_error("deepseek_v41 executor: overlapped Engram pass without its set");
         }
         kernels::engram_rows(static_cast<const std::uint8_t*>(device_rows) +
                                  (std::size_t(p.engram) * block + std::size_t(s.row) * columns) *

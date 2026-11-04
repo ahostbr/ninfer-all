@@ -328,6 +328,19 @@ kernel's compute; if the copy of the experts is the limit (about 56 ms a layer a
 GB/s against roughly 60 ms of measured layer time at 2,048 tokens) it does nothing, and it
 should be measured at `--prefill-chunk 4096`, where copies are shared by more rows.
 
+Combined run (T0833, 2026-11-04, 10.6K-token prompt, 64 output tokens; baseline 57.5 tok/s decode,
+842 tok/s prefill): `--deepseek-prompt-skip on --spec dspark --draft-confidence 0.7
+--deepseek-iq1m-matrix on --deepseek-engram-overlap ahead --deepseek-engram-dedupe on`.
+
+| `--prefill-chunk` | decode tok/s | prefill tok/s |
+|---|---|---|
+| 2048 | 66.8 | 1120 |
+| 4096 | 62-63 | 1180 |
+
+Without `--deepseek-iq1m-matrix` the 4096 combination's prefill is 1000 tok/s; without the two Engram
+switches it is 1040. With the matrix kernel on, answers are worded differently from the vector
+kernel's (the float sums run in another order) and were judged correct.
+
 ## The Engram table
 
 The two Engram blocks read 24 rows per token each (the 2-, 3- and 4-grams ending at the position,

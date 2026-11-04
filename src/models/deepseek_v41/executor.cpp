@@ -7,6 +7,7 @@
 #include "core/vmm.h"
 #include "core/weight_view.h"
 #include "models/deepseek_v41/cpu_experts.h"
+#include "models/deepseek_v41/delivery_plan.h"
 #include "models/deepseek_v41/kernels.h"
 #include "models/deepseek_v41/prompt_skip.h"
 #include "models/deepseek_v41/vision.h"
@@ -21,6 +22,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -38,6 +40,9 @@ namespace ninfer::models::deepseek_v41 {
 namespace {
 
 namespace gguf = ops::gguf;
+
+static_assert(kShortPromptRows == gguf::kMaxVectorColumns,
+              "a short prompt's rows are a decode call's vector width");
 
 constexpr std::size_t kAlign = 256;
 constexpr int kLatent        = 512; // the attention latent: key and value of every head
@@ -854,6 +859,9 @@ struct Executor::Impl {
         transport.cache_bytes     = options.expert_cache_bytes;
         transport.keep_free_bytes = kGraphReserve + (growing ? kKvHeadroom : 0);
         transport.elastic         = growing;
+        transport.prefetch_ahead      = options.expert_prefetch_ahead;
+        transport.track_wide_counts   = options.expert_track_prompt;
+        transport.profile_seeds_tier  = options.expert_profile_weights;
         const float dma_share     = options.expert_dma_share.value_or(0.0F);
         if (!(dma_share >= 0 && dma_share <= 1) || options.expert_cpu_threads > 256) {
             throw std::invalid_argument("DeepSeek-V4.1: the DMA share must be 0..1 and CPU threads 0..256");
@@ -2334,10 +2342,31 @@ struct Executor::Impl {
         std::memcpy(confidence.data(), host + b, std::size_t(b) * 4);
     }
 
+    // T0833 (expert_prefetch_ahead): names, for each block, the block whose wide expert call follows
+    // it in the coming pass (delivery_plan.h prefetch_chain), so the delivery copies that block's
+    // experts ahead; only the entries that changed since the last pass are written.
+    std::vector<std::int32_t> hinted_chain;
+    void hint_chain(const std::vector<std::int32_t>& chain) {
+        if (!delivery || !options.expert_prefetch_ahead) { return; }
+        hinted_chain.resize(layers.size(), -2);
+        for (std::size_t l = 0; l < layers.size() && l < chain.size(); ++l) {
+            if (hinted_chain[l] == chain[l] || layers[l].delivery_layer < 0) { continue; }
+            const std::int32_t next = chain[l];
+            delivery->hint_next(std::size_t(layers[l].delivery_layer),
+                                next >= 0 && layers[std::size_t(next)].delivery_layer >= 0
+                                    ? layers[std::size_t(next)].delivery_layer : -1);
+            hinted_chain[l] = chain[l];
+        }
+    }
+
     // A pass over staged rows (tokens, positions and, for decode rows, sequences on the device; the
     // Engram rows copied).
     void run(const Pass& s) {
         const int t = s.t;
+        // A wide pass runs every block in order, as this plain split of its rows does.
+        if (t > gguf::kMaxVectorColumns && options.expert_prefetch_ahead) {
+            hint_chain(prefetch_chain(int(layers.size()), -1, t, t, 0));
+        }
         image_mask  = step_images.empty() ? nullptr : static_cast<const std::uint8_t*>(d_image.p) + s.row;
         workspace->reset();
         auto scope = workspace->scope();
@@ -2586,6 +2615,9 @@ struct Executor::Impl {
             }
         }
         std::vector<SkipPiece> pieces;
+        if (options.expert_prefetch_ahead) {
+            hint_chain(prefetch_chain(int(layers.size()), skip_at, n, c, skip));
+        }
         for (std::size_t l = 0; l < layers.size(); ++l) {
             const LayerPlan& p = layers[l];
             plan_skip_pieces(int(l), skip_at, n, c, skip, pieces);
@@ -2916,6 +2948,27 @@ struct Executor::Impl {
         }
     }
 
+    // Cache settle on every delivery (the compute stream's last call is done), the budget shared.
+    ExpertSettle settle_experts(double max_ms, const std::function<bool()>& cancel) {
+        ExpertSettle total;
+        total.stop = ExpertSettle::Stop::Off;
+        if (!delivery) { return total; }
+        const auto start = std::chrono::steady_clock::now();
+        total            = delivery->settle(max_ms, cancel);
+        for (std::size_t r = 1; r < expert_peers.size(); ++r) {
+            RankBinding bind(device, r);
+            const double used = std::chrono::duration<double, std::milli>(
+                                    std::chrono::steady_clock::now() - start).count();
+            const auto part = expert_peers[r].delivery->settle(std::max(0.0, max_ms - used), cancel);
+            total.rounds    = std::max(total.rounds, part.rounds);
+            total.swaps += part.swaps;
+            total.fed = total.fed || part.fed;
+        }
+        total.milliseconds = std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now() - start).count();
+        return total;
+    }
+
     void reset_state(std::uint32_t sequence) {
         positions.at(sequence) = 0;
         histories.at(sequence) = {};
@@ -3101,10 +3154,17 @@ std::uint32_t Executor::prompt_skip_keep() const noexcept {
     } catch (...) { return 0; }
 }
 
+ExpertSettle Executor::settle_experts(double max_ms, const std::function<bool()>& cancel) {
+    return impl_->settle_experts(max_ms, cancel);
+}
+
 void Executor::forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,
                        std::uint32_t logit_rows, std::span<const ImageRows> images,
                        std::uint32_t skip_rows) {
-    if (logit_rows == 0 && !(skip_rows > 0 && skip_rows >= tokens.size())) {
+    // A call of decode width may leave no logits: a short prompt's rows steps (delivery_plan.h)
+    // keep them for the step that ends the prompt.
+    if (logit_rows == 0 && !(skip_rows > 0 && skip_rows >= tokens.size()) &&
+        tokens.size() > kShortPromptRows) {
         throw std::invalid_argument("deepseek_v41 forward: no logit rows");
     }
     impl_->forward(sequence, tokens, logit_rows, 0, images, skip_rows);

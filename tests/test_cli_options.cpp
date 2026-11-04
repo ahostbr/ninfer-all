@@ -33,6 +33,40 @@ int check(bool condition, const char* message) {
 
 int run_tests() {
     int failures = 0;
+    {
+        // T0833: the DeepSeek-V4.1 delivery experiments, off by default.
+        const auto base = parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--expert-residency", "host"});
+        failures += check(!base.hybrid_experts.deepseek_delivery_requested() &&
+                              base.hybrid_experts.deepseek_cache_settle_ms == 400 &&
+                              base.hybrid_experts.deepseek_cache_settle_idle_ms == 6000 &&
+                              base.hybrid_experts.deepseek_short_prompt_tokens == 96,
+                          "the --deepseek-* delivery experiments are not off by default");
+        const auto all = parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--expert-residency", "host",
+                                "--deepseek-prefetch-ahead", "on", "--deepseek-cache-settle", "on",
+                                "--deepseek-cache-settle-ms", "250", "--deepseek-cache-settle-idle-ms", "0",
+                                "--deepseek-short-prompt", "on", "--deepseek-short-prompt-tokens", "192",
+                                "--deepseek-profile-weights", "on"});
+        failures += check(all.hybrid_experts.deepseek_prefetch_ahead && all.hybrid_experts.deepseek_cache_settle &&
+                              all.hybrid_experts.deepseek_short_prompt && all.hybrid_experts.deepseek_profile_weights &&
+                              all.hybrid_experts.deepseek_cache_settle_ms == 250 &&
+                              all.hybrid_experts.deepseek_cache_settle_idle_ms == 0 &&
+                              all.hybrid_experts.deepseek_short_prompt_tokens == 192,
+                          "the --deepseek-* delivery experiments were not parsed");
+        const auto off = parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--expert-residency", "host",
+                                "--deepseek-prefetch-ahead", "on", "--deepseek-prefetch-ahead", "off"});
+        failures += check(!off.hybrid_experts.deepseek_prefetch_ahead, "--deepseek-prefetch-ahead off did not clear it");
+        for (const auto& bad : std::vector<std::vector<std::string>>{
+                 {"--deepseek-prefetch-ahead", "yes"}, {"--deepseek-cache-settle", "1"},
+                 {"--deepseek-short-prompt", "true"}, {"--deepseek-profile-weights", "ON"},
+                 {"--deepseek-cache-settle-ms", "-5"}, {"--deepseek-cache-settle-ms", "600001"},
+                 {"--deepseek-cache-settle-idle-ms", "soon"}, {"--deepseek-short-prompt-tokens", "0"},
+                 {"--deepseek-short-prompt-tokens", "4097"}}) {
+            std::vector<std::string> argv{"ninfer-cli", "model.ninfer", "--prompt", "x", "--expert-residency", "host"};
+            argv.insert(argv.end(), bad.begin(), bad.end());
+            failures += check(rejects([&] { (void)parse(argv); }),
+                              (bad[0] + " accepted " + bad[1]).c_str());
+        }
+    }
     failures += check(!parse({"ninfer-cli", "model.ninfer", "--prompt", "x"}).deepseek_prompt_skip &&
                           parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
                                  "--deepseek-prompt-skip", "on"}).deepseek_prompt_skip &&

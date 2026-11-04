@@ -1,11 +1,13 @@
 #pragma once
 
 #include "core/device.h"
+#include "core/expert_settle.h"
 #include "core/expert_tier.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -104,6 +106,20 @@ struct ExpertDeliveryOptions {
     // Which experts the cache holds once it is full (core/expert_tier.h), a pool per slot size.
     ExpertTierOptions tier{};
     ExpertCpuOptions cpu{};
+    // T0833 experiments, off by default.
+    // A wide call queues the copies of the layer that follows it (the executor's hint_next, else
+    // the layer that followed it last time) behind its own, before it waits for its own, instead
+    // of after it has been released to compute: the bus stays busy through the wait and the
+    // service's bookkeeping, and the layer is the pass's real next one when the order varies.
+    bool prefetch_ahead = false;
+    // Wide calls count each expert's pairs (a prompt's routes) for settle().
+    bool track_wide_counts = false;
+    // The pairs a layer's counts are scaled to when a prompt's routes (settle) or a routing profile
+    // (prime with profile_seeds_tier) are fed to the tier: about what a few dozen decode tokens
+    // route, so a prompt informs the cache without burying the conversation's own counts.
+    float tier_pairs = 160;
+    // prime(): the profile's counts also become the tier's, not only the cache's first contents.
+    bool profile_seeds_tier = false;
 };
 struct ExpertDeliveryStats {
     std::uint64_t requests = 0, routes = 0, hits = 0, misses = 0, evictions = 0;
@@ -250,6 +266,16 @@ public:
     void prime(const std::vector<std::vector<std::uint64_t>>* profile);
     // Every route the narrow calls took through each layer's experts since prime().
     [[nodiscard]] std::vector<std::vector<std::uint64_t>> totals() const;
+    // Names the layer a wide call to `layer` is followed by (ExpertDeliveryOptions::prefetch_ahead),
+    // -1 to leave it to what the order of earlier passes taught. Any thread, between calls.
+    void hint_next(std::size_t layer, std::int64_t next);
+    // Cache settle, after the compute stream's last call (it drains first, like shrink_cache): the
+    // wide calls' routes since the last settle (track_wide_counts) become tier counts, and swap
+    // rounds run (each carried out whole: victims leave, candidates copy in, tables upload) until
+    // one swaps nothing, `max_ms` pass before a round, `cancel` is true before one, or a limit.
+    // Decode and verification calls do the same a few experts at a time between passes; this does it
+    // at once, where the engine has nothing else to do.
+    ExpertSettle settle(double max_ms, const std::function<bool()>& cancel = {});
     // With a CPU share: its threads and vector backend, e.g. "15 pinned threads"; else empty.
     [[nodiscard]] std::string cpu_description() const;
 

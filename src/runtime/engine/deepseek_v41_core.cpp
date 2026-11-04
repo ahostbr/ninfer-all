@@ -6,6 +6,7 @@
 #include "core/host_pages.h"
 #include "core/startup.h"
 #include "core/tensor_split.h"
+#include "models/deepseek_v41/delivery_plan.h"
 #include "models/deepseek_v41/prompt_skip.h"
 #include "models/expert_profile.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
@@ -175,6 +176,17 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
         throw std::invalid_argument("expert DMA shares, CPU threads and routing profiles require "
                                     "host or disk experts (--expert-residency host|disk)");
     }
+    // T0833 delivery experiments: the options and NINFER_DS_* variables, which need experts on the
+    // host or in files, and (but the profile weights) a single device's delivery.
+    const models::deepseek_v41::DeliveryFlags delivery =
+        models::deepseek_v41::delivery_flags(hybrid);
+    if (options.expert_residency == ExpertResidency::Device &&
+        (delivery.prefetch_ahead || delivery.cache_settle || delivery.short_prompt ||
+         delivery.profile_weights)) {
+        throw std::invalid_argument("the --deepseek-prefetch-ahead, -cache-settle, -short-prompt and "
+                                    "-profile-weights experiments need host or disk experts "
+                                    "(--expert-residency host|disk)");
+    }
     if (options.tensor_parallel ? device.size() < 2 : device.size() != 1) {
         throw std::invalid_argument("DeepSeek-V4.1 runs on one device, or divides its routed "
                                     "experts over several with --tensor-parallel");
@@ -295,6 +307,9 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
     executor.expert_cache_bytes = options.expert_cache_bytes;
     executor.expert_dma_share   = hybrid.dma_share;
     executor.expert_cpu_threads = hybrid.cpu_threads;
+    executor.expert_prefetch_ahead  = delivery.prefetch_ahead;
+    executor.expert_track_prompt    = delivery.cache_settle;
+    executor.expert_profile_weights = delivery.profile_weights;
     // Expert parallelism: every device serves a share of the routed experts from host memory or
     // the files over its own bus; without --tensor-split the shares are equal.
     if (options.tensor_parallel) {
@@ -326,8 +341,17 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
         const std::vector<std::size_t> widths(model->expert_banks().size(),
                                               std::size_t(model->config().num_experts));
         if (!hybrid.routing_profile.empty()) {
-            executor.expert_profile = models::read_expert_profile(hybrid.routing_profile,
-                                                                  model->info().artifact_id, widths);
+            // Strata's profile of this pack carries rows for the DSpark drafter's layers after the
+            // text layers' (40 x 192 counts, or 43 x 192); both are read, positionally.
+            executor.expert_profile = models::read_expert_profile(
+                hybrid.routing_profile, model->info().artifact_id, widths,
+                models::kExpertProfileSpareRows);
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                               "DeepSeek-V4.1: expert profile %s read for artifact %s: %zu layers "
+                               "of %u experts (counts by position in the artifact's kept experts)",
+                               hybrid.routing_profile.string().c_str(),
+                               models::expert_profile_artifact_id(model->info().artifact_id).c_str(),
+                               widths.size(), unsigned(model->config().num_experts));
         } else {
             executor.expert_profile = models::builtin_expert_profile("deepseek-v4.1", widths);
         }
@@ -411,6 +435,30 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
             publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
                                "DeepSeek-V4.1: long-prompt layer skip off");
         }
+    }
+    if (options.expert_residency != ExpertResidency::Device) {
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "DeepSeek-V4.1: next-block expert prefetch ahead %s%s",
+                           delivery.prefetch_ahead ? "ON" : "off",
+                           delivery.prefetch_ahead
+                               ? " (a wide call queues the next block's copies before waiting for its own; the next block is named from the pass's order)"
+                               : "");
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "DeepSeek-V4.1: expert cache settle %s",
+                           delivery.cache_settle
+                               ? ("ON (" + std::to_string(delivery.settle_ms) + " ms after a prompt, " +
+                                  std::to_string(delivery.settle_idle_ms) + " ms while idle)").c_str()
+                               : "off");
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "DeepSeek-V4.1: short prompts as rows of %u %s",
+                           unsigned(models::deepseek_v41::kShortPromptRows),
+                           delivery.short_prompt
+                               ? ("ON (prompts of up to " + std::to_string(delivery.short_prompt_tokens) +
+                                  " new tokens take the narrow expert path)").c_str()
+                               : "off");
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "DeepSeek-V4.1: routing profile counts seed the expert tier %s",
+                           delivery.profile_weights ? "ON" : "off");
     }
     if (!executor.expert_split.empty()) {
         const std::uint32_t experts = model->config().num_experts;
@@ -687,6 +735,10 @@ struct DeepSeekV41Core::Impl {
     // 1 for its earlier rows (prompt_skip.h); 0: no skip. Whether to log each prompt's prefill.
     std::uint32_t skip_keep = 0;
     bool prefill_log        = true;
+    // T0833: the delivery experiments this Engine runs (all off for scoring and device experts), and
+    // whether a settle is owed once the Engine idles (touched by the worker alone).
+    models::deepseek_v41::DeliveryFlags flags;
+    bool idle_settle_due = false;
     static constexpr TokenId kBos = 0; // <｜begin▁of▁sentence｜>
 
     mutable std::mutex queue_mutex;
@@ -769,6 +821,10 @@ struct DeepSeekV41Core::Impl {
           diagnostics(options.diagnostic_observer),
           skip_keep(prompt_skip_wanted(options) ? i.executor->prompt_skip_keep() : 0),
           prefill_log(prefill_log_wanted()),
+          flags(options.purpose == EnginePurpose::Generation &&
+                        options.expert_residency != ExpertResidency::Device
+                    ? models::deepseek_v41::delivery_flags(options.hybrid_experts)
+                    : models::deepseek_v41::DeliveryFlags{}),
           slots(i.executor->options().sequences),
           decode_rounds_per_prefill(
               options.decode_rounds_per_prefill != 0
@@ -1038,6 +1094,11 @@ struct DeepSeekV41Core::Impl {
 
     void loop() {
         for (;;) {
+            if (idle_settle_due) {
+                try {
+                    settle_when_idle();
+                } catch (...) { fail_engine(std::current_exception()); }
+            }
             {
                 std::unique_lock lock(queue_mutex);
                 queue_cv.wait(lock, [&] { return stopping || !pending.empty() || any_active(); });
@@ -1060,6 +1121,7 @@ struct DeepSeekV41Core::Impl {
                 admit();
                 worked = step();
                 check_progress();
+                if (worked && flags.cache_settle && flags.settle_idle_ms != 0) { idle_settle_due = true; }
             } catch (...) { fail_engine(std::current_exception()); }
             publish_stats();
             if (!worked) {
@@ -1411,7 +1473,20 @@ struct DeepSeekV41Core::Impl {
             return static_cast<std::uint32_t>(
                 std::min<std::size_t>(left, instance.executor->options().prefill_chunk));
         }
-        return std::min(instance.executor->prompt_step(), prefill_until(r) - r.prefilled);
+        const std::uint32_t step =
+            std::min(instance.executor->prompt_step(), prefill_until(r) - r.prefilled);
+        return short_prompt(r) ? models::deepseek_v41::short_prompt_step(step) : step;
+    }
+
+    // Whether the request's prompt runs as rows of a decode call's width (T0833): at most
+    // short_prompt_tokens computed tokens, no pictures, no branches. Rows of eight take the narrow
+    // expert path, which serves cache hits from the cache and leaves a share of the misses to the
+    // CPU, where a wide pass copies most of a layer's experts for a few dozen tokens.
+    [[nodiscard]] bool short_prompt(const Request& r) const {
+        const auto prompt_n = static_cast<std::uint32_t>(r.prompt_tokens.size());
+        return !r.branches && r.media.empty() && prompt_n > r.reused &&
+               models::deepseek_v41::short_prompt(flags.short_prompt, flags.short_prompt_tokens,
+                                                  prompt_n - r.reused);
     }
 
     // The prompt position the request's prefill steps run up to before the state is kept: the next
@@ -1719,8 +1794,11 @@ struct DeepSeekV41Core::Impl {
                 ? models::deepseek_v41::plan_prompt_skip(n, until - r.prefilled, skip_keep)
                 : 0;
         if (lengths.empty()) {
-            executor.forward(r.slot, chunk, skip == n ? 0 : 1,
-                             chunk_images(r, r.prefilled, r.prefilled + n), skip);
+            const std::uint32_t logits =
+                short_prompt(r) ? models::deepseek_v41::short_prompt_logits(r.prefilled, n, prompt_n)
+                                : (skip == n ? 0U : 1U);
+            executor.forward(r.slot, chunk, logits, chunk_images(r, r.prefilled, r.prefilled + n),
+                             skip);
         } else {
             executor.forward_prompt_branches(r.slot, chunk, branch_tokens, lengths);
         }
@@ -1950,14 +2028,43 @@ struct DeepSeekV41Core::Impl {
                            "DeepSeek-V4.1 prefill: %u new tokens (%u reused) in %.2f s = %.0f tok/s, "
                            "%u step(s) of chunks of %u (spans of %u), %llu rows skipped past the "
                            "first ratio-1 block; experts: %.2f GiB copied, %.2f s serving, %llu "
-                           "layers prefetched, %llu bank reuses, %llu requests",
+                           "layers prefetched, %llu bank reuses, %llu requests%s",
                            computed, r.reused, wall, wall > 0 ? double(computed) / wall : 0.0,
                            r.prefill_steps, executor.options().prefill_chunk,
                            executor.prompt_step(), static_cast<unsigned long long>(r.skipped_rows),
                            double(experts.copied_bytes) / 1073741824.0, experts.service_seconds,
                            static_cast<unsigned long long>(experts.prefetched_layers),
                            static_cast<unsigned long long>(experts.bank_reuses),
-                           static_cast<unsigned long long>(experts.requests));
+                           static_cast<unsigned long long>(experts.requests),
+                           short_prompt(r) ? "; short prompt, rows of 8 through the narrow expert path"
+                                           : "");
+    }
+
+    // Cache settle (T0833): rounds of the expert tier now, the compute stream idle. `cancel` is
+    // polled between rounds.
+    template <class Cancel>
+    void settle_cache(double max_ms, const char* when, Cancel&& cancel) {
+        const auto result = instance.executor->settle_experts(max_ms, cancel);
+        if (result.rounds == 0 || (!result.fed && result.swaps == 0)) { return; }
+        publish_diagnostic(diagnostics, DiagnosticLevel::Info,
+                           "DeepSeek-V4.1 cache settle %s: %u round(s), %llu expert(s) swapped in "
+                           "%.0f ms (%s)%s",
+                           when, result.rounds, static_cast<unsigned long long>(result.swaps),
+                           result.milliseconds, stop_name(result.stop),
+                           result.fed ? ", the prompt's routes counted" : "");
+    }
+
+    // Once the Engine has nothing to run: the rounds the last decode passes did not reach.
+    void settle_when_idle() {
+        {
+            std::lock_guard lock(queue_mutex);
+            if (stopping || !pending.empty() || any_active()) { return; }
+        }
+        idle_settle_due = false;
+        settle_cache(double(flags.settle_idle_ms), "while idle", [&] {
+            std::lock_guard lock(queue_mutex);
+            return stopping || !pending.empty();
+        });
     }
 
     // The prompt is in (and a branched read's branches): the request takes its first token and
@@ -1975,6 +2082,19 @@ struct DeepSeekV41Core::Impl {
             stats.prefill_seconds_total += seconds(r.prefill_start, r.prefill_end);
         }
         if (prefill_log) { log_prefill(r, prompt_n); }
+        if (flags.cache_settle && flags.settle_ms != 0) {
+            // Not while another request decodes: it would wait for the rounds.
+            const bool others = std::any_of(slots.begin(), slots.end(), [&](const Slot& slot) {
+                return slot.request && slot.request.get() != &r && slot.request->decoding;
+            });
+            if (!others) {
+                settle_cache(double(flags.settle_ms), "after a prompt", [&] {
+                    std::lock_guard lock(queue_mutex);
+                    return stopping;
+                });
+            }
+        }
+        idle_settle_due = flags.cache_settle && flags.settle_idle_ms != 0;
         const auto& exec = r.options.execution;
         const std::uint32_t capacity =
             effective_output_capacity(exec.requested_output_tokens, max_context, prompt_n);

@@ -673,14 +673,11 @@ int main() {
     {
         // T0833: the Engram read experiments reach the serving options, off unless asked for.
         const auto base = parse({"ninfer-serve", "model.ninfer"}).ngram_table;
-        failures += check(!base.engram_dedupe && base.engram_overlap == ninfer::EngramOverlap::Off &&
-                              !base.read_refill && !base.engram_default_cache,
+        failures += check(!base.engram_dedupe && base.engram_overlap == ninfer::EngramOverlap::Off,
                           "the Engram read experiments are not off by default in serving");
         const auto on = parse({"ninfer-serve", "model.ninfer", "--deepseek-engram-dedupe", "on",
-                               "--deepseek-engram-overlap", "pass", "--file-read-refill", "on",
-                               "--deepseek-engram-default-cache", "on"}).ngram_table;
-        failures += check(on.engram_dedupe && on.engram_overlap == ninfer::EngramOverlap::Pass &&
-                              on.read_refill && on.engram_default_cache,
+                               "--deepseek-engram-overlap", "pass"}).ngram_table;
+        failures += check(on.engram_dedupe && on.engram_overlap == ninfer::EngramOverlap::Pass,
                           "the Engram read experiments did not reach serving options");
         bool refused = false;
         try {

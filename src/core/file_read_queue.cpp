@@ -57,7 +57,6 @@ void release(unsigned* p, unsigned value) {
 
 struct FileReadQueue::Impl {
     bool direct;
-    bool refill = false;
     std::vector<ReadSlot> slots;
     std::vector<std::filesystem::path> paths;
 #ifdef _WIN32
@@ -169,109 +168,24 @@ struct FileReadQueue::Impl {
 
     // All allocation and validation precede submission. Completion handling cannot throw while
     // another operation can still write to a caller's output or this queue's bounce buffers.
-    void prepare_slot(std::size_t index, const QueuedFileRead& read) {
-        auto& slot = slots[index];
-        slot.prefix = direct ? read.offset % kAlignment : 0;
-        slot.offset = read.offset - slot.prefix;
-        slot.needed = slot.prefix + read.destination.size();
-        slot.requested = direct ? (slot.needed + kAlignment - 1) & ~(kAlignment - 1) : slot.needed;
-        if (direct && slot.requested > slot.capacity) {
-            slot.bounce.reset(static_cast<std::uint8_t*>(
-                ::operator new(slot.requested, std::align_val_t{kAlignment})));
-            slot.capacity = slot.requested;
-        }
-        slot.data = direct ? slot.bounce.get() : read.destination.data();
-        slot.have = 0;
-        slot.error = 0;
-        slot.done = read.destination.empty();
-    }
-
     void prepare(std::span<const QueuedFileRead> group) {
-        for (std::size_t i = 0; i < group.size(); ++i) { prepare_slot(i, group[i]); }
-    }
-
-    // A completion of `result` bytes (or an error, when not positive) on a slot reading `read`:
-    // marks the slot done, or queues the rest of a short read.
-    void on_completion(std::size_t index, std::int64_t result, const QueuedFileRead& read) {
-        auto& slot = slots[index];
-        if (result <= 0) {
-            // Zero means EOF. Use a platform-independent sentinel for a short range.
-            slot.error = result < 0 ? static_cast<int>(-result) : -1;
-            slot.done = true;
-        } else {
-            slot.have += static_cast<std::size_t>(result);
-            if (slot.have >= slot.needed) {
-                slot.done = true;
-            } else if (direct && slot.have % kAlignment != 0) {
-                slot.error = -1;
-                slot.done = true;
-            } else {
-                enqueue(index, read.file);
+        for (std::size_t i = 0; i < group.size(); ++i) {
+            const auto& read = group[i];
+            auto& slot = slots[i];
+            slot.prefix = direct ? read.offset % kAlignment : 0;
+            slot.offset = read.offset - slot.prefix;
+            slot.needed = slot.prefix + read.destination.size();
+            slot.requested = direct ? (slot.needed + kAlignment - 1) & ~(kAlignment - 1) : slot.needed;
+            if (direct && slot.requested > slot.capacity) {
+                slot.bounce.reset(static_cast<std::uint8_t*>(
+                    ::operator new(slot.requested, std::align_val_t{kAlignment})));
+                slot.capacity = slot.requested;
             }
+            slot.data = direct ? slot.bounce.get() : read.destination.data();
+            slot.have = 0;
+            slot.error = 0;
+            slot.done = read.destination.empty();
         }
-    }
-
-    std::string failure_text(std::size_t index, const QueuedFileRead& read) const {
-        const auto& slot = slots[index];
-        return "file read queue: " + paths[read.file].string() +
-               (slot.error == -1 ? " ends early"
-                                 : " read failed (error " + std::to_string(slot.error) + ")");
-    }
-
-    // The batch with every slot kept busy: as a slot completes it takes the next read. A failure
-    // stops new reads, drains the ones in flight (their buffers must outlive them) and throws the
-    // first failure.
-    void read_refilling(std::span<const QueuedFileRead> reads) {
-        constexpr std::size_t kNone = std::numeric_limits<std::size_t>::max();
-        std::vector<std::size_t> owner(slots.size(), kNone);
-        std::size_t next = 0, active = 0;
-        std::string failure;
-        // Takes the slot's finished read: checks it, and copies a direct read out of its bounce.
-        const auto finish = [&](std::size_t index) {
-            const auto& read = reads[owner[index]];
-            if (slots[index].error != 0) {
-                if (failure.empty()) { failure = failure_text(index, read); }
-            } else if (direct && !read.destination.empty()) {
-                std::memcpy(read.destination.data(), slots[index].data + slots[index].prefix,
-                            read.destination.size());
-            }
-            owner[index] = kNone;
-            --active;
-        };
-        const auto start = [&](std::size_t index) {
-            while (failure.empty() && next < reads.size()) {
-                owner[index] = next;
-                prepare_slot(index, reads[next++]);
-                ++active;
-                if (!slots[index].done) {
-                    enqueue(index, reads[owner[index]].file);
-                    return;
-                }
-                finish(index); // an empty read
-            }
-        };
-        for (std::size_t index = 0; index < std::min(slots.size(), reads.size()); ++index) {
-            start(index);
-        }
-        while (active != 0) {
-            flush();
-            bool started = false;
-            for (std::size_t index = 0; index < slots.size(); ++index) {
-                if (owner[index] != kNone && slots[index].done) {
-                    finish(index);
-                    start(index);
-                    started = true;
-                }
-            }
-            if (started) { continue; }
-            const auto [index, result] = complete();
-            on_completion(index, result, reads[owner[index]]);
-            if (slots[index].done) {
-                finish(index);
-                start(index);
-            }
-        }
-        if (!failure.empty()) { throw FileReadError(failure); }
     }
 
     void enqueue(std::size_t index, std::size_t file) noexcept {
@@ -372,10 +286,6 @@ struct FileReadQueue::Impl {
                 throw std::invalid_argument("file read queue: invalid file, offset or range size");
             }
         }
-        if (refill && reads.size() > slots.size()) {
-            read_refilling(reads);
-            return;
-        }
         for (std::size_t first = 0; first < reads.size(); first += slots.size()) {
             const auto group = reads.subspan(first, std::min(slots.size(), reads.size() - first));
             prepare(group);
@@ -387,11 +297,31 @@ struct FileReadQueue::Impl {
                 if (std::all_of(slots.begin(), slots.begin() + group.size(),
                                 [](const auto& slot) { return slot.done; })) { break; }
                 const auto [index, result] = complete();
-                on_completion(index, result, group[index]);
+                auto& slot = slots[index];
+                if (result <= 0) {
+                    // Zero means EOF. Use a platform-independent sentinel for a short range.
+                    slot.error = result < 0 ? static_cast<int>(-result) : -1;
+                    slot.done = true;
+                } else {
+                    slot.have += static_cast<std::size_t>(result);
+                    if (slot.have >= slot.needed) {
+                        slot.done = true;
+                    } else if (direct && slot.have % kAlignment != 0) {
+                        slot.error = -1;
+                        slot.done = true;
+                    } else {
+                        enqueue(index, group[index].file);
+                    }
+                }
             }
             for (std::size_t i = 0; i < group.size(); ++i) {
                 const auto& slot = slots[i];
-                if (slot.error != 0) { throw FileReadError(failure_text(i, group[i])); }
+                if (slot.error != 0) {
+                    throw FileReadError("file read queue: " + paths[group[i].file].string() +
+                                        (slot.error == -1 ? " ends early"
+                                                          : " read failed (error " +
+                                                                std::to_string(slot.error) + ")"));
+                }
             }
             if (direct) {
                 for (std::size_t i = 0; i < group.size(); ++i) {
@@ -406,10 +336,9 @@ struct FileReadQueue::Impl {
 };
 
 std::unique_ptr<FileReadQueue> FileReadQueue::open(
-    std::span<const std::filesystem::path> paths, bool direct, std::size_t depth, bool refill) {
+    std::span<const std::filesystem::path> paths, bool direct, std::size_t depth) {
     if (depth == 0 || depth > 1024) { throw std::invalid_argument("file read queue: depth must be 1..1024"); }
     auto impl = std::make_unique<Impl>(direct, depth);
-    impl->refill = refill;
     if (!impl->initialize(paths)) { return nullptr; }
     return std::unique_ptr<FileReadQueue>(new FileReadQueue(std::move(impl)));
 }

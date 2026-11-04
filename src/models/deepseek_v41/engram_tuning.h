@@ -2,9 +2,8 @@
 
 // T0833: the switches of the Engram read path's speed experiments. Each is an A/B flag that
 // defaults to off: it changes how the rows are read, never which bytes. The core resolves them
-// from the command line and the environment (NINFER_DS_ENGRAM_DEDUPE, NINFER_DS_ENGRAM_OVERLAP,
-// NINFER_FILE_READ_REFILL, NINFER_DS_ENGRAM_DEFAULT_CACHE) and logs each as ON or off at start.
-// Pure functions, so the parsing and the sizing rule run without a device.
+// from the command line and the environment (NINFER_DS_ENGRAM_DEDUPE, NINFER_DS_ENGRAM_OVERLAP) and
+// logs each as ON or off at start. Pure functions, so the parsing runs without a device.
 
 #include "ninfer/model_enums.h"
 
@@ -22,10 +21,6 @@ struct EngramTuning {
     // Repeated rows of a batch are read once, and image tokens' rows (never used) are not read.
     bool dedupe = false;
     EngramOverlap overlap = EngramOverlap::Off;
-    // The file read queue refills each slot as it completes (the Engram reader's queue).
-    bool refill = false;
-    // With no --ngram-ram-mib, the disk reader keeps a row cache of default_engram_cache_bytes().
-    bool default_cache = false;
 };
 
 // "1", "on", "true" and "0", "off", "false" (lower case); anything else is refused, so a typo in
@@ -67,21 +62,7 @@ template <class Lookup>
     if (const char* v = text("NINFER_DS_ENGRAM_OVERLAP")) {
         tuning.overlap = parse_overlap("NINFER_DS_ENGRAM_OVERLAP", v);
     }
-    if (const char* v = text("NINFER_FILE_READ_REFILL")) {
-        tuning.refill = parse_switch("NINFER_FILE_READ_REFILL", v);
-    }
-    if (const char* v = text("NINFER_DS_ENGRAM_DEFAULT_CACHE")) {
-        tuning.default_cache = parse_switch("NINFER_DS_ENGRAM_DEFAULT_CACHE", v);
-    }
     return tuning;
-}
-
-// The row cache the disk reader gets when the user names none: Strata's rule, one 64th of the RAM
-// the process can still get, between 16 and 256 MiB (ds4_model.cu:3417-3421). Zero available
-// memory (unknown) takes the floor.
-[[nodiscard]] inline std::uint64_t default_engram_cache_bytes(std::uint64_t available_bytes) noexcept {
-    constexpr std::uint64_t kMiB = 1ULL << 20;
-    return std::clamp<std::uint64_t>(available_bytes / 64, 16 * kMiB, 256 * kMiB);
 }
 
 // The row ids of a pass in the order the device reads them, block after block: out[(b * t + r) *

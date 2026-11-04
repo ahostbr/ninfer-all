@@ -22,13 +22,8 @@ public:
     // Linux: io_uring; Windows: overlapped reads and IOCP. Returns null when the OS or its
     // sandbox disables the backend. File/open/allocation failures throw. Direct mode accepts
     // unaligned logical ranges; the queue owns at most depth aligned bounce buffers.
-    //
-    // refill: a batch longer than `depth` starts its next read as soon as any slot completes, so
-    // the queue stays full to the end of the batch; otherwise (default) it starts the next group
-    // of `depth` reads when the whole group has completed. The bytes read are the same.
     [[nodiscard]] static std::unique_ptr<FileReadQueue>
-    open(std::span<const std::filesystem::path> paths, bool direct, std::size_t depth,
-         bool refill = false);
+    open(std::span<const std::filesystem::path> paths, bool direct, std::size_t depth);
     ~FileReadQueue();
     FileReadQueue(const FileReadQueue&) = delete;
     FileReadQueue& operator=(const FileReadQueue&) = delete;

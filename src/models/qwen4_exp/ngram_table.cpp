@@ -488,7 +488,7 @@ public:
         std::vector<std::filesystem::path> paths;
         for (const auto& segment : owner.layout_.segments) { paths.push_back(segment.path); }
         queue_ = FileReadQueue::open(paths, owner.options_.io == NgramIo::Direct,
-                                    owner.options_.depth, owner.options_.refill);
+                                    owner.options_.depth);
         ids_.reserve(owner.options_.depth);
     }
 
@@ -649,8 +649,7 @@ NgramTableReader::NgramTableReader(NgramTableLayout layout, const NgramReadOptio
     if (options_.residency != NgramResidency::Ram && options_.io != NgramIo::Mapped) {
         std::vector<std::filesystem::path> paths;
         for (const auto& segment : layout_.segments) { paths.push_back(segment.path); }
-        queue_ = FileReadQueue::open(paths, options_.io == NgramIo::Direct, options_.depth,
-                                     options_.refill);
+        queue_ = FileReadQueue::open(paths, options_.io == NgramIo::Direct, options_.depth);
         if (queue_) {
             // Startup's parallel bulk loads are finished. One worker now drives the OS queue;
             // its depth bounds native reads instead of allocating a thread for every read.

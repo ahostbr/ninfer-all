@@ -46,15 +46,12 @@ int run_tests() {
     {
         // T0833: the Engram read experiments are off unless asked for, and strict about values.
         const auto base = parse({"ninfer-cli", "model.ninfer", "--prompt", "x"}).ngram_table;
-        failures += check(!base.engram_dedupe && base.engram_overlap == ninfer::EngramOverlap::Off &&
-                              !base.read_refill && !base.engram_default_cache,
+        failures += check(!base.engram_dedupe && base.engram_overlap == ninfer::EngramOverlap::Off,
                           "the Engram read experiments are not off by default");
         const auto on = parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
                                "--deepseek-engram-dedupe", "on", "--deepseek-engram-overlap",
-                               "ahead", "--file-read-refill", "true",
-                               "--deepseek-engram-default-cache", "1"}).ngram_table;
-        failures += check(on.engram_dedupe && on.engram_overlap == ninfer::EngramOverlap::Ahead &&
-                              on.read_refill && on.engram_default_cache,
+                               "ahead"}).ngram_table;
+        failures += check(on.engram_dedupe && on.engram_overlap == ninfer::EngramOverlap::Ahead,
                           "the Engram read experiments were not parsed");
         failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
                                  "--deepseek-engram-overlap", "pass"})
@@ -63,8 +60,7 @@ int run_tests() {
                                      "--deepseek-engram-overlap", "off"})
                                       .ngram_table.engram_overlap == ninfer::EngramOverlap::Off,
                           "--deepseek-engram-overlap pass|off was not parsed");
-        for (const char* flag : {"--deepseek-engram-dedupe", "--deepseek-engram-overlap",
-                                 "--file-read-refill", "--deepseek-engram-default-cache"}) {
+        for (const char* flag : {"--deepseek-engram-dedupe", "--deepseek-engram-overlap"}) {
             failures += check(rejects([&] {
                                   (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", flag,
                                                "yes"});

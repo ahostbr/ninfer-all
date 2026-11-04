@@ -1,5 +1,5 @@
-// CPU checks of the Engram read path's speed experiments (T0833): the switches' parsing and the
-// sizing rule (engram_tuning.h), the n-gram reader's dedupe and skip rows (a repeated row is read
+// CPU checks of the Engram read path's speed experiments (T0833): the switches' parsing
+// (engram_tuning.h), the n-gram reader's dedupe and skip rows (a repeated row is read
 // once and every output byte is unchanged), the background reads of a pass (engram_flight.h: jobs in
 // order, a block's slot completes when its read has, a failure is kept for the executor's thread),
 // and a two-block pass read through the fetcher against the reader's synchronous bytes. No device is
@@ -80,43 +80,25 @@ void test_tuning() {
         return found == environment.end() ? nullptr : found->second.c_str();
     };
     EngramTuning base;
-    check(!base.dedupe && base.overlap == EngramOverlap::Off && !base.refill && !base.default_cache,
-          "the defaults are all off");
+    check(!base.dedupe && base.overlap == EngramOverlap::Off, "the defaults are all off");
     auto resolved = resolve_engram_tuning(base, lookup);
-    check(!resolved.dedupe && resolved.overlap == EngramOverlap::Off && !resolved.refill &&
-              !resolved.default_cache,
+    check(!resolved.dedupe && resolved.overlap == EngramOverlap::Off,
           "no environment leaves the options alone");
-    environment = {{"NINFER_DS_ENGRAM_DEDUPE", "1"},
-                   {"NINFER_DS_ENGRAM_OVERLAP", "ahead"},
-                   {"NINFER_FILE_READ_REFILL", "true"},
-                   {"NINFER_DS_ENGRAM_DEFAULT_CACHE", "on"}};
+    environment = {{"NINFER_DS_ENGRAM_DEDUPE", "1"}, {"NINFER_DS_ENGRAM_OVERLAP", "ahead"}};
     resolved = resolve_engram_tuning(base, lookup);
-    check(resolved.dedupe && resolved.overlap == EngramOverlap::Ahead && resolved.refill &&
-              resolved.default_cache,
+    check(resolved.dedupe && resolved.overlap == EngramOverlap::Ahead,
           "the environment turns every experiment on");
-    EngramTuning all{true, EngramOverlap::Ahead, true, true};
-    environment = {{"NINFER_DS_ENGRAM_DEDUPE", "0"},
-                   {"NINFER_DS_ENGRAM_OVERLAP", "off"},
-                   {"NINFER_FILE_READ_REFILL", "false"},
-                   {"NINFER_DS_ENGRAM_DEFAULT_CACHE", "off"}};
+    EngramTuning all{true, EngramOverlap::Ahead};
+    environment = {{"NINFER_DS_ENGRAM_DEDUPE", "0"}, {"NINFER_DS_ENGRAM_OVERLAP", "off"}};
     resolved = resolve_engram_tuning(all, lookup);
-    check(!resolved.dedupe && resolved.overlap == EngramOverlap::Off && !resolved.refill &&
-              !resolved.default_cache,
+    check(!resolved.dedupe && resolved.overlap == EngramOverlap::Off,
           "the environment turns every experiment off over the options");
     environment = {{"NINFER_DS_ENGRAM_DEDUPE", ""}};
     resolved = resolve_engram_tuning(all, lookup);
     check(resolved.dedupe, "an empty variable leaves the option alone");
-    environment = {{"NINFER_FILE_READ_REFILL", "maybe"}};
+    environment = {{"NINFER_DS_ENGRAM_OVERLAP", "maybe"}};
     check(throws_invalid([&] { (void)resolve_engram_tuning(base, lookup); }),
           "a malformed variable was accepted");
-
-    constexpr std::uint64_t MiB = 1ULL << 20, GiB = 1ULL << 30;
-    check(default_engram_cache_bytes(0) == 16 * MiB, "unknown memory takes the floor");
-    check(default_engram_cache_bytes(512 * MiB) == 16 * MiB, "a small host takes the floor");
-    check(default_engram_cache_bytes(4 * GiB) == 64 * MiB, "a 64th of 4 GiB");
-    check(default_engram_cache_bytes(96 * GiB) == 256 * MiB, "a large host takes the cap");
-    check(default_engram_cache_bytes(16 * GiB) == 256 * MiB, "16 GiB reaches the cap");
-    check(default_engram_cache_bytes(15 * GiB) < 256 * MiB, "15 GiB is under the cap");
 
     {
         // The device's block-major layout from the hasher's token-major rows, with an image
@@ -210,16 +192,14 @@ void test_reader() {
     Table table;
     for (const auto io : {NgramIo::Buffered, NgramIo::Mapped}) {
         for (const bool dedupe : {false, true}) {
-            for (const bool refill : {false, true}) {
+            {
                 for (const std::uint64_t budget : {std::uint64_t{0}, std::uint64_t{256} << 10}) {
                     const std::string label = std::string("io=") + (io == NgramIo::Mapped ? "mmap" : "buffered") +
                                               " dedupe=" + (dedupe ? "1" : "0") +
-                                              " refill=" + (refill ? "1" : "0") +
                                               " cache=" + std::to_string(budget);
                     NgramReadOptions options;
                     options.io           = io;
                     options.dedupe       = dedupe;
-                    options.refill       = refill;
                     options.budget_bytes = budget;
                     options.depth        = 8;
                     NgramTableReader reader(table.layout(), options);

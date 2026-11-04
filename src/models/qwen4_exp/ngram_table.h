@@ -55,9 +55,6 @@ struct NgramReadOptions {
     // A row id repeated in a batch is looked up and read once; the later copies are copied from
     // the first one's output when the batch completes (bytes unchanged).
     bool dedupe = false;
-    // The OS read queue starts the next read of a batch as each one finishes, rather than after
-    // each group of `depth` (FileReadQueue's refill mode).
-    bool refill = false;
 };
 
 class NgramTableReader {

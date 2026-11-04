@@ -354,7 +354,7 @@ addresses and copies them to the device:
 
 ### The Engram read experiments
 
-Four switches, each off by default, A/B experiments on how the rows are read (none changes a byte
+Two switches, each off by default, A/B experiments on how the rows are read (neither changes a byte
 of them). Each has an environment variable for bench scripts, which wins over the option and takes
 `1`, `on`, `true`, `0`, `off` or `false` (anything else is refused at startup); the startup log
 says which are on. Nothing here was run on a GPU: the tests are CPU-only, and the effect on tokens a
@@ -379,15 +379,6 @@ second is to be measured (one arm each, three runs).
   pass. The extra buffers are logged at startup (about 100 MiB of each kind per set for a 16,384-token
   span). Expect a hidden wait of about 0.5 ms at block 1 and several ms at block 14 for decode; the
   fraction of a token that is is the Engram wait the counters report.
-- **`--file-read-refill on` (`NINFER_FILE_READ_REFILL`).** `FileReadQueue::read` waited for each
-  group of `depth` reads to finish before starting the next group, so one slow read idled the other
-  slots. With refill each slot takes the next read as soon as it completes; a failure still stops
-  new reads and drains the ones in flight before it is raised. It reaches the Engram reader's queue
-  (Windows buffered reads and direct reads, Linux io_uring), not the expert files' queue.
-- **`--deepseek-engram-default-cache on` (`NINFER_DS_ENGRAM_DEFAULT_CACHE`).** With `disk`
-  residency and no `--ngram-ram-mib`, the reader keeps a clock-evicting row cache of a 64th of the
-  available RAM at startup, between 16 and 256 MiB (Strata's rule; the Coder run's 1024 MiB from
-  `--ngram-ram-mib 1024` is larger and wins when given).
 
 ## The DSpark drafter
 

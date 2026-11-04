@@ -46,15 +46,6 @@ inline constexpr const char* kNgramTableHelp =
     "                                layer (pass); also read the next prompt chunk's rows\n"
     "                                while this one computes (ahead). Default off;\n"
     "                                NINFER_DS_ENGRAM_OVERLAP overrides\n"
-    "  --file-read-refill on|off     DeepSeek-V4.1 Engram rows on Windows/Linux native\n"
-    "                                queues: start the next read as each finishes, not\n"
-    "                                after each group of --ngram-io-depth (default off;\n"
-    "                                NINFER_FILE_READ_REFILL=0|1 overrides)\n"
-    "  --deepseek-engram-default-cache on|off\n"
-    "                                DeepSeek-V4.1, disk residency with no\n"
-    "                                --ngram-ram-mib: a row cache of 1/64 of the\n"
-    "                                available RAM, 16 to 256 MiB (default off;\n"
-    "                                NINFER_DS_ENGRAM_DEFAULT_CACHE=0|1 overrides)\n"
     "  --no-ngram-table              run Qwen3.8-Flash-Next without its n-gram table,\n"
     "                                DeepSeek-V4.1 without its Engram table.\n"
     "                                Non-standard experimental mode: the model was\n"
@@ -122,10 +113,6 @@ bool parse_ngram_table_option(std::string_view option, NgramTableOptions& out, V
         out.engram_dedupe = models::deepseek_v41::parse_switch(option, std::string(value()));
     } else if (option == "--deepseek-engram-overlap") {
         out.engram_overlap = models::deepseek_v41::parse_overlap(option, std::string(value()));
-    } else if (option == "--file-read-refill") {
-        out.read_refill = models::deepseek_v41::parse_switch(option, std::string(value()));
-    } else if (option == "--deepseek-engram-default-cache") {
-        out.engram_default_cache = models::deepseek_v41::parse_switch(option, std::string(value()));
     } else {
         return false;
     }

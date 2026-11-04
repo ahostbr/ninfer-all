@@ -217,10 +217,8 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
     // The Engram read experiments (T0833), the environment over the options; a malformed variable
     // is refused here, before anything loads.
     const models::deepseek_v41::EngramTuning tuning = models::deepseek_v41::resolve_engram_tuning(
-        {.dedupe        = table.engram_dedupe,
-         .overlap       = table.engram_overlap,
-         .refill        = table.read_refill,
-         .default_cache = table.engram_default_cache},
+        {.dedupe  = table.engram_dedupe,
+         .overlap = table.engram_overlap},
         [](const char* name) { return std::getenv(name); });
     StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
     const artifact::Reader reader(options.artifact_path);
@@ -313,22 +311,12 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
                                     : options.tensor_split;
     }
     executor.engram_table       = std::move(engram);
-    // With --deepseek-engram-default-cache and no --ngram-ram-mib, the disk reader keeps a row
-    // cache of a 64th of the RAM still free, 16 to 256 MiB.
-    std::uint64_t engram_cache_bytes = table.ram_budget_bytes.value_or(0);
-    const bool default_cache =
-        tuning.default_cache && !table.ram_budget_bytes && table.residency == NgramResidency::Disk;
-    if (default_cache) {
-        engram_cache_bytes = models::deepseek_v41::default_engram_cache_bytes(
-            available_host_memory_bytes().value_or(0));
-    }
     executor.engram_read        = {.residency    = table.residency,
                                    .io           = table.io,
-                                   .budget_bytes = engram_cache_bytes,
+                                   .budget_bytes = table.ram_budget_bytes.value_or(0),
                                    .lock         = table.lock,
                                    .depth        = table.io_depth,
-                                   .dedupe       = tuning.dedupe,
-                                   .refill       = tuning.refill};
+                                   .dedupe       = tuning.dedupe};
     executor.engram_tuning      = tuning;
     // A span of `budget` positions holds rows x (columns + 1) + 2 of them, so its rows x columns
     // aligner cells, of r x r patches each, are at most budget - 3.
@@ -505,8 +493,7 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
                            "DeepSeek-V4.1: Engram table %s, %s reads", place.c_str(),
                            instance->executor->engram_description().c_str());
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
-                           "DeepSeek-V4.1: Engram reads: dedupe %s, overlap %s, queue refill %s, "
-                           "default row cache %s",
+                           "DeepSeek-V4.1: Engram reads: dedupe %s, overlap %s",
                            tuning.dedupe ? "ON (repeated rows read once, image tokens' rows skipped)"
                                          : "off",
                            tuning.overlap == EngramOverlap::Off
@@ -515,11 +502,7 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
                                   " ON (+" + std::to_string(memory.engram_overlap_device_bytes >> 20U) +
                                   " MiB device, +" +
                                   std::to_string(memory.engram_overlap_pinned_bytes >> 20U) +
-                                  " MiB pinned for the prompt passes' row buffers)").c_str(),
-                           tuning.refill ? "ON" : "off",
-                           default_cache ? ("ON (" + std::to_string(engram_cache_bytes >> 20U) +
-                                            " MiB)").c_str()
-                                         : "off");
+                                  " MiB pinned for the prompt passes' row buffers)").c_str());
     }
     if (options.expert_residency != ExpertResidency::Device) {
         const auto experts = memory.experts;

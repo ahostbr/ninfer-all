@@ -267,6 +267,42 @@ experts. With host or disk experts the executor runs a prompt's chunks block by 
   cache may lend to, down to chunk by chunk. With a fixed
   `--expert-cache-mib` they stay in the workspace. The Engram rows of a span's tokens are staged
   on the card (about 95 MiB more than for one chunk).
+- **The chunk.** 2048 tokens unless `--prefill-chunk N` names another (a multiple of 128, at most
+  4096; a larger one is clamped with a warning). A device without room for the chunk's workspace
+  takes the widest of 2048, 1024 and 512 below it that fits, and the log says which it took. A
+  wider chunk gives the routed experts' matrix kernel more pairs per expert (4096 tokens: 128, the
+  widest tile) and costs about 1.3 GiB more workspace, taken from the expert cache.
+- **One line a prompt.** When a prompt's prefill ends the log carries its new tokens, wall time,
+  tokens a second, steps, the rows that skipped blocks, and the expert deliveries since it began
+  (GiB copied, seconds serving, layers prefetched, bank reuses). `NINFER_DS_PREFILL_LOG=0` turns it off.
+
+### The long-prompt layer skip
+
+`--deepseek-prompt-skip on` (or `NINFER_DS_PROMPT_SKIP=1`; default off) skips, for a long prompt,
+the attention and the experts of blocks 21-39 for every row but the last 2,668 before the point
+the state is kept at (a checkpoint or the prompt's end), as Strata does by default (its
+`STRATA_DS4_PROMPT_SKIP`, "YOCO"). It applies when the model's blocks from the first of
+compression ratio 1 (block 20 in the release) are all of ratio 1 with no compressed cache or
+indexer keys of their own, and so read block 20's; the executor runs prompt spans; and no DSpark
+drafter is loaded. The startup log says `long-prompt layer skip ON`, or why it cannot.
+
+- **What runs for a skipped row.** Blocks 0-19 as ever; block 20 only its compressor and the
+  indexer's keys (the compressed latents every later block reads), no window, selection,
+  attention or FFN; blocks 21-39 nothing. No expert is delivered for a skipped row at blocks 20-39,
+  so a span that skips whole copies about half the experts a full span does.
+- **Why the rest is exact.** A row of block l reads the `window - 1` rows before it at block l and
+  block 20's compressed cache. The blocks past the cut see a window of unwritten latents for
+  their first 127 rows, and that damage widens by 127 rows a block; after 19 blocks the rows
+  the rings and the logits are made of lie past it, which takes 19 x 127 + 128 = 2,541 rows, and
+  2,668 are kept. The tests check this on a dependency model (`test_prompt_skip.cpp`).
+- **State.** Only the end of a prompt run (a checkpoint of the shared prefix, the turn's end, the
+  prompt's end) is exact; a step ends earlier only inside a run. A request stopped inside a
+  skipped run leaves no prefix to continue from. Runs of fewer than 3,692 rows, or branched
+  reads, do not skip. The rings of blocks 20-39 are zeroed before a skipping pass, so rows
+  whose results nothing reads see finite values.
+- **Quality.** Strata reports a KL of 0.00029 against the full pass for its skip. NInfer's own
+  figure is not measured yet; compare `--deepseek-prompt-skip off` and `on` on the same prompts
+  before relying on it.
 
 ## The Engram table
 

@@ -159,8 +159,21 @@ public:
     // Runs up to prompt_step() tokens at the sequence's next positions and leaves the logits of
     // the last `logit_rows` (at most kMaxLogitRows) in logits(). `images` (in row order, apart)
     // replace their rows' embeddings.
+    //
+    // `skip_rows` (up to the tokens, 0: none): the first rows of the call skip the blocks past the
+    // long-prompt skip's block, as prompt_skip.h has it. Only a pass that ends a prompt run (a
+    // frontier: a checkpoint or the prompt's end) leaves exact state, and then the rows after the
+    // skipped ones are at least prompt_skip_keep(). Ignored when prompt_skip_keep() is 0. With every
+    // row skipped, logit_rows may be 0 and the call leaves no logits.
     void forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,
-                 std::uint32_t logit_rows, std::span<const ImageRows> images = {});
+                 std::uint32_t logit_rows, std::span<const ImageRows> images = {},
+                 std::uint32_t skip_rows = 0);
+    // Rows a prompt run keeps through every block, before the point it ends at, when it skips the
+    // blocks past the long-prompt skip's block for the earlier ones (prompt_skip.h); 0 when this
+    // model or executor does not allow the skip: the model's blocks past the first with compression
+    // ratio 1 are not all ratio 1 without a cache of their own, the executor has no prompt spans
+    // (experts on the device, or no room), or a DSpark drafter taps their inputs.
+    [[nodiscard]] std::uint32_t prompt_skip_keep() const noexcept;
     // Whether prompt calls may carry images.
     [[nodiscard]] bool vision() const noexcept;
     // The span rows of an image of grid_w x grid_h patches (BF16 [grid_h * grid_w][patch features]

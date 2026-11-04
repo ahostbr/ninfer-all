@@ -116,6 +116,10 @@ std::string serve_usage_text(const char* argv0) {
            "  --max-context N               logical context ceiling of each request (default\n"
            "                                8192)\n"
            "  --max-concurrency N           requests decoded together, 1..8 (default 1)\n"
+           "  --deepseek-prompt-skip on|off DeepSeek-V4.1 on prompt spans: of a long prompt, the rows\n"
+           "                                before its last 2668 skip the attention and experts\n"
+           "                                of blocks 21-39 (the state kept is the full pass's;\n"
+           "                                default off; NINFER_DS_PROMPT_SKIP=0|1 overrides)\n"
            "  --prefill-chunk N             prefill chunk in tokens, a multiple of 128\n"
            "                                (default 1024; 4096 for native MoE experts\n"
            "                                in host memory or files); with an int8 or\n"
@@ -738,6 +742,17 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         if (arg == "--prefill-chunk") {
             options.prefill_chunk = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--prefill-chunk"), "prefill-chunk"));
+            continue;
+        }
+        if (arg == "--deepseek-prompt-skip") {
+            const std::string_view value = require_value("--deepseek-prompt-skip");
+            if (value == "on") {
+                options.deepseek_prompt_skip = true;
+            } else if (value == "off") {
+                options.deepseek_prompt_skip = false;
+            } else {
+                throw std::invalid_argument("--deepseek-prompt-skip accepts on or off");
+            }
             continue;
         }
         if (arg == "--decode-rounds-per-prefill") {

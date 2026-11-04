@@ -165,6 +165,10 @@ std::string usage_text(const char* argv0) {
            "\n"
            "CONTEXT\n"
            "  --max-context N               context ceiling in tokens (default 2048)\n"
+           "  --deepseek-prompt-skip on|off DeepSeek-V4.1 on prompt spans: of a long prompt, the rows\n"
+           "                                before its last 2668 skip the attention and experts\n"
+           "                                of blocks 21-39 (the state kept is the full pass's;\n"
+           "                                default off; NINFER_DS_PROMPT_SKIP=0|1 overrides)\n"
            "  --prefill-chunk N             prefill chunk in tokens, a multiple of 128\n"
            "                                (default 1024; 4096 for native MoE experts\n"
            "                                in host memory or files); with an int8 or\n"
@@ -407,6 +411,15 @@ Options parse_options(int argc, char** argv) {
             kv_headroom_mib = static_cast<std::size_t>(mib);
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = parse_u32(value(arg), "prefill-chunk");
+        } else if (arg == "--deepseek-prompt-skip") {
+            const std::string_view mode = value(arg);
+            if (mode == "on") {
+                options.deepseek_prompt_skip = true;
+            } else if (mode == "off") {
+                options.deepseek_prompt_skip = false;
+            } else {
+                throw std::invalid_argument("--deepseek-prompt-skip accepts on or off");
+            }
         } else if (arg == "--device") {
             options.device  = parse_device(value(arg));
             device_explicit = true;

@@ -6,6 +6,7 @@
 #include "core/host_pages.h"
 #include "core/startup.h"
 #include "core/tensor_split.h"
+#include "models/deepseek_v41/prompt_skip.h"
 #include "models/expert_profile.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/frontend/processor.h"
@@ -53,6 +54,22 @@ std::uint64_t elapsed_ns(Clock::time_point from, Clock::time_point to) {
 
 double seconds(Clock::time_point from, Clock::time_point to) {
     return std::chrono::duration<double>(to - from).count();
+}
+
+// --deepseek-prompt-skip, or NINFER_DS_PROMPT_SKIP (0 or 1) over it; scoring Engines keep no
+// context and take no part.
+bool prompt_skip_wanted(const EngineOptions& options) {
+    if (options.purpose != EnginePurpose::Generation) { return false; }
+    if (const char* env = std::getenv("NINFER_DS_PROMPT_SKIP"); env != nullptr && *env != '\0') {
+        return std::strcmp(env, "0") != 0;
+    }
+    return options.deepseek_prompt_skip;
+}
+
+// NINFER_DS_PREFILL_LOG=0 turns the per-prompt prefill line off.
+bool prefill_log_wanted() {
+    const char* env = std::getenv("NINFER_DS_PREFILL_LOG");
+    return env == nullptr || *env == '\0' || std::strcmp(env, "0") != 0;
 }
 
 // A DSpark round verifies the drafts while each one's confidence is at least this (Strata's
@@ -318,17 +335,32 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
     // Causal scoring keeps no context between requests.
     executor.checkpoints = options.context_cache.enabled &&
                            options.purpose == EnginePurpose::Generation;
-    // Prompt chunks of 2048 tokens whatever was requested: the routed experts' matrix kernel fills
-    // its widest tile only at wide chunks, and the staging ring holds the window and one chunk. A
-    // device without room for that chunk's workspace takes the widest of 1024 and 512 that fits.
-    for (const std::uint32_t chunk : {2048u, 1024u, 512u}) {
+    // Prompt chunks of 2048 tokens unless --prefill-chunk names one (a multiple of 128, at most
+    // 4096, the executor's bound): the routed experts' matrix kernel fills its widest tile only at
+    // wide chunks, and the staging ring holds the window and one chunk. A device without room for
+    // the chunk's workspace takes the widest of the smaller ones of 2048, 1024 and 512 that fits.
+    const std::uint32_t requested_chunk =
+        options.purpose == EnginePurpose::Generation ? options.prefill_chunk : 0;
+    const std::vector<std::uint32_t> chunks =
+        models::deepseek_v41::prompt_chunk_candidates(requested_chunk);
+    if (requested_chunk != 0 && chunks.front() != requested_chunk) {
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
+                           "DeepSeek-V4.1: --prefill-chunk %u is past the 4096 tokens a chunk may "
+                           "have; chunks of %u tokens are tried first",
+                           requested_chunk, chunks.front());
+    }
+    for (const std::uint32_t chunk : chunks) {
         executor.prefill_chunk = chunk;
         try {
             instance->executor =
                 std::make_unique<models::deepseek_v41::Executor>(*model, device, executor);
             break;
-        } catch (const models::deepseek_v41::InsufficientMemory&) {
-            if (chunk == 512) { throw; }
+        } catch (const models::deepseek_v41::InsufficientMemory& error) {
+            if (chunk == chunks.back()) { throw; }
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
+                               "DeepSeek-V4.1: prompt chunks of %u tokens do not fit (%s); "
+                               "trying a smaller one",
+                               chunk, error.what());
         }
     }
     device.synchronize();
@@ -360,6 +392,26 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
                            ? " at most, growing with the sequences beside an elastic expert cache"
                            : "",
                        double(memory.workspace_bytes) / 1048576.0);
+    {
+        const bool wanted = prompt_skip_wanted(options);
+        const std::uint32_t keep = instance->executor->prompt_skip_keep();
+        if (wanted && keep != 0) {
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                               "DeepSeek-V4.1: long-prompt layer skip ON: of a prompt run of more "
+                               "than %u tokens, the rows before its last %u skip the blocks past "
+                               "the first ratio-1 block (attention and experts); the state kept at "
+                               "a checkpoint or the prompt's end is that of the full pass",
+                               unsigned(keep + models::deepseek_v41::kPromptSkipMinRows), keep);
+        } else if (wanted) {
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
+                               "DeepSeek-V4.1: long-prompt layer skip asked for but unavailable "
+                               "here (it needs prompt spans, no DSpark drafter and the release's "
+                               "block structure); prompts run every row through every block");
+        } else {
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                               "DeepSeek-V4.1: long-prompt layer skip off");
+        }
+    }
     if (!executor.expert_split.empty()) {
         const std::uint32_t experts = model->config().num_experts;
         const auto ends = split_shares(experts, unit_positions(experts, 1), executor.expert_split);
@@ -586,6 +638,13 @@ struct DeepSeekV41Core::Request {
     std::optional<GenerationBudget> budget;
     Clock::time_point admitted, prefill_start, prefill_end, first_token, last_token;
     SpeculativeStats speculative; // an Engine with --spec dspark or --lookup-ngram
+    // The long-prompt skip: prompt rows that skipped blocks, and whether the sequence's state is
+    // short of exact until the run reaches its frontier (a cancelled request then leaves no prefix
+    // to continue from). The prefill line's counts: steps, and the expert deliveries before it.
+    std::uint64_t skipped_rows = 0;
+    std::uint32_t prefill_steps = 0;
+    bool inexact = false;
+    ExpertDeliveryStats expert_start;
 };
 
 struct DeepSeekV41Core::Impl {
@@ -624,6 +683,10 @@ struct DeepSeekV41Core::Impl {
     const std::uint32_t dspark_block; // --spec dspark: the drafter's block; 0 is off
     const float dspark_floor;         // the confidence a kept draft reaches
     const DiagnosticObserver diagnostics;
+    // Rows a prompt run keeps through every block when it skips the blocks past the first of ratio
+    // 1 for its earlier rows (prompt_skip.h); 0: no skip. Whether to log each prompt's prefill.
+    std::uint32_t skip_keep = 0;
+    bool prefill_log        = true;
     static constexpr TokenId kBos = 0; // <｜begin▁of▁sentence｜>
 
     mutable std::mutex queue_mutex;
@@ -704,6 +767,8 @@ struct DeepSeekV41Core::Impl {
           lookup_ngram(options.speculative.lookup_ngram), dspark_block(i.executor->dspark_block()),
           dspark_floor(options.speculative.draft_confidence.value_or(kDSparkConfidenceFloor)),
           diagnostics(options.diagnostic_observer),
+          skip_keep(prompt_skip_wanted(options) ? i.executor->prompt_skip_keep() : 0),
+          prefill_log(prefill_log_wanted()),
           slots(i.executor->options().sequences),
           decode_rounds_per_prefill(
               options.decode_rounds_per_prefill != 0
@@ -1282,6 +1347,7 @@ struct DeepSeekV41Core::Impl {
         }
         r.prefill_start        = Clock::now();
         r.progress             = r.prefill_start;
+        if (prefill_log) { r.expert_start = executor.expert_stats(); }
         r.constrained          = r.output.grammar_state() != nullptr;
         if (r.constrained) { schedule_mask(r); } // the first token's, while the prompt prefills
         {
@@ -1345,6 +1411,13 @@ struct DeepSeekV41Core::Impl {
             return static_cast<std::uint32_t>(
                 std::min<std::size_t>(left, instance.executor->options().prefill_chunk));
         }
+        return std::min(instance.executor->prompt_step(), prefill_until(r) - r.prefilled);
+    }
+
+    // The prompt position the request's prefill steps run up to before the state is kept: the next
+    // shared prefix, the turn's end (anchor), or the prompt's end. A step never crosses it.
+    [[nodiscard]] static std::uint32_t prefill_until(const Request& r) {
+        const auto prompt_n = static_cast<std::uint32_t>(r.prompt_tokens.size());
         std::uint32_t until = r.prefilled < r.anchor_at ? r.anchor_at : prompt_n;
         for (const std::uint32_t frontier : r.shared_at) {
             if (frontier > r.prefilled) {
@@ -1352,7 +1425,7 @@ struct DeepSeekV41Core::Impl {
                 break;
             }
         }
-        return std::min(instance.executor->prompt_step(), until - r.prefilled);
+        return until;
     }
 
     // Decode rounds that run before a prefill step while other requests generate: the configured
@@ -1584,7 +1657,13 @@ struct DeepSeekV41Core::Impl {
             result.timings.generation_wall_seconds = seconds(r.first_token, r.last_token);
         }
         result.timings.total_seconds = r.prepare_seconds + seconds(r.submitted, now);
-        slots.at(r.slot).request     = nullptr;
+        Slot& finished = slots.at(r.slot);
+        if (r.inexact) {
+            // Stopped inside a skipped run: the rows it fed are not a prefix anything continues.
+            finished.fed.clear();
+            finished.media.clear();
+        }
+        finished.request = nullptr;
         complete(request, std::move(result));
     }
 
@@ -1632,11 +1711,22 @@ struct DeepSeekV41Core::Impl {
         if (r.branches && r.prefilled + n == prompt_n && n < executor.options().prefill_chunk) {
             next_branches(r, executor.options().prefill_chunk - n, branch_tokens, lengths);
         }
+        // The long-prompt skip: the rows of this step before the last skip_keep of the run it belongs
+        // to skip the blocks past the first of ratio 1 (a branched read runs whole).
+        const std::uint32_t until = prefill_until(r);
+        const std::uint32_t skip =
+            skip_keep != 0 && !r.branches && lengths.empty()
+                ? models::deepseek_v41::plan_prompt_skip(n, until - r.prefilled, skip_keep)
+                : 0;
         if (lengths.empty()) {
-            executor.forward(r.slot, chunk, 1, chunk_images(r, r.prefilled, r.prefilled + n));
+            executor.forward(r.slot, chunk, skip == n ? 0 : 1,
+                             chunk_images(r, r.prefilled, r.prefilled + n), skip);
         } else {
             executor.forward_prompt_branches(r.slot, chunk, branch_tokens, lengths);
         }
+        ++r.prefill_steps;
+        r.skipped_rows += skip;
+        if (skip > 0) { r.inexact = true; }
         slot.fed.insert(slot.fed.end(), chunk.begin(), chunk.end());
         for (const MediaMark& mark : r.media) {
             if (mark.begin >= r.prefilled && mark.begin < r.prefilled + n) {
@@ -1645,6 +1735,7 @@ struct DeepSeekV41Core::Impl {
         }
         r.prefilled += n;
         r.progress = Clock::now();
+        if (r.prefilled >= until) { r.inexact = false; } // the run's frontier: the state is exact
         if (reuse_prefixes && r.reusable &&
             std::binary_search(r.shared_at.begin(), r.shared_at.end(), r.prefilled)) {
             store_image(r.slot, slot.fed, slot.media, nullptr, PrefixReusePath::SharedStablePrefix);
@@ -1847,6 +1938,28 @@ struct DeepSeekV41Core::Impl {
         finish_prompt(request);
     }
 
+    // One line per prompt (NINFER_DS_PREFILL_LOG=0 silences it): the tokens computed, the wall time
+    // from the prefill's start, steps, rows that skipped blocks, and the expert deliveries since
+    // then (other requests' included while they share the Engine).
+    void log_prefill(const Request& r, std::uint32_t prompt_n) {
+        const auto& executor = *instance.executor;
+        const auto experts   = executor.expert_stats() - r.expert_start;
+        const std::uint32_t computed = prompt_n - r.reused;
+        const double wall = seconds(r.prefill_start, r.prefill_end);
+        publish_diagnostic(diagnostics, DiagnosticLevel::Info,
+                           "DeepSeek-V4.1 prefill: %u new tokens (%u reused) in %.2f s = %.0f tok/s, "
+                           "%u step(s) of chunks of %u (spans of %u), %llu rows skipped past the "
+                           "first ratio-1 block; experts: %.2f GiB copied, %.2f s serving, %llu "
+                           "layers prefetched, %llu bank reuses, %llu requests",
+                           computed, r.reused, wall, wall > 0 ? double(computed) / wall : 0.0,
+                           r.prefill_steps, executor.options().prefill_chunk,
+                           executor.prompt_step(), static_cast<unsigned long long>(r.skipped_rows),
+                           double(experts.copied_bytes) / 1073741824.0, experts.service_seconds,
+                           static_cast<unsigned long long>(experts.prefetched_layers),
+                           static_cast<unsigned long long>(experts.bank_reuses),
+                           static_cast<unsigned long long>(experts.requests));
+    }
+
     // The prompt is in (and a branched read's branches): the request takes its first token and
     // decodes from there.
     void finish_prompt(const std::shared_ptr<Request>& request) {
@@ -1861,6 +1974,7 @@ struct DeepSeekV41Core::Impl {
             stats.computed_prefill_tokens += prompt_n - r.reused;
             stats.prefill_seconds_total += seconds(r.prefill_start, r.prefill_end);
         }
+        if (prefill_log) { log_prefill(r, prompt_n); }
         const auto& exec = r.options.execution;
         const std::uint32_t capacity =
             effective_output_capacity(exec.requested_output_tokens, max_context, prompt_n);

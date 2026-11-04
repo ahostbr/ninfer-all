@@ -8,6 +8,7 @@
 #include "core/weight_view.h"
 #include "models/deepseek_v41/cpu_experts.h"
 #include "models/deepseek_v41/kernels.h"
+#include "models/deepseek_v41/prompt_skip.h"
 #include "models/deepseek_v41/vision.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/weight_input.h"
@@ -247,6 +248,9 @@ struct Pass {
     bool seed = true;
     const std::int32_t* visible = nullptr;
     int extra_window = 0;
+    // A prompt piece before the long-prompt skip's cut, at the block it starts at: the block runs
+    // its compressor and indexer keys over the rows and nothing else (prompt_skip.h).
+    bool kv_only = false;
 };
 
 } // namespace
@@ -1548,6 +1552,15 @@ struct Executor::Impl {
         auto* x32       = alloc<float>(std::size_t(t) * hidden);
         kernels::hc_pre_norm(h, pre, p.attention_norm, t, streams, hidden, eps,
                              static_cast<__nv_bfloat16*>(x.data), x32, stream);
+        if (s.kv_only) {
+            // The rows' compressed latents and indexer keys alone: the window, the selection, the
+            // attention and the FFN of rows before the long-prompt skip's cut are not run.
+            if (!p.kv_source) {
+                throw std::logic_error("deepseek_v41: a kv_only pass at a block with no cache");
+            }
+            compress_block(p, x32, t, s);
+            return;
+        }
         const int qkv_rows = query_rank + kLatent;
         auto* qkv          = alloc<float>(std::size_t(t) * qkv_rows);
         if (p.stq) {
@@ -2375,6 +2388,16 @@ struct Executor::Impl {
         return span_tokens != 0 ? span_tokens : options.prefill_chunk;
     }
 
+    // The block the long-prompt skip starts at, or -1 (prompt_skip.h): the skip runs as a span, and
+    // the drafter taps every block's input for a pass's last rows, which a skipped pass does not run.
+    [[nodiscard]] int skip_block() const {
+        return span_tokens == 0 || drafter ? -1 : prompt_skip_layer(config);
+    }
+    [[nodiscard]] std::uint32_t prompt_skip_keep() const {
+        return deepseek_v41::prompt_skip_keep(skip_block(), config.num_hidden_layers,
+                                              config.sliding_window);
+    }
+
     // A step's images, kept while it runs.
     struct StepImages {
         Impl& impl;
@@ -2425,10 +2448,18 @@ struct Executor::Impl {
         return out;
     }
 
+    // skip_rows: the first rows of a prompt pass that skip the blocks past the long-prompt skip's
+    // block (prompt_skip.h); the pass runs as a span, and with all of its rows skipped it keeps no
+    // logits.
     void forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,
                  std::uint32_t logit_rows, std::uint32_t logit_column = 0,
-                 std::span<const ImageRows> images = {}) {
+                 std::span<const ImageRows> images = {}, std::uint32_t skip_rows = 0) {
         const int t = int(tokens.size());
+        if (skip_rows > 0 && logit_column == 0 && skip_block() >= 0 &&
+            std::uint32_t(t) <= span_tokens) {
+            forward_span(sequence, tokens, logit_rows, images, skip_rows);
+            return;
+        }
         if (std::uint32_t(t) > options.prefill_chunk && logit_column == 0) {
             forward_span(sequence, tokens, logit_rows, images);
             return;
@@ -2467,11 +2498,19 @@ struct Executor::Impl {
     // blocks in memory borrowed from an elastic expert cache (borrow_span), else in the workspace;
     // each chunk's arithmetic is forward()'s, and the logits are the span's last rows.
     void forward_span(std::uint32_t sequence, std::span<const std::int32_t> tokens,
-                      std::uint32_t logit_rows, std::span<const ImageRows> images = {}) {
+                      std::uint32_t logit_rows, std::span<const ImageRows> images = {},
+                      std::uint32_t skip_rows = 0) {
         const int n = int(tokens.size()), c = int(options.prefill_chunk);
         if (sequence >= options.sequences || std::uint32_t(n) > span_tokens ||
             logit_rows > std::min<std::uint32_t>(n, kMaxLogitRows)) {
             throw std::invalid_argument("deepseek_v41 forward: invalid prompt span");
+        }
+        // The long-prompt skip: rows [0, skip) run the blocks before skip_at and, at it, their
+        // compressor and indexer keys alone. The rows of the logits stay past the cut.
+        const int skip_at = skip_rows > 0 ? skip_block() : -1;
+        const int skip = skip_at < 0 ? 0 : int(std::min<std::uint32_t>(skip_rows, std::uint32_t(n)));
+        if (skip > 0 && n - skip < int(logit_rows)) {
+            throw std::invalid_argument("deepseek_v41 forward: the skip leaves no row for the logits");
         }
         const std::uint32_t first = positions[sequence];
         if (first + std::uint32_t(n) > options.max_context) {
@@ -2483,12 +2522,19 @@ struct Executor::Impl {
             borrowed = borrow_span(std::uint32_t(n));
             if (!borrowed.p) {
                 // The cache cannot lend the span's buffers now: its halves (whole chunks) as spans
-                // whose buffers it may lend, down to chunk by chunk.
+                // whose buffers it may lend, down to chunk by chunk. A pass of one chunk or less
+                // (a skipping one) runs plainly, every row through every block.
+                if (n <= c) {
+                    forward(sequence, tokens, logit_rows, 0, images);
+                    return;
+                }
                 const int half = (n / 2 + c - 1) / c * c;
                 const auto first_images = slice_images(images, 0, std::size_t(half));
                 const auto last_images  = slice_images(images, std::size_t(half), std::size_t(n));
-                forward(sequence, tokens.first(std::size_t(half)), 0, 0, first_images);
-                forward(sequence, tokens.subspan(std::size_t(half)), logit_rows, 0, last_images);
+                forward(sequence, tokens.first(std::size_t(half)), 0, 0, first_images,
+                        std::uint32_t(std::min(skip, half)));
+                forward(sequence, tokens.subspan(std::size_t(half)), logit_rows, 0, last_images,
+                        std::uint32_t(std::max(0, skip - half)));
                 return;
             }
         }
@@ -2528,16 +2574,31 @@ struct Executor::Impl {
                                 co.comb + std::size_t(row) * streams * streams};
         };
         const int tapped = drafter ? std::min(n, window) : 0; // the span's last rows the drafter taps
+        if (skip > 0) {
+            // The blocks from skip_at on hold no latents of the rows before the cut: their window
+            // rings are zeroed, so the rows past the cut that read them (whose results nothing
+            // after them reads, prompt_skip.h) see finite values.
+            for (std::size_t l = std::size_t(skip_at); l < layers.size(); ++l) {
+                CUDA_CHECK(cudaMemsetAsync(
+                    static_cast<std::byte*>(layers[l].ring.p) +
+                        std::size_t(sequence) * kRing * kLatent * sizeof(__nv_bfloat16),
+                    0, std::size_t(kRing) * kLatent * sizeof(__nv_bfloat16), stream));
+            }
+        }
+        std::vector<SkipPiece> pieces;
         for (std::size_t l = 0; l < layers.size(); ++l) {
             const LayerPlan& p = layers[l];
-            for (int row = 0; row < n; row += c) {
+            plan_skip_pieces(int(l), skip_at, n, c, skip, pieces);
+            for (const SkipPiece& piece : pieces) {
+                const int row = piece.row;
                 Pass s;
-                s.t        = std::min(c, n - row);
+                s.t        = piece.rows;
                 s.chunk    = true;
                 s.row      = row;
                 s.staged   = n;
                 s.sequence = sequence;
                 s.first    = first + std::uint32_t(row);
+                s.kv_only  = piece.kv_only;
                 float* hc  = h + std::size_t(row) * streams * hidden;
                 if (const int lo = std::max(row, n - tapped); tapped > 0 && lo < row + s.t) {
                     tap(l, h + std::size_t(lo) * streams * hidden, row + s.t - lo, lo - (n - tapped));
@@ -2552,6 +2613,7 @@ struct Executor::Impl {
                 attention(p, hc, l == 0 ? nullptr : f.pre, s.t, s,
                           topk + std::size_t(row) * index_topk,
                           candidates ? candidates + std::size_t(row) * candidate_words : nullptr, a);
+                if (piece.kv_only) { continue; }
                 mixes(p.hc_ffn, hc, s.t, mix_scratch, f);
                 ffn(p, hc, a.pre, s.t, f);
             }
@@ -3033,10 +3095,19 @@ std::string Executor::expert_cpu_description() const {
 
 std::uint32_t Executor::prompt_step() const noexcept { return impl_->prompt_step(); }
 
+std::uint32_t Executor::prompt_skip_keep() const noexcept {
+    try {
+        return impl_->prompt_skip_keep();
+    } catch (...) { return 0; }
+}
+
 void Executor::forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,
-                       std::uint32_t logit_rows, std::span<const ImageRows> images) {
-    if (logit_rows == 0) { throw std::invalid_argument("deepseek_v41 forward: no logit rows"); }
-    impl_->forward(sequence, tokens, logit_rows, 0, images);
+                       std::uint32_t logit_rows, std::span<const ImageRows> images,
+                       std::uint32_t skip_rows) {
+    if (logit_rows == 0 && !(skip_rows > 0 && skip_rows >= tokens.size())) {
+        throw std::invalid_argument("deepseek_v41 forward: no logit rows");
+    }
+    impl_->forward(sequence, tokens, logit_rows, 0, images, skip_rows);
 }
 
 bool Executor::vision() const noexcept { return impl_->tower != nullptr; }

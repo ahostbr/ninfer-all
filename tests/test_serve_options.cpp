@@ -664,6 +664,17 @@ int main() {
     } catch (const std::invalid_argument&) { invalid_panel_rejected = true; }
     failures +=
         check(invalid_panel_rejected, "--log-stats-panel accepted a value other than on|off");
+    failures += check(!parse({"ninfer-serve", "model.ninfer"}).deepseek_prompt_skip &&
+                          parse({"ninfer-serve", "model.ninfer", "--deepseek-prompt-skip", "on"})
+                              .deepseek_prompt_skip &&
+                          !parse({"ninfer-serve", "model.ninfer", "--deepseek-prompt-skip", "off"})
+                               .deepseek_prompt_skip,
+                      "--deepseek-prompt-skip did not reach serving options or is not off by default");
+    bool invalid_skip_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--deepseek-prompt-skip", "yes"});
+    } catch (const std::invalid_argument&) { invalid_skip_rejected = true; }
+    failures += check(invalid_skip_rejected, "--deepseek-prompt-skip accepted a value other than on|off");
     failures += check(configured.media_cache_bytes == (256ULL << 20) &&
                           configured.media_live_bytes == (512ULL << 20) &&
                           configured.media_preprocess_threads == 6,
@@ -1322,6 +1333,7 @@ int main() {
                                         "--ngram-session-mib",
                                         "--no-cuda-graph",
                                         "--no-endpoint-anchors",
+                                        "--deepseek-prompt-skip",
                                         "--no-prefill-a8",
                                         "--no-prefill-cublas-projections",
                                         "--no-prefix-reuse",

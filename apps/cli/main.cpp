@@ -390,6 +390,7 @@ int main(int argc, char** argv) {
         engine_options.max_context              = cli.max_context;
         engine_options.kv_capacity              = cli.kv_capacity;
         engine_options.prefill_chunk            = cli.prefill_chunk;
+        engine_options.deepseek_prompt_skip     = cli.deepseek_prompt_skip;
         engine_options.kv_cache                 = cli.kv_cache;
         engine_options.speculative              = cli.speculative;
         engine_options.enable_vision            = cli.enable_vision;

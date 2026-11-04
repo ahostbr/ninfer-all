@@ -539,8 +539,15 @@ struct EngineOptions {
     std::uint32_t pending_timeout_ms   = 30000;
     // Prompt tokens per prefill chunk; 0 is automatic: 1024, or 4096 for a native Qwen3.5-family MoE
     // whose routed experts live in host memory or files (each chunk carries the whole expert bank
-    // across the bus once). Gemma 4 and Flint choose their own chunk.
+    // across the bus once). Gemma 4 and Flint choose their own chunk; DeepSeek-V4.1 tries it first
+    // (2048 when 0; at most 4096), then the smaller of 2048, 1024 and 512 if the device lacks room.
     std::uint32_t prefill_chunk        = 0;
+    // DeepSeek-V4.1 only: of a long prompt run, rows before its last (layers - first ratio-1
+    // block) * (window - 1) + window skip the attention and experts of the blocks past that block
+    // (prompt_skip.h), as Strata does by default. The state kept at a checkpoint or the prompt's end
+    // is the full pass's up to the experts' summing order. Needs prompt spans (experts in host
+    // memory or files). NINFER_DS_PROMPT_SKIP=0|1 overrides it.
+    bool deepseek_prompt_skip          = false;
     // Decode rounds that run before a prefill chunk while other requests generate, proportionally
     // fewer (at least one) before a shorter prefill unit and more before a longer one. A decode
     // round takes tens of milliseconds and a chunk hundreds, so strict alternation (1) leaves

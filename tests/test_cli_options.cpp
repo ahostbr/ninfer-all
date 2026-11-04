@@ -33,6 +33,16 @@ int check(bool condition, const char* message) {
 
 int run_tests() {
     int failures = 0;
+    failures += check(!parse({"ninfer-cli", "model.ninfer", "--prompt", "x"}).deepseek_prompt_skip &&
+                          parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+                                 "--deepseek-prompt-skip", "on"}).deepseek_prompt_skip &&
+                          !parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+                                  "--deepseek-prompt-skip", "off"}).deepseek_prompt_skip &&
+                          rejects([&] {
+                              (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+                                           "--deepseek-prompt-skip", "yes"});
+                          }),
+                      "--deepseek-prompt-skip was not parsed as on|off, or is not off by default");
     failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--gpu-clock-floor",
                              "1500"}).gpu_clock_floor_mhz == 1500 &&
                           parse({"ninfer-cli", "model.ninfer", "--prompt", "x"})
@@ -426,6 +436,7 @@ int run_tests() {
                                         "--mtp-experts-q4",
                                         "--ngram-draft-tokens",
                                         "--ngram-min-match",
+                                        "--deepseek-prompt-skip",
                                         "--no-cuda-graph",
                                         "--no-prefill-a8",
                                         "--no-prefill-cublas-projections",

@@ -133,6 +133,20 @@ void test_table(const std::vector<std::uint32_t>& gpu) {
             const int got    = byte_of(kCodes12[2 * e + j / 4], j % 4);
             check(got == expect, "code table entry differs from 8 g +- 1 of the CPU grid");
         }
+        // Decoder<IQ1_M>::decode's own arithmetic: __vsub4((g & 0x0F0F0F0F) << 3, offset), the bytes
+        // subtracted modulo 256.
+        const auto vsub4 = [](std::uint32_t a, std::uint32_t b) {
+            std::uint32_t out = 0;
+            for (int i = 0; i < 4; ++i) {
+                out |= (((a >> (8 * i)) - (b >> (8 * i))) & 0xFFu) << (8 * i);
+            }
+            return out;
+        };
+        const std::uint32_t offset = minus ? 0x09090909u : 0x07070707u;
+        check(kCodes12[2 * e] == vsub4((gpu[std::size_t(index)] & 0x0F0F0F0Fu) << 3, offset) &&
+                  kCodes12[2 * e + 1] ==
+                      vsub4(((gpu[std::size_t(index)] >> 4) & 0x0F0F0F0Fu) << 3, offset),
+              "code table entry differs from the current decode's __vsub4 form");
         check(kCodes12[2 * e] == iq::weights4(gpu[std::size_t(index)] & 0x0F0F0F0Fu, minus) &&
                   kCodes12[2 * e + 1] ==
                       iq::weights4((gpu[std::size_t(index)] >> 4) & 0x0F0F0F0Fu, minus),

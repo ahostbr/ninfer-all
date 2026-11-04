@@ -137,7 +137,7 @@ std::vector<__nv_bfloat16> random_bf16(std::size_t count, std::mt19937& rng) {
 void test_matrix(std::mt19937& rng) {
     const int experts = 6, rows = 256, k = 1024, pairs = 48;
     Bank bank(rows, k, experts, 3, rng);
-    std::vector<std::int32_t> ids(std::size_t(pairs));
+    std::vector<std::int32_t> ids(static_cast<std::size_t>(pairs));
     for (auto& id : ids) { id = std::int32_t(rng() % experts); }
     Routes routes(ids, experts);
     const auto x = random_bf16(std::size_t(pairs) * k, rng);
@@ -177,7 +177,7 @@ void test_matrix(std::mt19937& rng) {
     bool finite = true;
     for (int p = 0; p < pairs; ++p) {
         const float* column = nullptr;
-        std::vector<float> xf(std::size_t(k));
+        std::vector<float> xf(static_cast<std::size_t>(k));
         for (int i = 0; i < k; ++i) { xf[std::size_t(i)] = __bfloat162float(x[std::size_t(p) * k + i]); }
         for (int r = 0; r < rows; ++r) {
             column = bank.rows_of(ids[std::size_t(p)]) + std::size_t(r) * k;
@@ -212,7 +212,7 @@ void test_decode_kernels(std::mt19937& rng) {
         const int pairs = tokens * top_k;
         std::vector<std::int32_t> ids;
         for (int t = 0; t < tokens; ++t) {
-            std::vector<int> pool(std::size_t(experts));
+            std::vector<int> pool(static_cast<std::size_t>(experts));
             for (int e = 0; e < experts; ++e) { pool[std::size_t(e)] = e; }
             std::shuffle(pool.begin(), pool.end(), rng);
             for (int j = 0; j < top_k; ++j) { ids.push_back(pool[std::size_t(j)]); }
@@ -246,7 +246,7 @@ void test_decode_kernels(std::mt19937& rng) {
 
         // The fused kernel against the unfused rows through the CPU's clamped SwiGLU.
         std::uniform_real_distribution<float> factor(0.25f, 1.5f);
-        std::vector<float> scale(std::size_t(tokens));
+        std::vector<float> scale(static_cast<std::size_t>(tokens));
         for (auto& s : scale) { s = factor(rng); }
         DeviceBuffer d_scale(scale.size() * 4);
         d_scale.copy_from_host(scale.data(), scale.size() * 4);

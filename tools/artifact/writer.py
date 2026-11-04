@@ -12,7 +12,7 @@ from uuid import uuid4
 
 from .framing import HEADER, MAGIC, PART_MAGIC, PAYLOAD_ALIGNMENT
 from .layouts import align_up
-from .file_io import IO_CHUNK_BYTES, Writeback, pwrite
+from .file_io import IO_CHUNK_BYTES, Writeback, extend, pwrite
 from .schema import (
     ArtifactError,
     ArtifactObject,
@@ -169,7 +169,7 @@ class ArtifactWriter:
                 self._fds.append(fd)
                 self._temporary.append(Path(temporary))
                 start = self.payload_offset if index == 0 else PAYLOAD_ALIGNMENT
-                os.ftruncate(fd, integer(start + file.payload_bytes, "file bytes"))
+                extend(fd, integer(start + file.payload_bytes, "file bytes"))
                 header = HEADER.pack(
                     MAGIC if index == 0 else PART_MAGIC,
                     len(encoded) if index == 0 else index,

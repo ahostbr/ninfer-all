@@ -104,6 +104,13 @@ struct MoeVecArgs {
     const float* weights;
     const float* gate;
     int activation; // GateActivation of `gate` and of the fused form
+    bool codes12;   // IQ1_M: read the weights through the 12-bit code table (chunks of 1, 2 and 4)
+    // Fused form only: the output is DeepSeek-V4.1's clamped SwiGLU of the two dots, each first
+    // multiplied by scale[pair / per_token] (when given) and rounded to BF16, and `second` may be
+    // null: the up rows then follow the gate rows (`rows` of them) in the same expert.
+    bool clamped;
+    const float* scale;
+    float limit;
 };
 
 template <ggml_type type>

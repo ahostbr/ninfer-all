@@ -783,7 +783,8 @@ detail::MoeVecArgs moe_args(const MoeTable& first, const MoeTable* second,
 
 void moe_vector_product(GgmlType type, const MoeTable& table, const MoeRouting& routing,
                         int max_active, int column_group, int per_token, const void* activation,
-                        int columns, const MoeOutput& out, int chunk, cudaStream_t stream) {
+                        int columns, const MoeOutput& out, int chunk, cudaStream_t stream,
+                        bool iq1m_codes12) {
     const int targets =
         int(out.bf16 != nullptr) + int(out.f32 != nullptr) + int(out.weighted != nullptr);
     if (targets != 1 || (out.weighted != nullptr && out.weights == nullptr)) {
@@ -796,6 +797,7 @@ void moe_vector_product(GgmlType type, const MoeTable& table, const MoeRouting& 
     args.weights    = out.weights;
     args.gate       = out.gate;
     args.activation = static_cast<int>(out.activation);
+    args.codes12    = iq1m_codes12;
     detail::moe_launcher(type)(args, max_active, chunk, false, stream);
 }
 
@@ -807,6 +809,24 @@ void moe_vector_swiglu(GgmlType type, const MoeTable& gate, const MoeTable& up,
     auto args       = moe_args(gate, &up, routing, column_group, 1, activation, columns);
     args.out_bf16   = out;
     args.activation = static_cast<int>(gate_activation);
+    detail::moe_launcher(type)(args, max_active, chunk, true, stream);
+}
+
+void moe_vector_clamped_swiglu(GgmlType type, const MoeTable& gate_up, const MoeRouting& routing,
+                               int max_active, int column_group, const void* activation,
+                               int columns, __nv_bfloat16* out, const float* scale, int per_token,
+                               float limit, int chunk, cudaStream_t stream, bool iq1m_codes12) {
+    if (out == nullptr || gate_up.rows <= 0 || gate_up.rows % 2 != 0 || per_token <= 0) {
+        throw std::invalid_argument("gguf moe clamped swiglu: invalid output or table");
+    }
+    // The gate and up rows of one expert are the parent's first and second halves.
+    const MoeTable half{gate_up.experts, gate_up.row_bytes, gate_up.rows / 2, gate_up.k};
+    auto args       = moe_args(half, nullptr, routing, column_group, per_token, activation, columns);
+    args.out_bf16   = out;
+    args.codes12    = iq1m_codes12;
+    args.clamped    = true;
+    args.scale      = scale;
+    args.limit      = limit;
     detail::moe_launcher(type)(args, max_active, chunk, true, stream);
 }
 
@@ -1100,7 +1120,13 @@ void matrix_product_bf16(GgmlType type, const void* weight, std::int64_t row_byt
     throw std::invalid_argument("gguf matrix product: no integer kernel for this block type");
 }
 
-bool moe_matrix_supported(GgmlType type, int rows, int k, bool tail) {
+bool moe_matrix_supported(GgmlType type, int rows, int k, bool tail, bool iq1m_matrix) {
+    if (type == GgmlType::IQ1_M) {
+        // IQ1_M has no dense matrix kernel (has_matrix_kernel); its MoE one is opt-in and
+        // integer-tensor-core only (Volta's FP16 route does not carry it).
+        return iq1m_matrix && !moe_matrix_sm70() &&
+               detail::moe_matrix_fits_impl<GGML_TYPE_IQ1_M>(rows, k, tail);
+    }
     if (moe_matrix_sm70()) {
         return has_matrix_kernel(type) && rows > 0 && rows % 32 == 0 && k > 0 &&
                k % block_shape(type).elements == 0;
@@ -1198,9 +1224,9 @@ void moe_matrix_product(GgmlType type, const MoeTable& table, const MoeRouting& 
         NINFER_GGUF_MOE_MATRIX_CASE(IQ3_XXS);
         NINFER_GGUF_MOE_MATRIX_CASE(IQ3_S);
         NINFER_GGUF_MOE_MATRIX_CASE(IQ1_S);
+        NINFER_GGUF_MOE_MATRIX_CASE(IQ1_M);
         NINFER_GGUF_MOE_MATRIX_CASE(IQ4_NL);
         NINFER_GGUF_MOE_MATRIX_CASE(IQ4_XS);
-    case GgmlType::IQ1_M:
     case GgmlType::MXFP4:
         break;
     }

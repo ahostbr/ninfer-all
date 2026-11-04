@@ -28,6 +28,7 @@
 #include "core/tensor.h"
 #include "models/deepseek_v41/engram.h"
 #include "models/deepseek_v41/engram_tuning.h"
+#include "models/deepseek_v41/kernel_switches.h"
 #include "models/deepseek_v41/model.h"
 #include "models/expert_profile.h"
 #include "models/qwen4_exp/ngram_table.h"
@@ -93,6 +94,8 @@ struct ExecutorOptions {
     // routed experts, which it serves from host memory or the files through a delivery and device
     // cache of its own; everything else stays on rank 0. Empty for one device.
     std::vector<double> expert_split;
+    // The kernel A/B switches (kernel_switches.h), already resolved against the environment.
+    KernelSwitches kernels;
 };
 
 // An image's rows in a prompt call: the call's rows from `row` on, as many as `embeddings` holds

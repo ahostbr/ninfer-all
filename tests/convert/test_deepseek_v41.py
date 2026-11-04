@@ -101,9 +101,10 @@ def _blocks(generator, rows, columns, block_values, block_bytes, scale_bytes=2):
     return blocks.reshape(rows, -1)
 
 
-def _release(tmp_path, kv=None, offsets=None):
+def _release(tmp_path, kv=None, offsets=None, dialect="release"):
     """A three-block DeepSeek-V4.1 release (window-only, ratio 2, ratio 1; Engram in block 0): the
-    HF text files, a GGUF split in two shards and the Engram GGUF."""
+    HF text files, a GGUF split in two shards and the Engram GGUF. `dialect="ista"` writes the same
+    weights as llama.cpp b11870+ names them (ISTA-DASLab's GGUFs)."""
 
     hf = tmp_path / "hf"
     hf.mkdir()
@@ -192,14 +193,40 @@ def _release(tmp_path, kv=None, offsets=None):
             q8(g + "engram_wkv.weight", (HC + 1) * HIDDEN, columns * ENGRAM_DIM, shard)
             vector(g + "engram_q.weight", (HC, HIDDEN), TYPE_BF16, shard)
             vector(g + "engram_k.weight", (HC, HIDDEN), TYPE_BF16, shard)
+    kv = kv or _gguf_kv()
+    if dialect == "ista":
+        f = "deepseek41."
+        constants = {name: stored[f"engram_{name}.weight"]
+                     for name in ("token_map", "multipliers", "primes", "offsets")}
+        drop = {f"engram_{name}.weight" for name in constants}
+        for shard in shards:
+            shard[:] = [t for t in shard if t[0] not in drop
+                        and not t[0].endswith(("engram_q.weight", "engram_k.weight"))]
+            shard[:] = [(t[0].replace("engram_wkv", "engram_kv"), *t[1:]) for t in shard]
+        gate = (stored["blk.0.engram_q.weight"] * stored["blk.0.engram_k.weight"]).astype("<f4")
+        shards[0].append(("blk.0.engram_gate.weight", gate.shape, TYPE_F32, gate.tobytes()))
+        kv = dict(kv)
+        for old, new in deepseek_v41.NEW_KV_NAMES.items():
+            if f + old in kv:
+                kv[f + new] = kv.pop(f + old)
+        # Derived from the gating function and the prime sums in the newer files.
+        del kv[f + "expert_scoring_func"], kv[f + "engram.num_embeddings"]
+        kv[f + "engram.token_map"] = [int(v) for v in constants["token_map"]]
+        kv[f + "ple.layer_multipliers"] = [int(v) for v in constants["multipliers"].reshape(-1)]
+        kv[f + "ple.head_vocab_sizes"] = [int(v) for v in constants["primes"].reshape(-1)]
+        kv[f + "ple.head_offsets"] = [int(v) for v in constants["offsets"].reshape(-1)]
     first = tmp_path / "ds-00001-of-00002.gguf"
-    write_gguf(first, kv or _gguf_kv(), shards[0])
+    write_gguf(first, kv, shards[0])
     write_gguf(tmp_path / "ds-00002-of-00002.gguf", {"split.count": 2}, shards[1])
     table = tmp_path / "engram.gguf"
     rows = _blocks(generator, ENGRAM_ROWS, ENGRAM_DIM, 32, 18)
-    write_gguf(table, {"general.architecture": "deepseek41-engram"},
-               [("blk.0.engram_embd.weight", (ENGRAM_ROWS, ENGRAM_DIM), TYPE_IQ4_NL,
-                 rows.tobytes())])
+    if dialect == "ista":  # one tensor of every block's rows, and no general.architecture
+        write_gguf(table, {}, [("per_layer_token_embd.weight", (ENGRAM_ROWS, ENGRAM_DIM),
+                                TYPE_IQ4_NL, rows.tobytes())])
+    else:
+        write_gguf(table, {"general.architecture": "deepseek41-engram"},
+                   [("blk.0.engram_embd.weight", (ENGRAM_ROWS, ENGRAM_DIM), TYPE_IQ4_NL,
+                     rows.tobytes())])
     stored["engram"] = rows
     return hf, first, table, stored
 
@@ -482,6 +509,70 @@ def test_the_artifact_keeps_the_gguf_rows_and_the_engram_table(tmp_path):
             stored["engram_token_map.weight"].tobytes()
         assert artifact.read_object(resources["chat_template.jinja"]) == \
             (deepseek_v41.DEFAULT_RESOURCES / "chat_template.jinja").read_bytes()
+
+
+def _objects(output):
+    from tools.artifact.reader import Artifact
+
+    with Artifact(output) as artifact:
+        directory = artifact.directory
+        return ({obj.id: artifact.read_object(obj.id) for obj in artifact.objects},
+                directory.bindings,
+                {name: component["config"] for name, component in directory.components.items()})
+
+
+def test_the_ista_gguf_dialect_converts_to_the_same_artifact(tmp_path):
+    """The weights of the llama.cpp b11870+ layout (renamed metadata, `engram_kv`, the gate stored
+    as its product, hash constants in metadata, one table tensor) convert to the same objects and
+    configs as the layout the recipe was written against."""
+
+    parts = {}
+    for dialect in ("release", "ista"):
+        root = tmp_path / dialect
+        root.mkdir()
+        hf, first, table, _ = _release(root, dialect=dialect)
+        parts[dialect] = _objects(_convert(root, hf, first, table))
+    assert parts["ista"][0] == parts["release"][0]
+    assert parts["ista"][1] == parts["release"][1]
+    assert parts["ista"][2] == parts["release"][2]
+    assert "engram/table" in parts["ista"][1] and "text/layers/0/engram/gate" in parts["ista"][1]
+
+
+def test_a_gguf_with_fewer_experts_sets_the_count(tmp_path):
+    """A GGUF pruned to fewer routed experts converts from the release's config.json as it is."""
+
+    from tools.convert.sources.safetensors import SafetensorsSource
+
+    hf, first, _, _ = _release(tmp_path)
+    config = json.loads((hf / "config.json").read_text())
+    config["text_config"]["n_routed_experts"] = 2 * EXPERTS
+    (hf / "config.json").write_text(json.dumps(config))
+    with SafetensorsSource(hf) as base, deepseek_v41.GGUFShards(first) as gguf:
+        model = deepseek_v41.build_model(base, gguf)
+    assert model.components["text"]["config"]["n_routed_experts"] == EXPERTS
+    # More experts than the release has is not a pruned GGUF.
+    config["text_config"]["n_routed_experts"] = EXPERTS - 1
+    (hf / "config.json").write_text(json.dumps(config))
+    with SafetensorsSource(hf) as base, deepseek_v41.GGUFShards(first) as gguf:
+        with pytest.raises(ValueError):
+            deepseek_v41.build_model(base, gguf)
+
+
+def test_engram_offsets_in_metadata_count_from_their_own_block():
+    from types import SimpleNamespace
+
+    kv = {"deepseek41.engram.token_map": [0, 1, 2, 3, 4, 5, 6, 7],
+          "deepseek41.ple.layer_multipliers": [1, 3, 5, 2, 4, 6],
+          "deepseek41.ple.head_vocab_sizes": [5, 7, 11, 13, 3, 4, 5, 6],
+          # offsets from the start of the whole table: the second block starts at row 36
+          "deepseek41.ple.head_offsets": [0, 5, 12, 23, 36, 39, 43, 48]}
+    config = {"engram_layer_ids": [0, 1], "engram_max_ngram_size": 3, "engram_n_heads": 2,
+              "vocab_size": 8, "engram_compressed_vocab_size": 10, "engram_pad_token_id": 1,
+              "engram_num_embeddings": [36, 18]}
+    out = deepseek_v41.engram_constants(SimpleNamespace(tensors={}, kv=kv), config)
+    assert out["offsets"] == [[0, 5, 12, 23], [0, 3, 7, 12]]
+    assert out["primes"] == [[5, 7, 11, 13], [3, 4, 5, 6]]
+    assert out["multipliers"] == [[1, 3, 5], [2, 4, 6]]
 
 
 def test_the_model_and_its_table_convert_apart(tmp_path):

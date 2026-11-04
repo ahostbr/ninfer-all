@@ -224,10 +224,10 @@ def text_config(source: dict) -> dict:
     return out
 
 
-# Fork change C1 (docs/fork/WINDOWS_PORT.md): ISTA-DASLab's GGUFs written for llama.cpp b11870 and
-# newer (the Coder, 2026-11-03) name some keys differently from the files this recipe was written
-# against. NEW_KV_NAMES maps the name this module reads to the new one; a key the file lacks under
-# the old name is read under the new one. Nothing here is read from the network.
+# GGUFs written for llama.cpp b11870 and newer (ISTA-DASLab's GSQ-RCO Coder) name some keys
+# differently from the files this recipe was first written against. NEW_KV_NAMES maps the name
+# this module reads to the newer one; a key the file lacks under the old name is read under the
+# new one, so a file in the old layout takes the old paths unchanged.
 NEW_KV_NAMES = {
     "attention.candidate_block_size": "attention.indexer.candidate_block_size",
     "attention.candidate_topk_blocks": "attention.indexer.candidate_top_k_blocks",
@@ -529,7 +529,7 @@ def engram_constants(gguf: GGUFShards, config: dict) -> dict:
         primes = gguf.integers("engram_primes.weight", "<i8")
         offsets = gguf.integers("engram_offsets.weight", "<i8")
     else:
-        # Change C1: the newer GGUFs carry the hash constants as metadata arrays. head_offsets
+        # The newer GGUFs carry the hash constants as metadata arrays. head_offsets
         # counts rows from the start of the whole table; the model wants them from the start of
         # their own Engram block (artifact layout: block rows one after the other).
         kv = gguf.kv
@@ -697,7 +697,7 @@ def engram_table_source(table: GGUFFile, config: dict) -> LogicalSource:
 
     width = config["engram_head_dim"]
     if NEW_TABLE_TENSOR in table.tensors:
-        # Change C1: the newer Engram GGUF is one tensor of every block's rows in order, with no
+        # The newer Engram GGUF is one tensor of every block's rows in order, with no
         # general.architecture key.
         total = int(sum(config["engram_num_embeddings"]))
         info = table.info(NEW_TABLE_TENSOR)
@@ -762,6 +762,15 @@ def build_model(base, gguf: GGUFShards | None, *, components=("text", "engram"),
         raise ValueError("the vision component converts from --source vision=MMPROJ.gguf and "
                          "--source bias_vl=BIAS_VL.safetensors")
     config = text_config(base.config)
+    if gguf is not None and "text" in selected:
+        # A GGUF pruned to fewer routed experts than the release (ISTA-DASLab's Coder keeps 192 of
+        # 384) says so in expert_count and in the shapes of its router and banks. Read the count
+        # from it rather than from a hand-edited copy of config.json; moe_block checks the shapes.
+        kept = gguf.kv.get("deepseek41.expert_count")
+        if type(kept) is int and config["num_experts_per_tok"] <= kept < config["n_routed_experts"]:
+            print(f"the GGUF keeps {kept} of the release's {config['n_routed_experts']} routed "
+                  f"experts per layer", flush=True)
+            config["n_routed_experts"] = kept
     records = {"engram": {"config": engram_table_config(config)}}
     if "text" not in selected:
         if resource_overrides:
@@ -868,7 +877,7 @@ def build_model(base, gguf: GGUFShards | None, *, components=("text", "engram"),
         if i in config["engram_layer_ids"]:
             n = p + "engram/"
             columns = (config["engram_max_ngram_size"] - 1) * config["engram_n_heads"]
-            # Change C1: the newer GGUFs name the projection engram_kv and store the gate product.
+            # The newer GGUFs name the projection engram_kv and store the gate product.
             wkv = g + ("engram_kv.weight" if g + "engram_kv.weight" in gguf.tensors
                        else "engram_wkv.weight")
             matrix(n + "projection", wkv,

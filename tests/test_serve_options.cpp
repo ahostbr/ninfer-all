@@ -103,6 +103,17 @@ int main() {
         } catch (const std::invalid_argument&) { rejected = true; }
         failures += check(rejected, "server accepted an invalid embedding residency");
     }
+    // Fork cut N30: --host is loopback-only.
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--host", "127.0.0.1"}).host ==
+                          "127.0.0.1",
+                      "the loopback address was refused");
+    for (const char* host : {"0.0.0.0", "::", "192.168.1.5", "example.test"}) {
+        bool refused = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--host", host});
+        } catch (const std::invalid_argument&) { refused = true; }
+        failures += check(refused, "a non-loopback --host was accepted");
+    }
     failures += check(!parse({"ninfer-serve", "model.ninfer", "--expert-residency", "host"})
                                .hybrid_experts.dma_share.has_value(),
                       "server must default the expert DMA share to automatic");

@@ -236,7 +236,7 @@ int main() {
                           plain.target.path == "/mcp",
                       "host, port and path were not split out of the target url");
 
-    const McpProxyRequest default_port = parse_mcp_proxy_target("http://example.test/mcp");
+    const McpProxyRequest default_port = parse_mcp_proxy_target("http://localhost/mcp");
     failures += check(default_port.ok && default_port.target.port == 80,
                       "a target url without a port did not default to 80");
 
@@ -269,13 +269,21 @@ int main() {
     failures += check(!parse_mcp_proxy_target("example.test/mcp").ok,
                       "a schemeless target was accepted");
     failures += check(!parse_mcp_proxy_target("http://").ok, "a hostless target was accepted");
-    failures += check(!parse_mcp_proxy_target("http://host:70000/mcp").ok,
+    failures += check(!parse_mcp_proxy_target("http://127.0.0.1:70000/mcp").ok,
                       "an out-of-range port was accepted");
-    failures += check(!parse_mcp_proxy_target("http://host:abc/mcp").ok,
+    failures += check(!parse_mcp_proxy_target("http://127.0.0.1:abc/mcp").ok,
                       "a non-numeric port was accepted");
     failures += check(!parse_mcp_proxy_target("http://::1:12315/mcp").ok,
                       "an unbracketed IPv6 literal was accepted");
     failures += check(!parse_mcp_proxy_target("").ok, "an empty target was accepted");
+
+    // Fork cut N11: the relay reaches this PC only.
+    failures += check(!parse_mcp_proxy_target("http://example.test/mcp").ok,
+                      "a non-loopback host was accepted");
+    failures += check(!parse_mcp_proxy_target("http://192.168.1.5:8080/mcp").ok,
+                      "a LAN address was accepted");
+    failures += check(!parse_mcp_proxy_target("http://127.0.0.1.example.test/mcp").ok,
+                      "a host that only starts with 127.0.0.1 was accepted");
 
     const httplib::Headers headers = {
         {std::string(kMcpProxyHeaderPrefix) + "Authorization", "Bearer secret"},

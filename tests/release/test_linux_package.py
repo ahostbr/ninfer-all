@@ -132,8 +132,7 @@ class LinuxPackageTest(unittest.TestCase):
         (self.build / 'generated').mkdir()
         (self.build / 'generated/ninfer_build_id.h').write_text(
             '#define NINFER_BUILD_ID "aaaaaaaaa"\n#define NINFER_VERSION "2026-10-23.2"\n')
-        shutil.copy2(ROOT / 'docker/entrypoint.sh', self.repo / 'docker/entrypoint.sh')
-        shutil.copy2(ROOT / 'docker/release.Dockerfile', self.repo / 'docker/release.Dockerfile')
+        # Fork cut N19: docker/ is removed, so the packager ships no Dockerfile or entrypoint.
         # The release archives cmake/NinferFFmpeg.cmake records for the linked media libraries.
         media = {}
         for library, version, licence in (('dav1d', '1.5.4', 'COPYING'), ('ffmpeg', '9.0.2', 'COPYING.LGPLv2.1')):
@@ -196,7 +195,7 @@ class LinuxPackageTest(unittest.TestCase):
             return
         raise AssertionError(args)
 
-    def test_archive_roundtrip_and_runtime_docker_context(self):
+    def test_archive_roundtrip(self):
         PACKAGE.main()
         dist = self.repo / 'dist'
         volume = next(dist.glob('*.tar.gz.001'))
@@ -210,7 +209,7 @@ class LinuxPackageTest(unittest.TestCase):
             prefix = names[0]
             self.assertTrue(archive.getmember(prefix + '/ninfer').isfile())
             self.assertTrue(archive.getmember(prefix + '/backends/cuda13/libninfer-runtime.so').isfile())
-            self.assertIn(prefix + '/Dockerfile', names)
+            self.assertNotIn(prefix + '/Dockerfile', names)
             info = json.load(archive.extractfile(prefix + '/BUILD-INFO.json'))
             self.assertEqual(info['architectures'], ['75', '120a'])
             self.assertEqual(info['version'], '2026-10-23.2')

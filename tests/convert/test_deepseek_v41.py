@@ -381,6 +381,24 @@ def _bias_vl(tmp_path, layers=3):
     return path, values
 
 
+def test_bias_vl_comes_from_a_gguf_that_carries_it(tmp_path):
+    from tools.convert import bias_vl_from_gguf
+    from tools.convert.sources.safetensors import SafetensorsSource
+
+    generator = np.random.default_rng(41)
+    values = [generator.normal(size=EXPERTS).astype(np.float32) for _ in range(3)]
+    path = tmp_path / "coder.gguf"
+    write_gguf(path, {"general.architecture": "deepseek41", "deepseek41.block_count": 3},
+               [(f"blk.{i}.exp_probs_b_vl.bias", (EXPERTS,), TYPE_F32, v.tobytes())
+                for i, v in enumerate(values)])
+    out = tmp_path / "bias_vl.safetensors"
+    bias_vl_from_gguf.main([str(path), "--out", str(out)])
+    with SafetensorsSource(out) as source:
+        for layer, expected in enumerate(values):
+            assert np.array_equal(source.read_flat(f"layers.{layer}.ffn.gate.bias_vl").numpy(),
+                                  expected)
+
+
 def _convert(tmp_path, hf, first, table, components=("text", "engram"), drafter=None,
              mmproj=None, bias_vl=None):
     from tools.convert.pipeline import convert

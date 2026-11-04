@@ -137,6 +137,18 @@ python -m tools.convert --model models/deepseek-v4.1/hf --recipe deepseek_v41_gg
   --out models/DeepSeek-V4.1-Flash-Engram-IQ4_NL-ninfer-v3.ninfer --device cpu
 ```
 
+GGUFs written for llama.cpp b11870 and newer (ISTA-DASLab's GSQ-RCO Coder, which keeps 192 of the 384
+routed experts per layer) name some keys and tensors differently: the Engram and indexer metadata
+(`deepseek41.ple.*`, `engram.*`, `attention.indexer.*`), `engram_kv`, the Engram gate stored as the
+product of its two factors, the hash constants as metadata arrays, and the table as one tensor
+`per_layer_token_embd.weight`. The converter reads both layouts and takes the expert count from the
+GGUF. Such a GGUF also carries the routing bias of image positions (`blk.N.exp_probs_b_vl.bias`), so
+the base release's shards are not needed for it:
+
+```bash
+python -m tools.convert.bias_vl_from_gguf SHARD1.gguf --out models/deepseek-v4.1/bias_vl.safetensors
+```
+
 The model reads the Engram GGUF only for the table's digest, and of the STQ pack only its config,
 its index and its six drafter files (3.85 GB), checking that the pack states the release's model and
 drafter keys. `--components text,dspark` leaves the vision tower out and `--components text` the

@@ -488,7 +488,7 @@ public:
         std::vector<std::filesystem::path> paths;
         for (const auto& segment : owner.layout_.segments) { paths.push_back(segment.path); }
         queue_ = FileReadQueue::open(paths, owner.options_.io == NgramIo::Direct,
-                                    owner.options_.depth);
+                                    owner.options_.depth, owner.options_.refill);
         ids_.reserve(owner.options_.depth);
     }
 
@@ -649,7 +649,8 @@ NgramTableReader::NgramTableReader(NgramTableLayout layout, const NgramReadOptio
     if (options_.residency != NgramResidency::Ram && options_.io != NgramIo::Mapped) {
         std::vector<std::filesystem::path> paths;
         for (const auto& segment : layout_.segments) { paths.push_back(segment.path); }
-        queue_ = FileReadQueue::open(paths, options_.io == NgramIo::Direct, options_.depth);
+        queue_ = FileReadQueue::open(paths, options_.io == NgramIo::Direct, options_.depth,
+                                     options_.refill);
         if (queue_) {
             // Startup's parallel bulk loads are finished. One worker now drives the OS queue;
             // its depth bounds native reads instead of allocating a thread for every read.
@@ -813,6 +814,31 @@ std::int64_t NgramTableReader::hot_slot(std::uint64_t row) const noexcept {
     return static_cast<std::int64_t>(slot) + std::popcount(bits & below);
 }
 
+// Fills copies_ with every row of the batch that repeats an earlier one (not kNgramSkipRow), as
+// (its index, the earlier one's); the earlier row is the one the file or cache serves.
+void NgramTableReader::find_repeats(std::span<const std::uint64_t> row_ids) {
+    const std::size_t capacity = std::bit_ceil(std::max<std::size_t>(row_ids.size() * 2, 16));
+    dedupe_table_.assign(capacity, 0);
+    const std::size_t mask = capacity - 1;
+    for (std::size_t i = 0; i < row_ids.size(); ++i) {
+        const std::uint64_t row = row_ids[i];
+        if (row == kNgramSkipRow) { continue; }
+        std::size_t slot = static_cast<std::size_t>((row * 0x9E3779B97F4A7C15ULL) >> 20U) & mask;
+        for (;;) {
+            const std::uint32_t held = dedupe_table_[slot];
+            if (held == 0) {
+                dedupe_table_[slot] = static_cast<std::uint32_t>(i) + 1;
+                break;
+            }
+            if (row_ids[held - 1] == row) {
+                copies_.emplace_back(static_cast<std::uint32_t>(i), held - 1);
+                break;
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+}
+
 void NgramTableReader::submit(std::span<const std::uint64_t> row_ids, std::span<std::uint8_t> out) {
     if (pending_) { throw std::logic_error("n-gram table: a batch is in flight"); }
     const std::size_t rb = layout_.row_bytes;
@@ -820,7 +846,7 @@ void NgramTableReader::submit(std::span<const std::uint64_t> row_ids, std::span<
         throw std::invalid_argument("n-gram table: output size mismatch");
     }
     for (const std::uint64_t row : row_ids) {
-        if (row >= layout_.rows) {
+        if (row >= layout_.rows && row != kNgramSkipRow) {
             throw std::out_of_range("n-gram table: row " + std::to_string(row) + " past " +
                                     std::to_string(layout_.rows));
         }
@@ -828,8 +854,20 @@ void NgramTableReader::submit(std::span<const std::uint64_t> row_ids, std::span<
     batch_start_ = std::chrono::steady_clock::now();
     misses_.clear();
     admissions_.clear();
-    std::uint64_t hits = 0;
+    copies_.clear();
+    std::uint64_t hits = 0, skipped = 0;
+    if (options_.dedupe && row_ids.size() > 1) { find_repeats(row_ids); }
+    std::size_t next_copy = 0;
     for (std::size_t i = 0; i < row_ids.size(); ++i) {
+        if (row_ids[i] == kNgramSkipRow) {
+            std::memset(out.data() + i * rb, 0, rb);
+            ++skipped;
+            continue;
+        }
+        if (next_copy < copies_.size() && copies_[next_copy].first == i) {
+            ++next_copy; // a repeat: copied from its first occurrence at wait()
+            continue;
+        }
         if (cache_ && cache_->copy(row_ids[i], out.data() + i * rb)) {
             ++hits;
             continue;
@@ -874,8 +912,12 @@ void NgramTableReader::submit(std::span<const std::uint64_t> row_ids, std::span<
             }
         }
     }
-    rows_.fetch_add(row_ids.size(), std::memory_order_relaxed);
-    resident_hits_.fetch_add(hits, std::memory_order_relaxed);
+    // A repeated row is served from memory, at wait(), so it counts with the rows RAM served; a
+    // skipped row was never addressed.
+    rows_.fetch_add(row_ids.size() - skipped, std::memory_order_relaxed);
+    resident_hits_.fetch_add(hits + copies_.size(), std::memory_order_relaxed);
+    deduped_.fetch_add(copies_.size(), std::memory_order_relaxed);
+    skipped_.fetch_add(skipped, std::memory_order_relaxed);
     batch_ids_ = row_ids;
     batch_out_ = out;
     pending_   = true;
@@ -922,6 +964,14 @@ void NgramTableReader::wait() {
     try {
         pool_->finish();
     } catch (...) { failure = std::current_exception(); }
+    if (!failure) {
+        const std::size_t rb = layout_.row_bytes;
+        for (const auto& [to, from] : copies_) {
+            std::memcpy(batch_out_.data() + std::size_t(to) * rb,
+                        batch_out_.data() + std::size_t(from) * rb, rb);
+        }
+        copies_.clear();
+    }
     if (!failure && cache_) {
         for (const std::size_t i : admissions_) {
             cache_->insert(batch_ids_[i], batch_out_.data() + i * layout_.row_bytes);

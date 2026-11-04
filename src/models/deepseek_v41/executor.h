@@ -27,6 +27,7 @@
 #include "core/device.h"
 #include "core/tensor.h"
 #include "models/deepseek_v41/engram.h"
+#include "models/deepseek_v41/engram_tuning.h"
 #include "models/deepseek_v41/model.h"
 #include "models/expert_profile.h"
 #include "models/qwen4_exp/ngram_table.h"
@@ -74,6 +75,10 @@ struct ExecutorOptions {
     // non-standard mode that degrades the output).
     std::optional<qwen4_exp::NgramTableLayout> engram_table;
     qwen4_exp::NgramReadOptions engram_read;
+    // T0833: the Engram read path's experiments (engram_tuning.h); all off by default. dedupe here
+    // also leaves out the rows of image tokens, which no layer reads; the reader's own dedupe flag
+    // (engram_read.dedupe) is the core's to set beside it.
+    EngramTuning engram_tuning;
     // Prompt calls may carry images (a model loaded with its vision tower): the most patches an
     // image has, which sizes the tower's scratch. 0: text only.
     std::uint32_t vision_max_patches = 0;
@@ -101,6 +106,10 @@ struct ExecutorMemory {
     std::uint64_t span_borrow_bytes = 0;
     // Engram rows held in RAM (a table read whole, or the reader's row cache).
     std::uint64_t engram_resident_bytes = 0;
+    // EngramOverlap Pass and Ahead: the device and pinned host bytes of the extra buffer sets that
+    // prompt passes read their Engram rows through (0 with overlap off).
+    std::uint64_t engram_overlap_device_bytes = 0;
+    std::uint64_t engram_overlap_pinned_bytes = 0;
     // The vision tower: the scratch of one encode within workspace_bytes, and the device bytes the
     // tower and its image buffers own beside the model's weights.
     std::uint64_t vision_encode_bytes = 0;
@@ -165,9 +174,13 @@ public:
     // frontier: a checkpoint or the prompt's end) leaves exact state, and then the rows after the
     // skipped ones are at least prompt_skip_keep(). Ignored when prompt_skip_keep() is 0. With every
     // row skipped, logit_rows may be 0 and the call leaves no logits.
+    //
+    // `ahead` (EngramOverlap::Ahead; otherwise ignored): the tokens of the prompt call that will
+    // follow this one on the sequence. Their Engram rows are read in the background while this call
+    // computes, into the buffers that call takes; it uses them if its tokens are these.
     void forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,
                  std::uint32_t logit_rows, std::span<const ImageRows> images = {},
-                 std::uint32_t skip_rows = 0);
+                 std::uint32_t skip_rows = 0, std::span<const std::int32_t> ahead = {});
     // Rows a prompt run keeps through every block, before the point it ends at, when it skips the
     // blocks past the long-prompt skip's block for the earlier ones (prompt_skip.h); 0 when this
     // model or executor does not allow the skip: the model's blocks past the first with compression

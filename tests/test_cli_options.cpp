@@ -43,6 +43,35 @@ int run_tests() {
                                            "--deepseek-prompt-skip", "yes"});
                           }),
                       "--deepseek-prompt-skip was not parsed as on|off, or is not off by default");
+    {
+        // T0833: the Engram read experiments are off unless asked for, and strict about values.
+        const auto base = parse({"ninfer-cli", "model.ninfer", "--prompt", "x"}).ngram_table;
+        failures += check(!base.engram_dedupe && base.engram_overlap == ninfer::EngramOverlap::Off &&
+                              !base.read_refill && !base.engram_default_cache,
+                          "the Engram read experiments are not off by default");
+        const auto on = parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+                               "--deepseek-engram-dedupe", "on", "--deepseek-engram-overlap",
+                               "ahead", "--file-read-refill", "true",
+                               "--deepseek-engram-default-cache", "1"}).ngram_table;
+        failures += check(on.engram_dedupe && on.engram_overlap == ninfer::EngramOverlap::Ahead &&
+                              on.read_refill && on.engram_default_cache,
+                          "the Engram read experiments were not parsed");
+        failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+                                 "--deepseek-engram-overlap", "pass"})
+                                  .ngram_table.engram_overlap == ninfer::EngramOverlap::Pass &&
+                              parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+                                     "--deepseek-engram-overlap", "off"})
+                                      .ngram_table.engram_overlap == ninfer::EngramOverlap::Off,
+                          "--deepseek-engram-overlap pass|off was not parsed");
+        for (const char* flag : {"--deepseek-engram-dedupe", "--deepseek-engram-overlap",
+                                 "--file-read-refill", "--deepseek-engram-default-cache"}) {
+            failures += check(rejects([&] {
+                                  (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", flag,
+                                               "yes"});
+                              }),
+                              "an Engram read experiment accepted a malformed value");
+        }
+    }
     failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--gpu-clock-floor",
                              "1500"}).gpu_clock_floor_mhz == 1500 &&
                           parse({"ninfer-cli", "model.ninfer", "--prompt", "x"})

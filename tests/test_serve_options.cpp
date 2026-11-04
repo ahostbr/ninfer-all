@@ -670,6 +670,24 @@ int main() {
                           !parse({"ninfer-serve", "model.ninfer", "--deepseek-prompt-skip", "off"})
                                .deepseek_prompt_skip,
                       "--deepseek-prompt-skip did not reach serving options or is not off by default");
+    {
+        // T0833: the Engram read experiments reach the serving options, off unless asked for.
+        const auto base = parse({"ninfer-serve", "model.ninfer"}).ngram_table;
+        failures += check(!base.engram_dedupe && base.engram_overlap == ninfer::EngramOverlap::Off &&
+                              !base.read_refill && !base.engram_default_cache,
+                          "the Engram read experiments are not off by default in serving");
+        const auto on = parse({"ninfer-serve", "model.ninfer", "--deepseek-engram-dedupe", "on",
+                               "--deepseek-engram-overlap", "pass", "--file-read-refill", "on",
+                               "--deepseek-engram-default-cache", "on"}).ngram_table;
+        failures += check(on.engram_dedupe && on.engram_overlap == ninfer::EngramOverlap::Pass &&
+                              on.read_refill && on.engram_default_cache,
+                          "the Engram read experiments did not reach serving options");
+        bool refused = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--deepseek-engram-overlap", "yes"});
+        } catch (const std::invalid_argument&) { refused = true; }
+        failures += check(refused, "--deepseek-engram-overlap accepted a malformed value");
+    }
     bool invalid_skip_rejected = false;
     try {
         (void)parse({"ninfer-serve", "model.ninfer", "--deepseek-prompt-skip", "yes"});

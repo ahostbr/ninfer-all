@@ -17,3 +17,7 @@ set_tests_properties(ninfer_deepseek_v41_vision_real_test PROPERTIES SKIP_RETURN
 ninfer_add_test(ninfer_deepseek_v41_prompt_skip_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_prompt_skip.cpp"
   LIBRARIES ninfer_model_runtime)
+
+ninfer_add_test(ninfer_deepseek_v41_engram_reads_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engram_reads.cpp"
+  LIBRARIES ninfer_model_loading)

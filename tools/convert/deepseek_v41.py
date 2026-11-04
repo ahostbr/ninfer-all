@@ -224,10 +224,49 @@ def text_config(source: dict) -> dict:
     return out
 
 
+# Fork change C1 (docs/fork/WINDOWS_PORT.md): ISTA-DASLab's GGUFs written for llama.cpp b11870 and
+# newer (the Coder, 2026-11-03) name some keys differently from the files this recipe was written
+# against. NEW_KV_NAMES maps the name this module reads to the new one; a key the file lacks under
+# the old name is read under the new one. Nothing here is read from the network.
+NEW_KV_NAMES = {
+    "attention.candidate_block_size": "attention.indexer.candidate_block_size",
+    "attention.candidate_topk_blocks": "attention.indexer.candidate_top_k_blocks",
+    "attention.candidate_source_layer_id": "attention.indexer.candidate_source_layer",
+    "kv_source_layer_ids": "attention.kv_source_layers",
+    "index_source_layer_ids": "attention.indexer.source_layers",
+    "engram.layer_ids": "ple.layers",
+    "engram_head_dim": "embedding_length_per_layer_input",
+    "engram_n_heads": "ple.heads_per_ngram",
+    "engram_max_ngram_size": "ple.ngram_size",
+    "engram_pad_token_id": "engram.pad_token_id",
+}
+NEW_TABLE_TENSOR = "per_layer_token_embd.weight"
+
+
+def kv_view(kv: dict) -> dict:
+    """`kv` with the keys validate() reads under their old names, filled in from the new names."""
+
+    out = dict(kv)
+    f = "deepseek41."
+    for old, new in NEW_KV_NAMES.items():
+        if f + old not in out and f + new in out:
+            out[f + old] = out[f + new]
+    if f + "expert_scoring_func" not in out and \
+            out.get(f + "expert_gating_func") == SQRT_SOFTPLUS_GATING:
+        out[f + "expert_scoring_func"] = "sqrtsoftplus"
+    sizes = out.get(f + "ple.head_vocab_sizes")
+    layers = out.get(f + "engram.layer_ids")
+    if f + "engram.num_embeddings" not in out and sizes is not None and layers:
+        per = len(sizes) // len(layers)
+        out[f + "engram.num_embeddings"] = [int(sum(sizes[i * per:(i + 1) * per]))
+                                            for i in range(len(layers))]
+    return out
+
+
 def validate(gguf: GGUFShards, config: dict) -> None:
     """The GGUF's architecture metadata against the release's config.json."""
 
-    kv = gguf.kv
+    kv = kv_view(gguf.kv)
     if kv.get("general.architecture") != "deepseek41":
         raise ValueError(f"{gguf.path}: expected a DeepSeek-V4.1 (deepseek41) GGUF")
     f = "deepseek41."
@@ -484,10 +523,24 @@ def engram_constants(gguf: GGUFShards, config: dict) -> dict:
     layers = len(config["engram_layer_ids"])
     n, heads = config["engram_max_ngram_size"], config["engram_n_heads"]
     columns = (n - 1) * heads
-    token_map = gguf.integers("engram_token_map.weight", "<i4")
-    multipliers = gguf.integers("engram_multipliers.weight", "<i8")
-    primes = gguf.integers("engram_primes.weight", "<i8")
-    offsets = gguf.integers("engram_offsets.weight", "<i8")
+    if "engram_token_map.weight" in gguf.tensors:
+        token_map = gguf.integers("engram_token_map.weight", "<i4")
+        multipliers = gguf.integers("engram_multipliers.weight", "<i8")
+        primes = gguf.integers("engram_primes.weight", "<i8")
+        offsets = gguf.integers("engram_offsets.weight", "<i8")
+    else:
+        # Change C1: the newer GGUFs carry the hash constants as metadata arrays. head_offsets
+        # counts rows from the start of the whole table; the model wants them from the start of
+        # their own Engram block (artifact layout: block rows one after the other).
+        kv = gguf.kv
+        token_map = np.asarray(kv["deepseek41.engram.token_map"], dtype="<i4")
+        multipliers = np.asarray(kv["deepseek41.ple.layer_multipliers"],
+                                 dtype="<i8").reshape(layers, n)
+        primes = np.asarray(kv["deepseek41.ple.head_vocab_sizes"],
+                            dtype="<i8").reshape(layers, columns)
+        offsets = np.asarray(kv["deepseek41.ple.head_offsets"],
+                             dtype="<i8").reshape(layers, columns)
+        offsets = offsets - offsets[:, :1]
     if token_map.shape != (config["vocab_size"],):
         raise ValueError("engram_token_map must map every token")
     if (multipliers.shape != (layers, n) or primes.shape != (layers, columns)
@@ -642,9 +695,18 @@ def expert_gate_up(gguf: GGUFShards, layer: int, experts: int, width: int,
 def engram_table_source(table: GGUFFile, config: dict) -> LogicalSource:
     """The Engram GGUF's tables (one per Engram block) as one table of their rows in order."""
 
+    width = config["engram_head_dim"]
+    if NEW_TABLE_TENSOR in table.tensors:
+        # Change C1: the newer Engram GGUF is one tensor of every block's rows in order, with no
+        # general.architecture key.
+        total = int(sum(config["engram_num_embeddings"]))
+        info = table.info(NEW_TABLE_TENSOR)
+        if info.shape != (total, width) or info.type_name != "IQ4_NL":
+            raise ValueError(f"{table.path}: {NEW_TABLE_TENSOR} is {info.type_name} {info.shape}; "
+                             f"expected IQ4_NL ({total}, {width})")
+        return block_source(table, NEW_TABLE_TENSOR, (total, width), rows())
     if table.kv.get("general.architecture") != "deepseek41-engram":
         raise ValueError(f"{table.path}: expected the release's Engram GGUF (deepseek41-engram)")
-    width = config["engram_head_dim"]
     parts = []
     for layer, rows_in_layer in zip(config["engram_layer_ids"], config["engram_num_embeddings"]):
         name = ENGRAM_TENSOR.format(layer)
@@ -656,13 +718,20 @@ def engram_table_source(table: GGUFFile, config: dict) -> LogicalSource:
     return _stacked(parts, f"{table.path}:engram") if len(parts) > 1 else parts[0]
 
 
+def table_tensors(table: GGUFFile, layers) -> list[str]:
+    """The tensors that hold the Engram rows, in table order."""
+
+    if NEW_TABLE_TENSOR in table.tensors:
+        return [NEW_TABLE_TENSOR]
+    return [ENGRAM_TENSOR.format(layer) for layer in layers]
+
+
 def table_digest(table: GGUFFile, config: dict) -> str:
     """SHA-256 of the Engram rows' bytes, which the artifact stores unchanged, row for row."""
 
     digest = hashlib.sha256()
     step = 1 << 28
-    for layer in config["engram_layer_ids"]:
-        name = ENGRAM_TENSOR.format(layer)
+    for name in table_tensors(table, config["engram_layer_ids"]):
         size = table.info(name).nbytes
         for begin in range(0, size, step):
             digest.update(table.tensor_bytes(name, begin, min(begin + step, size)))
@@ -799,11 +868,18 @@ def build_model(base, gguf: GGUFShards | None, *, components=("text", "engram"),
         if i in config["engram_layer_ids"]:
             n = p + "engram/"
             columns = (config["engram_max_ngram_size"] - 1) * config["engram_n_heads"]
-            matrix(n + "projection", g + "engram_wkv.weight",
+            # Change C1: the newer GGUFs name the projection engram_kv and store the gate product.
+            wkv = g + ("engram_kv.weight" if g + "engram_kv.weight" in gguf.tensors
+                       else "engram_wkv.weight")
+            matrix(n + "projection", wkv,
                    ((hc + 1) * h, columns * config["engram_head_dim"]), (n + "rows",))
-            q = gguf.file(g + "engram_q.weight").read_direct(g + "engram_q.weight")
-            k = gguf.file(g + "engram_k.weight").read_direct(g + "engram_k.weight")
-            gate = (q.astype(np.float32) * k.astype(np.float32)).reshape(hc, h)
+            if g + "engram_gate.weight" in gguf.tensors:
+                gate = gguf.file(g + "engram_gate.weight").read_direct(
+                    g + "engram_gate.weight").astype(np.float32).reshape(hc, h)
+            else:
+                q = gguf.file(g + "engram_q.weight").read_direct(g + "engram_q.weight")
+                k = gguf.file(g + "engram_k.weight").read_direct(g + "engram_k.weight")
+                gate = (q.astype(np.float32) * k.astype(np.float32)).reshape(hc, h)
             vector(n + "gate", None, (hc, h),
                    array_source(torch.from_numpy(np.ascontiguousarray(gate)),
                                 g + "engram_q*engram_k"))
@@ -971,7 +1047,7 @@ def configure_engram(model, recipe, table) -> None:
     if source.read_encoded(0, 1).format != TABLE_FORMAT:
         raise ValueError("the Engram GGUF must hold IQ4_NL rows")
     descriptor["format"] = TABLE_FORMAT
-    size = sum(table.info(ENGRAM_TENSOR.format(i)).nbytes for i in descriptor["layers"])
+    size = sum(table.info(name).nbytes for name in table_tensors(table, descriptor["layers"]))
     print(f"hashing the Engram table ({size / 1e9:.1f} GB)", flush=True)
     descriptor["table_sha256"] = table_digest(table, config)
     if "engram/table" in model.parameters:

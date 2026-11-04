@@ -133,12 +133,6 @@ ExpertTier::Victim ExpertTier::admission_victim(std::size_t layer, std::int32_t 
     return {};
 }
 
-std::vector<ExpertTier::Swap> ExpertTier::end_round() {
-    if (options_.every == 0) { return {}; }
-    passes_ = options_.every - 1;
-    return end_pass();
-}
-
 std::vector<ExpertTier::Swap> ExpertTier::end_pass() {
     std::vector<Swap> swaps;
     if (options_.every != 0 && ++passes_ >= options_.every) {

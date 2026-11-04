@@ -36,7 +36,6 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -73,12 +72,6 @@ struct ExecutorOptions {
     // bus times. CPU threads: 0 for one per physical core.
     std::optional<float> expert_dma_share;
     std::uint32_t expert_cpu_threads = 0;
-    // T0833 experiments (hybrid_expert_options.h), off by default: the next block's experts queued
-    // behind a wide call's own and the block named from the pass's real order; a prompt's routes
-    // kept for ExpertDelivery::settle; --expert-profile counts also the tier's starting counts.
-    bool expert_prefetch_ahead   = false;
-    bool expert_track_prompt     = false;
-    bool expert_profile_weights  = false;
     // The Engram table's rows and how they are read; none runs the model without its Engram (a
     // non-standard mode that degrades the output).
     std::optional<qwen4_exp::NgramTableLayout> engram_table;
@@ -171,9 +164,6 @@ public:
     // The CPU's share of missing experts (its threads and kernels), or empty when the GPU copies
     // every miss.
     [[nodiscard]] std::string expert_cpu_description() const;
-    // Cache settle (ExpertDelivery::settle) on every delivery: after the compute stream's last
-    // call. Off (and zero rounds) when there is no expert delivery.
-    ExpertSettle settle_experts(double max_ms, const std::function<bool()>& cancel = {});
     // Prompt tokens one forward() may take: prefill_chunk, or with host or disk experts a span of
     // several chunks (as many as memory allows beside the expert cache), which forward() runs
     // layer by layer so that each block's missing experts cross the bus once for all of them.

@@ -81,9 +81,6 @@ public:
     // Ends a decode pass. Every `every` passes: the round's swaps, best gain first, and the counts'
     // decay. The caller carries them out and reports the states.
     [[nodiscard]] std::vector<Swap> end_pass();
-    // The round of `every` passes now, whatever the passes counted so far (the settle after a
-    // prompt): its swaps and the counts' decay. None when rounds are off (every == 0).
-    [[nodiscard]] std::vector<Swap> end_round();
 
 private:
     struct Entry {

@@ -68,9 +68,7 @@ after the text layers'; they are ignored), and refuses anything else naming what
 artifact identity (both are printed), the row count, or the layer whose width is not 192. The
 startup log prints `expert profile <path> read for artifact <id>: 40 layers of 192 experts`, and a
 refusal for the wrong identity prints the one the artifact has (`recorded for artifact 'A', this one
-is 'B'`), so a script can take it from a first run with any profile. Counts only place the cache's first contents;
-`--deepseek-profile-weights on` (T0833) also gives them to the expert tier as its starting counts,
-so the seeded experts are not the coldest ones the first decode passes see.
+is 'B'`), so a script can take it from a first run with any profile. Counts only place the cache's first contents.
 
 **Checked** (`python -I` with the repo's own parser, no network): `validate` OK, `engram_constants` OK,
 `engram_table_source` OK (768,022,850 x 256, `gguf_iq4_nl`), `build_model(text)` OK (962 parameters, router

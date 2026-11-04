@@ -1,6 +1,5 @@
 #pragma once
 
-#include "core/strict_value.h"
 #include "ninfer/engine_options.h"
 
 #include <charconv>
@@ -39,24 +38,7 @@ inline constexpr const char* kHybridExpertHelp =
     "                                runs (default 2 with the automatic cache, which holds them\n"
     "                                as expert cache slots between prompts, else 1)\n"
     "  --expert-cache-adaptive       replace cold cached experts between calls;\n"
-    "                                changes the CPU/GPU arithmetic partition\n"
-    "  DeepSeek-V4.1-only delivery experiments (T0833; each off by default, each also set by\n"
-    "  the NINFER_DS_* variable named beside it, 1|on|true or 0|off|false):\n"
-    "  --deepseek-prefetch-ahead on|off     a wide prompt call queues the next block's expert\n"
-    "                                copies behind its own and names the block from the pass's\n"
-    "                                real order (NINFER_DS_PREFETCH_AHEAD)\n"
-    "  --deepseek-cache-settle on|off       after a prompt, its routes feed the expert tier and\n"
-    "                                swap rounds run at once; again while the Engine idles\n"
-    "                                (NINFER_DS_CACHE_SETTLE)\n"
-    "  --deepseek-cache-settle-ms N         the most a settle after a prompt takes (default 400;\n"
-    "                                NINFER_DS_CACHE_SETTLE_MS)\n"
-    "  --deepseek-cache-settle-idle-ms N    the most an idle settle takes (default 6000;\n"
-    "                                NINFER_DS_CACHE_SETTLE_IDLE_MS)\n"
-    "  --deepseek-short-prompt on|off       a prompt of at most N new tokens runs in rows of 8\n"
-    "                                through the narrow expert path (NINFER_DS_SHORT_PROMPT)\n"
-    "  --deepseek-short-prompt-tokens N     that N (default 96; NINFER_DS_SHORT_PROMPT_TOKENS)\n"
-    "  --deepseek-profile-weights on|off    --expert-profile counts also seed the expert tier's\n"
-    "                                counts (NINFER_DS_PROFILE_WEIGHTS)\n";
+    "                                changes the CPU/GPU arithmetic partition\n";
 
 template<class Value>
 bool parse_hybrid_expert_option(std::string_view option, HybridExpertOptions& out, Value&& value) {
@@ -106,30 +88,6 @@ bool parse_hybrid_expert_option(std::string_view option, HybridExpertOptions& ou
         }
     } else if (option == "--expert-cache-adaptive") {
         out.adaptive_cache = true;
-    } else if (option == "--deepseek-prefetch-ahead" || option == "--deepseek-cache-settle" ||
-               option == "--deepseek-short-prompt" || option == "--deepseek-profile-weights") {
-        // On the command line only on|off; the environment also takes 1|0|true|false.
-        const std::string text(value());
-        if (text != "on" && text != "off") {
-            throw std::invalid_argument(std::string(option) + " takes on or off");
-        }
-        const bool on = text == "on";
-        if (option == "--deepseek-prefetch-ahead") { out.deepseek_prefetch_ahead = on; }
-        else if (option == "--deepseek-cache-settle") { out.deepseek_cache_settle = on; }
-        else if (option == "--deepseek-short-prompt") { out.deepseek_short_prompt = on; }
-        else { out.deepseek_profile_weights = on; }
-    } else if (option == "--deepseek-cache-settle-ms" || option == "--deepseek-cache-settle-idle-ms" ||
-               option == "--deepseek-short-prompt-tokens") {
-        const std::string text(value());
-        const auto count  = parse_count(text);
-        const bool tokens = option == "--deepseek-short-prompt-tokens";
-        if (!count || (tokens ? (*count == 0 || *count > 4096) : *count > 600000)) {
-            throw std::invalid_argument(std::string(option) + (tokens
-                ? " takes an integer in 1..4096" : " takes milliseconds in 0..600000"));
-        }
-        if (tokens) { out.deepseek_short_prompt_tokens = *count; }
-        else if (option == "--deepseek-cache-settle-ms") { out.deepseek_cache_settle_ms = *count; }
-        else { out.deepseek_cache_settle_idle_ms = *count; }
     } else if (option == "--expert-profile" || option == "--expert-profile-out") {
         const std::string path(value());
         if (path.empty()) { throw std::invalid_argument(std::string(option) + " takes a file path"); }

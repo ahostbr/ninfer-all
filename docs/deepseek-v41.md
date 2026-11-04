@@ -304,56 +304,13 @@ drafter is loaded. The startup log says `long-prompt layer skip ON`, or why it c
   figure is not measured yet; compare `--deepseek-prompt-skip off` and `on` on the same prompts
   before relying on it.
 
-### Delivery experiments (T0833)
+### Routing profile
 
-Four switches for how host or disk experts reach the GPU, every one off by default and meant to be
-timed against its off arm and stripped if it does not win (none has run on a GPU). Each is an
-option and a `NINFER_DS_*` variable (`1`/`on`/`true`, `0`/`off`/`false`; an unsigned integer for the
-numbers; anything else is an error, so a mistyped A/B run cannot pass for the other arm), and the
-startup log says `ON` or `off` for each.
-
-| Option | Variable | What it does |
-|---|---|---|
-| `--deepseek-prefetch-ahead on\|off` | `NINFER_DS_PREFETCH_AHEAD` | A wide call queues the next block's expert copies behind its own before it waits for them (the bus never idles through the service thread's bookkeeping), and the executor names that block from the pass's real order instead of leaving it to what the last pass taught. |
-| `--deepseek-cache-settle on\|off`, `--deepseek-cache-settle-ms N` (400), `--deepseek-cache-settle-idle-ms N` (6000) | `NINFER_DS_CACHE_SETTLE`, `_MS`, `_IDLE_MS` | After a prompt, its routes (all wide calls since the last settle) become tier counts and swap rounds run at once, up to N ms, before the first token; and again once the Engine idles, up to N ms (polled for new requests between rounds). |
-| `--deepseek-short-prompt on\|off`, `--deepseek-short-prompt-tokens N` (96) | `NINFER_DS_SHORT_PROMPT`, `_TOKENS` | A prompt of at most N computed tokens (no images, no branches) runs in rows of 8, a decode call's width: the narrow expert path, cache hits and the CPU share, no CUDA graph. |
-| `--deepseek-profile-weights on\|off` | `NINFER_DS_PROFILE_WEIGHTS` | `--expert-profile` counts also become the expert tier's starting counts (160 pairs a layer), not only the cache's first contents. |
-
-- **The double buffer was already there.** The delivery has two layer banks and prefetches the next
-  wide call's layer into the other bank from the post work of the call before it
-  (`expert_delivery.cu` `post()`), so copies and compute overlap at the layer level already. The
-  switch only closes two gaps: the copy of block l+1 starts after the service thread has waited for
-  block l's copies, released compute and run the post work (a gap per block, about 40 a sweep), and
-  the next block is the one the last pass followed the call with, which the long-prompt skip changes
-  (a fully skipped span ends at block 19; a mixed one runs 19 to 20). Disk experts are left to the
-  post work, since their file reads would hold compute back.
-  On this host the gain is bounded by arithmetic: a 14K-token prompt takes about 17 s against about
-  3 s of copies for its two sweeps, so a prompt that long is compute-bound and the switch moves
-  little; it matters for prompts of a few hundred to a thousand tokens, which compute for less
-  time than their copies take, and there only by the bus idle time it removes.
-- **Cache settle.** Wide calls do not count toward the tier and promote only into free slots, so
-  after the first prompt the cache holds what the first prompt promoted and adapts over decode
-  passes, a round every four passes with eight copies per call. Settle feeds each layer's prompt
-  routes, scaled to 160 pairs so a prompt does not bury the conversation's own counts, and runs
-  rounds (up to 96 swaps each, at most six) with the compute stream idle: victims leave, candidates
-  copy in on the side stream, the tables upload, all before compute resumes. It is skipped after a
-  prompt while another request decodes. The idle settle only finishes rounds the last decode
-  passes did not reach.
-- **Short prompts.** A prompt of 22 tokens or more routes to half a layer's experts or more, which
-  the delivery serves as a wide call that copies every expert the cache lacks (about 120 of 192 a
-  layer); eight tokens route to about 43, and the rows path serves what the cache holds and leaves
-  the CPU a share of the rest. It costs one non-graph forward (about a decode step) for every eight
-  tokens, so it wins while that is less than a sweep's copies. The crossover is a measurement:
-  time 32, 64, 96, 192 and 384 tokens against the off arm. The rows run the vector kernels, whose
-  products round step by step as a decode token's do, where a wide pass runs the matrix kernels
-  (BF16 activations rounded to q8_1): the two arms' states differ in rounding, so compare their
-  greedy answers and log-probabilities, not their bits. Placement-only switches (prefetch ahead,
-  cache settle, profile weights) change no result.
-- **Routing profile.** `--expert-profile` reads the Coder's 40 x 192 counts by position (the
-  converted artifact keeps experts in the order of the pack's kept-experts list, as Strata's own
-  profile does) and ignores up to eight more rows, which Strata's file carries for the drafter's
-  layers. A wrong artifact identity, layer count or layer width is refused naming both values, and
-  the startup log names the artifact identity a profile must carry.
+`--expert-profile` reads the Coder's 40 x 192 counts by position (the
+converted artifact keeps experts in the order of the pack's kept-experts list, as Strata's own
+profile does) and ignores up to eight more rows, which Strata's file carries for the drafter's
+layers. A wrong artifact identity, layer count or layer width is refused naming both values, and
+the startup log names the artifact identity a profile must carry.
 
 ### Kernel switches for the GPU bench
 

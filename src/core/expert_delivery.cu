@@ -29,9 +29,6 @@ namespace {
 
 // A round's copies a call's post work issues at most: experts, and bytes read from files.
 constexpr std::size_t kRoundExperts = 8;
-// The most rounds one settle runs: each decays the counts by the tier's factor, so a few rounds
-// carry out every swap that a prompt's counts justify.
-constexpr std::uint32_t kSettleRounds = 6;
 constexpr std::uint64_t kRoundFileBytes = 8ULL << 20;
 
 // needed[e] of a call: its pairs routed to expert e, and whether the table entry the split read
@@ -399,11 +396,6 @@ struct ExpertDelivery::Impl {
     // Between a call's ready signal and the next request the GPU may read any layer's table (the
     // next split, then that call's cached pairs), so post work writes only free slots. Cached
     // experts are replaced only while a request is served, never one it routes.
-    // T0833: the executor's name for the layer a wide call to a layer is followed by (-1: none), a
-    // staged call's wait mark, and a prompt's routes per expert since the last settle.
-    std::unique_ptr<std::atomic<std::int64_t>[]> next_hint;
-    cudaEvent_t served_mark = nullptr;
-    std::vector<std::vector<std::uint32_t>> wide_counts;
     std::int64_t previous_layer = -1;
     bool previous_wide          = false;
     std::size_t call_layer      = 0;
@@ -711,11 +703,6 @@ struct ExpertDelivery::Impl {
             layer_pools.push_back(layer.pool);
         }
         tier = std::make_unique<ExpertTier>(widths, layer_pools, options.tier);
-        next_hint = std::make_unique<std::atomic<std::int64_t>[]>(layers.size());
-        for (std::size_t li = 0; li < layers.size(); ++li) { next_hint[li].store(-1); }
-        if (options.track_wide_counts) {
-            for (const auto& layer : layers) { wide_counts.emplace_back(layer.source.experts.size(), 0); }
-        }
         set_free();
         if (disk) {
             round_staging = std::make_unique<PinnedHostBuffer>(
@@ -754,11 +741,10 @@ struct ExpertDelivery::Impl {
             CUDA_CHECK(cudaEventCreateWithFlags(&round_staged, cudaEventDisableTiming));
             CUDA_CHECK(cudaEventCreate(&copies_begun));
             CUDA_CHECK(cudaEventCreate(&copies_done));
-            CUDA_CHECK(cudaEventCreateWithFlags(&served_mark, cudaEventDisableTiming));
             service = std::thread([this] { run(); });
         } catch (...) {
             for (auto event : copied) { if (event) { cudaEventDestroy(event); } }
-            for (auto event : {round_staged, copies_begun, copies_done, served_mark}) {
+            for (auto event : {round_staged, copies_begun, copies_done}) {
                 if (event) { cudaEventDestroy(event); }
             }
             cudaStreamDestroy(copies);
@@ -786,9 +772,7 @@ struct ExpertDelivery::Impl {
             }
         }
         for (auto event : spare_events) { cudaEventDestroy(event); }
-        for (auto event : {round_staged, copies_begun, copies_done, served_mark}) {
-            cudaEventDestroy(event);
-        }
+        for (auto event : {round_staged, copies_begun, copies_done}) { cudaEventDestroy(event); }
         cudaStreamDestroy(copies);
         cudaStreamDestroy(rounds);
     }
@@ -1267,9 +1251,9 @@ struct ExpertDelivery::Impl {
 
     // A pass has ended: the tier's round. Victims leave now (never an expert the served call
     // routes); candidates hold their slots pending until post work has copied them in.
-    void round(ExpertDeliveryStats& delta, bool force = false) {
+    void round(ExpertDeliveryStats& delta) {
         set_free();
-        for (const auto& swap : force ? tier->end_round() : tier->end_pass()) {
+        for (const auto& swap : tier->end_pass()) {
             auto& layer = layers[swap.layer];
             if (layer.slot_of[std::size_t(swap.in)] >= 0) { continue; }
             std::int32_t s = -1;
@@ -1569,11 +1553,6 @@ struct ExpertDelivery::Impl {
         }
         delta.routes = routes;
         const bool wide = 2 * routes >= std::uint32_t(experts);
-        if (wide && options.track_wide_counts) {
-            std::lock_guard lock(mutex);
-            auto& row = wide_counts[li];
-            for (int e = 0; e < experts; ++e) { row[std::size_t(e)] += call_count[std::size_t(e)]; }
-        }
         land(!wide);
         ++stamp;
         for (int e = 0; e < experts; ++e) {
@@ -1697,16 +1676,7 @@ struct ExpertDelivery::Impl {
             ranges_dirty = false;
         }
         upload_tables();
-        if (wide && options.prefetch_ahead) {
-            // The call's copies and uploads are queued: mark them, queue the next layer's copies
-            // behind the mark, and wait for the mark alone, so compute is released as soon as its
-            // own experts are there and the bus never waits for this thread between the two.
-            CUDA_CHECK(cudaEventRecord(served_mark, copies));
-            if (prefetch_successor(delta, true)) { flush_pieces(delta); }
-            CUDA_CHECK(cudaEventSynchronize(served_mark));
-        } else {
-            CUDA_CHECK(cudaStreamSynchronize(copies));
-        }
+        CUDA_CHECK(cudaStreamSynchronize(copies));
         if (timed) {
             float milliseconds = 0;
             CUDA_CHECK(cudaEventElapsedTime(&milliseconds, copies_begun, copies_done));
@@ -1715,38 +1685,6 @@ struct ExpertDelivery::Impl {
         delta.service_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - started).count();
         add(delta);
-    }
-
-    // Queues the copies of the experts the cache lacks of the layer a wide call is followed by, into
-    // the bank this call does not use: the executor's hint, else the layer that followed it last
-    // time. Returns whether a layer was queued. It only fills pieces; the caller flushes them.
-    bool prefetch_successor(ExpertDeliveryStats& delta, bool pinned_only = false) {
-        if (bank_state.size() != 2 || !call_wide) { return false; }
-        const std::int64_t hinted = options.prefetch_ahead ? next_hint[call_layer].load() : -1;
-        const std::int64_t chosen = hinted >= 0 ? hinted : layers[call_layer].successor;
-        if (chosen < 0 || std::size_t(chosen) >= layers.size() || std::size_t(chosen) == call_layer) {
-            return false;
-        }
-        const auto next = std::size_t(chosen);
-        const bool held = std::any_of(bank_state.begin(), bank_state.end(),
-                                      [&](const Bank& b) { return b.layer == std::int64_t(next); });
-        std::vector<std::int32_t> experts;
-        for (std::size_t e = 0; e < layers[next].source.experts.size() && !held; ++e) {
-            if (layers[next].slot_of[e] < 0) { experts.push_back(std::int32_t(e)); }
-        }
-        // Never the bank this call's consumers are reading, nor a lent one: the next call may
-        // be narrow and read its slots.
-        const int k = pick_bank(call_bank);
-        if (experts.empty() || bank_lent[std::size_t(k)]) { return false; }
-        // Disk experts are read on this thread: queued before compute is released, that read would
-        // delay it, so serve leaves them to the post work.
-        if (pinned_only && layers[next].source.experts[std::size_t(experts.front())].front().pinned == nullptr) {
-            return false;
-        }
-        claim_bank(k, next);
-        fill_bank(k, next, experts);
-        ++delta.prefetched_layers;
-        return true;
     }
 
     // After the call's experts are ready: a wide call promotes its most routed bank experts into
@@ -1789,8 +1727,23 @@ struct ExpertDelivery::Impl {
                 deferred.push_back({li, e, s});
             }
         }
-        // With prefetch_ahead the call has queued the next layer already (serve), and finds it held.
-        (void)prefetch_successor(delta);
+        if (bank_state.size() == 2 && layer.successor >= 0) {
+            const auto next = std::size_t(layer.successor);
+            const bool held = std::any_of(bank_state.begin(), bank_state.end(),
+                                          [&](const Bank& b) { return b.layer == std::int64_t(next); });
+            std::vector<std::int32_t> experts;
+            for (std::size_t e = 0; e < layers[next].source.experts.size() && !held; ++e) {
+                if (layers[next].slot_of[e] < 0) { experts.push_back(std::int32_t(e)); }
+            }
+            // Never the bank this call's consumers are reading, nor a lent one: the next call may
+            // be narrow and read its slots.
+            const int k = pick_bank(call_bank);
+            if (!experts.empty() && !bank_lent[std::size_t(k)]) {
+                claim_bank(k, next);
+                fill_bank(k, next, experts);
+                ++delta.prefetched_layers;
+            }
+        }
         flush_pieces(delta); // tables are unchanged: promoted entries are patched at the next request
         delta.service_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - started).count();
@@ -1871,45 +1824,6 @@ struct ExpertDelivery::Impl {
         }
         CUDA_CHECK(cudaStreamSynchronize(copies));
         CUDA_CHECK(cudaStreamSynchronize(rounds));
-    }
-
-    // Cache settle (T0833). The wide calls' routes since the last settle become tier counts of
-    // options.tier_pairs a layer. Returns whether any layer had routes.
-    bool feed_wide_counts() {
-        bool fed = false;
-        for (std::size_t li = 0; li < wide_counts.size(); ++li) {
-            auto& row         = wide_counts[li];
-            const auto scaled = scale_counts(std::span<const std::uint32_t>(row), options.tier_pairs);
-            for (std::size_t e = 0; e < scaled.size(); ++e) {
-                if (scaled[e] > 0) {
-                    tier->route(li, std::int32_t(e), scaled[e]);
-                    fed = true;
-                }
-            }
-            std::fill(row.begin(), row.end(), 0);
-        }
-        return fed;
-    }
-
-    // One whole round, the compute stream idle and the service quiet: finish what earlier passes
-    // queued, run the tier's round, copy every candidate in, land them and upload the tables.
-    // Returns the experts swapped in (the queued ones included).
-    std::size_t settle_round() {
-        std::lock_guard lock(mutex);
-        ExpertDeliveryStats delta;
-        land();
-        // No call is being served: nothing is routed that a victim must spare.
-        std::fill(call_routed.begin(), call_routed.end(), 0);
-        round(delta, true);
-        const std::size_t swaps = queued.size();
-        while (!queued.empty()) { issue_rounds(delta); }
-        CUDA_CHECK(cudaStreamSynchronize(rounds));
-        land();
-        upload_tables();
-        CUDA_CHECK(cudaStreamSynchronize(copies));
-        set_free();
-        counters = counters + delta;
-        return swaps;
     }
 
     // An elastic cache, quiesced and locked: gives back at least `bytes` of whole granules, or
@@ -2199,26 +2113,12 @@ void ExpertDelivery::prime(const std::vector<std::vector<std::uint64_t>>* profil
     {
         std::lock_guard lock(p.mutex);
         for (auto& layer : p.layers) { std::fill(layer.total.begin(), layer.total.end(), 0); }
-        for (auto& row : p.wide_counts) { std::fill(row.begin(), row.end(), 0); }
     }
     p.set_free();
     if (profile == nullptr) { return; }
     const auto& counts = *profile;
     if (counts.size() != p.layers.size()) {
         throw std::invalid_argument("expert delivery: the profile describes other layers");
-    }
-    // The profile's counts are the tier's too (profile_seeds_tier), as many pairs a layer as a
-    // prompt's are, so the experts it places are not the coldest the first decode passes see.
-    if (p.options.profile_seeds_tier) {
-        for (std::size_t li = 0; li < counts.size(); ++li) {
-            if (counts[li].size() != p.layers[li].source.experts.size()) {
-                throw std::invalid_argument("expert delivery: the profile's bank width differs");
-            }
-            const auto scaled = scale_counts(std::span<const std::uint64_t>(counts[li]), p.options.tier_pairs);
-            for (std::size_t e = 0; e < scaled.size(); ++e) {
-                if (scaled[e] > 0) { p.tier->route(li, std::int32_t(e), scaled[e]); }
-            }
-        }
     }
     // Most routed first over every layer, each into its pool while it has slots; ties keep layer
     // and expert order.
@@ -2258,36 +2158,6 @@ void ExpertDelivery::prime(const std::vector<std::vector<std::uint64_t>>* profil
     CUDA_CHECK(cudaStreamSynchronize(p.copies));
     p.set_free();
     p.counters = p.counters + delta;
-}
-
-void ExpertDelivery::hint_next(std::size_t layer, std::int64_t next) {
-    auto& p = *impl_;
-    if (layer >= p.layers.size()) { throw std::out_of_range("expert delivery: no such layer"); }
-    p.next_hint[layer].store(next);
-}
-
-ExpertSettle ExpertDelivery::settle(double max_ms, const std::function<bool()>& cancel) {
-    auto& p = *impl_;
-    if (p.released) { throw std::logic_error("expert delivery: device backing is released"); }
-    ExpertSettle out;
-    if (p.tier->options().every == 0) {
-        out.stop = ExpertSettle::Stop::Off;
-        return out;
-    }
-    drain();
-    DeviceBinding bind(p.rank.device);
-    const auto start   = std::chrono::steady_clock::now();
-    const auto elapsed = [&] {
-        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-    };
-    {
-        std::lock_guard lock(p.mutex);
-        out.fed = p.feed_wide_counts();
-    }
-    auto result = run_settle(max_ms, kSettleRounds, [&] { return std::uint64_t(p.settle_round()); },
-                             elapsed, [&] { return cancel && cancel(); });
-    result.fed = out.fed;
-    return result;
 }
 
 std::vector<std::vector<std::uint64_t>> ExpertDelivery::totals() const {

@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from math import prod
 from pathlib import Path
 import struct
+import threading
 from typing import Any, Sequence
 
 import numpy as np
@@ -177,7 +178,13 @@ class _Cursor:
 
 
 class GGUFFile:
-    """Parse the header of a GGUF v3 file and expose memory-mapped tensor bytes."""
+    """Parse the header of a GGUF v3 file and expose its tensor bytes through bounded reads.
+
+    Tensor bytes are read with an ordinary file handle (seek + readinto into a fresh buffer), never
+    a memory map: on Windows every mapped page a pass touches stays in the process working set, so
+    one sequential pass over a 110.6 GB file filled 96 GB of RAM in about 90 s. Read pages go to the
+    OS cache instead, which the OS reclaims. A caller holds only the ranges it asked for.
+    """
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -215,13 +222,34 @@ class GGUFFile:
         self.alignment = int(kv.get("general.alignment", DEFAULT_ALIGNMENT))
         self.header_bytes = cursor.position
         self.data_offset = align_up(self.header_bytes, self.alignment)
-        self._map = np.memmap(self.path, dtype=np.uint8, mode="r")
+        self._handle = None
+        self._lock = threading.Lock()
 
     def __enter__(self) -> GGUFFile:
         return self
 
     def __exit__(self, *_exc) -> None:
-        self._map = None
+        with self._lock:
+            if self._handle is not None:
+                self._handle.close()
+                self._handle = None
+
+    def _read(self, start: int, stop: int) -> np.ndarray:
+        """File bytes ``[start, stop)`` as a new uint8 array."""
+
+        out = np.empty(stop - start, dtype=np.uint8)
+        view = memoryview(out)
+        with self._lock:
+            if self._handle is None:
+                self._handle = self.path.open("rb", buffering=0)
+            self._handle.seek(start)
+            done = 0
+            while done < len(view):
+                count = self._handle.readinto(view[done : done + (1 << 30)])
+                if not count:
+                    raise ValueError(f"{self.path}: file ended at byte {start + done}")
+                done += count
+        return out
 
     @property
     def data_bytes_available(self) -> int:
@@ -249,7 +277,7 @@ class GGUFFile:
                 f"{name}: bytes [{byte_begin},{end}) are past the end of the file "
                 f"({self.file_bytes} bytes; the data section may be truncated)"
             )
-        return self._map[start:stop]
+        return self._read(start, stop)
 
     def _row_bytes(self, info: TensorInfo) -> int:
         if len(info.shape) < 2:
@@ -278,13 +306,26 @@ class GGUFFile:
             raise ValueError(f"{name}: {info.type_name} is not a direct format")
         return np.ascontiguousarray(values.reshape(info.shape))
 
-    def read_bf16_words(self, name: str) -> np.ndarray:
+    def read_bf16_words(
+        self, name: str, row_begin: int = 0, row_end: int | None = None
+    ) -> np.ndarray:
+        """The tensor's BF16 words in its shape; with a row range, rows ``[row_begin, row_end)``
+        of its flattened leading dimensions, read alone."""
+
         info = self.info(name)
         if info.type_id != TYPE_BF16:
             raise ValueError(f"{name}: expected BF16, got {info.type_name}")
-        return np.ascontiguousarray(
-            np.frombuffer(self.tensor_bytes(name), dtype="<u2").reshape(info.shape)
-        )
+        if row_begin == 0 and row_end is None:
+            return np.ascontiguousarray(
+                np.frombuffer(self.tensor_bytes(name), dtype="<u2").reshape(info.shape)
+            )
+        columns = info.shape[-1]
+        rows = prod(info.shape[:-1])
+        end = rows if row_end is None else row_end
+        if not 0 <= row_begin <= end <= rows:
+            raise ValueError(f"{name}: row range [{row_begin},{end}) is outside {rows}")
+        raw = self.tensor_bytes(name, row_begin * columns * 2, end * columns * 2)
+        return np.frombuffer(raw, dtype="<u2").reshape(end - row_begin, columns)
 
     def read_blocks(
         self, name: str, row_begin: int = 0, row_end: int | None = None
@@ -305,6 +346,31 @@ class GGUFFile:
         row_bytes = self._row_bytes(info)
         raw = self.tensor_bytes(name, row_begin * row_bytes, end * row_bytes)
         return np.asarray(raw).reshape(end - row_begin, row_bytes)
+
+    def read_block_rows(self, name: str, index: Sequence[int]) -> np.ndarray:
+        """The listed rows of a ggml block matrix as ``uint8 [len(index), row_bytes]``.
+
+        Reads each run of consecutive rows once and holds only the listed rows, so a row map that
+        interleaves two far-apart halves of an expert bank costs the rows it names, not the span
+        between its lowest and highest row.
+        """
+
+        info = self.info(name)
+        if info.type_id not in BLOCK_FORMATS:
+            raise ValueError(f"{name}: {info.type_name} is not a stored block format")
+        rows = prod(info.shape[:-1])
+        index = np.asarray(index, dtype=np.int64)
+        if index.size and not 0 <= int(index.min()) <= int(index.max()) < rows:
+            raise ValueError(f"{name}: rows are outside [0,{rows})")
+        row_bytes = self._row_bytes(info)
+        unique, inverse = np.unique(index, return_inverse=True)
+        packed = np.empty((len(unique), row_bytes), dtype=np.uint8)
+        breaks = np.flatnonzero(np.diff(unique) != 1) + 1
+        for run in np.split(np.arange(len(unique)), breaks) if len(unique) else []:
+            first, last = int(unique[run[0]]), int(unique[run[-1]]) + 1
+            raw = self.tensor_bytes(name, first * row_bytes, last * row_bytes)
+            packed[run[0] : run[-1] + 1] = raw.reshape(last - first, row_bytes)
+        return packed[inverse.reshape(index.shape)]
 
     def read_ternary(
         self, name: str, row_begin: int = 0, row_end: int | None = None

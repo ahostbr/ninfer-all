@@ -277,11 +277,10 @@ def block_source(
 
     def encoded(begin: int, end: int) -> EncodedRows:
         index = select(begin, end)
-        low, high = int(index.min()), int(index.max()) + 1
-        blocks = gguf.read_blocks(tensor, low, high)
+        blocks = gguf.read_block_rows(tensor, index)
         return EncodedRows(
             format,
-            torch.from_numpy(np.ascontiguousarray(blocks[index - low])),
+            torch.from_numpy(blocks),
             empty,
             input_columns=gather,
         )
@@ -298,10 +297,10 @@ def block_source(
 
 
 def bf16_source(gguf: GGUFFile, tensor: str, shape: tuple[int, int]) -> LogicalSource:
-    """A stored BF16 matrix as its exact words, read a run of rows at a time from the mapped file."""
+    """A stored BF16 matrix as its exact words, read a run of rows at a time from the file."""
 
     def values(first: int, last: int) -> torch.Tensor:
-        words = np.array(gguf.read_bf16_words(tensor)[first:last], copy=True)
+        words = np.array(gguf.read_bf16_words(tensor, first, last), copy=True)
         return torch.from_numpy(words.view(np.int16)).view(torch.bfloat16)
 
     return LogicalSource(shape, f"{tensor}[BF16]{list(shape)}", _flat(values, shape[1]))
@@ -351,8 +350,7 @@ def q2_native_source(
 
     def encoded(begin: int, end: int) -> EncodedRows:
         index = select(begin, end)
-        low, high = int(index.min()), int(index.max()) + 1
-        blocks = gguf.read_blocks(tensor, low, high)[index - low].reshape(end - begin, groups, 18)
+        blocks = gguf.read_block_rows(tensor, index).reshape(end - begin, groups, 18)
         scale_words = np.zeros((end - begin, padded_groups), dtype="<u2")
         scale_words[:, :groups] = np.ascontiguousarray(blocks[..., :2]).view("<u2").squeeze(-1)
         scales = scale_words.view("<f2")
@@ -384,8 +382,7 @@ def q8_native_source(
 
     def encoded(begin: int, end: int) -> EncodedRows:
         index = select(begin, end)
-        low, high = int(index.min()), int(index.max()) + 1
-        blocks = gguf.read_blocks(tensor, low, high)[index - low].reshape(end - begin, groups, 34)
+        blocks = gguf.read_block_rows(tensor, index).reshape(end - begin, groups, 34)
         raw_words = np.ascontiguousarray(blocks[..., :2]).view("<u2").squeeze(-1)
         raw_scales = raw_words.view("<f2")
         raw_codes = blocks[..., 2:]

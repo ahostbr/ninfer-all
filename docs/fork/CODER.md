@@ -7,9 +7,9 @@ The Coder is at `G:\Models\litesuite\DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder`:
 - shard 6 is `DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf` (110,595,290,816 bytes), hard-linked;
 - `mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf` (972 MB), `expert-selection\...kept-experts.json`.
 
-**Nothing below was converted, loaded or run.** Everything marked "checked" was checked from file
-headers and a header-level dry run of the converter (`build_model` and the recipe, with the 103 GiB
-digest stubbed out), which reads no weights.
+**Status 2026-11-03 (T0827):** sections (a) and (b) were checked from file headers and a header-level dry run
+(`build_model` and the recipe, with the 103 GiB digest stubbed out). Section (c) is now being run; what
+the runs measured and changed is in "Conversion runs" below. Nothing has been loaded or served.
 
 ## (a) Does the converter accept the Coder, and how does the router map to the kept experts?
 
@@ -107,8 +107,9 @@ python -m tools.convert --model %HF% --recipe deepseek_v41_gguf --components eng
   --out G:\Models\litesuite\ninfer\DeepSeek-V4.1-Flash-Engram-IQ4_NL-ninfer-v3.ninfer --device cpu
 ```
 
-Both runs read the whole 110.6 GB Engram GGUF once to hash it (the model records the digest, and the run refuses
-a table with another one). Upstream's measured times: 6 min 23 s for the 125.8 GB model on 96 threads,
+**The Engram GGUF is read twice by the table run** (a SHA-256 pass, then the row copy) **and once more by the model
+step**, whose `configure_engram` (`deepseek_v41.py:1064`) hashes it unconditionally (the model records the digest,
+and the run refuses a table with another one). The hash pass is about 2.5 min at ~700 MB/s. Upstream's measured times: 6 min 23 s for the 125.8 GB model on 96 threads,
 3 min 29 s for the table on 24 cores (`docs/deepseek-v41.md:144`); expect longer on this disk.
 
 **Sizes** (from the headers): routed experts 66,036,695,040 bytes (61.50 GiB); everything else in shards 2-5,
@@ -128,6 +129,30 @@ So the order is 2, verify the model artifact, delete shards 2-5 and the mmproj *
 Engram GGUF (and shard 6, the same inode) can go too, which frees 110.6 GB again. The other route is writing the
 table to H: (219 GB free) and moving it; H: is on the shared USB hub, so that needs Sentinel's clearance first.
 
+## Conversion runs (T0827, 2026-11-03)
+
+Three things the first runs found, all fixed on `fork/audited`:
+
+1. **`GGUFFile` memory-mapped the file.** On Windows every mapped page a pass touches stays in the process
+   working set, so hashing the 110.6 GB Engram took system RAM from 13% to 98% of 96 GB in ~90 s (twice; the
+   first crashed Claude Code). Fixed in `a0ebeeae`: `tensor_bytes` is a bounded seek + readinto
+   (`sources/gguf.py`), expert-bank row gathers read only the rows they name (`read_block_rows`). Measured after:
+   converter RSS 0.48 GiB through a 103 GiB pass, system RAM flat. Never reintroduce `np.memmap` on these files,
+   and never pass `--ngram-io mmap` to the engine (same working-set class).
+2. **The writer zero-filled its output.** `os.ftruncate` is `_chsize_s` on Windows and writes the length as
+   zeros through the cache: the table artifact spent ~12 min (21:07 to ~21:23) on 110.6 GB of zeros before
+   copying a row; the 73 GB model would pay the same. Fixed in `44c6ef94` (`file_io.extend`, SetEndOfFile).
+   After a hard kill, the hidden `.<name>.ninfer.*.tmp` is a zero-filled file of the full size: put it in the
+   Recycle Bin before retrying.
+3. **A disk flush every 64 MiB** halves sustained write speed on Windows (80 vs 155 MB/s measured), so
+   `WRITEBACK_BYTES` is 512 MiB there. `--rows-per-chunk` was left at 512: 73 KB writes into the cache run at
+   ~4 GB/s, so chunk size is not the cost.
+
+Where the outputs went (the table plan above changed because G: had room for the model, C: did not):
+the table artifact is `C:\Users\Ryan\.litesuite\llm\ninfer-models\deepseek-v41\DeepSeek-V4.1-Flash-Engram-IQ4_NL-ninfer-v3.ninfer`;
+the model artifact is `G:\Models\litesuite\ninfer\DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-ninfer-v3.ninfer`.
+Both runs are detached (WMI) with a watchdog that kills the converter by exact PID above 85% system RAM.
+
 ## (d) RAM
 
 `--expert-residency host` pins **61.50 GiB** of routed experts (66,036,695,040 bytes; per layer 1,418 MiB, layer 39
@@ -139,6 +164,16 @@ memory against the card's memory" (`docs/build-windows.md:87`, `docs/maintainer/
 Windows number for DeepSeek exists at all (its measurements are Linux, 188 GiB hosts, and "a host with 128 GB ... not
 tested", `docs/deepseek-v41.md:207`). If pinning 61.5 GiB is refused (`failed to pin`), `--expert-residency disk`
 keeps only 138 MiB pinned and serves the experts from the OS page cache (`docs/deepseek-v41.md:193`).
+
+**Budget with the host-KV tier.** The 61.50 GiB is not the whole pinned bill. The default pinned host-KV tier is
+8 GiB and the DeepSeek core has no Windows clamp on it (`deepseek_v41_core.cpp:697-727`). The engine reads all
+61.5 GiB before it pins and aborts with no fallback if the pin is refused (`materializer.cpp:813`,
+`apps/serve/main.cpp:413`; `host_pages.cpp:94` is the refusal under WDDM on a 32 GB card).
+
+**First-run flags: `--expert-residency disk --no-prefix-reuse`.** Never pass `--ngram-residency ram` (103 GiB
+commit), `--ngram-io mmap`, `--host-cache-mib auto` or `--disk-kv-path`. A `--expert-residency host` run comes
+later and only after a tiny `cudaHostRegister` ladder probe (8/16/32/48/64 GiB); the probe touches the GPU
+driver, so it waits for Ryan's go.
 
 ## Optional components
 

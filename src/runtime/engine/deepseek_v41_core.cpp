@@ -6,6 +6,7 @@
 #include "core/host_pages.h"
 #include "core/startup.h"
 #include "core/tensor_split.h"
+#include "models/deepseek_v41/kernel_switches.h"
 #include "models/deepseek_v41/prompt_skip.h"
 #include "models/expert_profile.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
@@ -33,6 +34,7 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <mutex>
@@ -332,6 +334,12 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
             executor.expert_profile = models::builtin_expert_profile("deepseek-v4.1", widths);
         }
     }
+    // The kernel A/B switches (kernel_switches.h): a flag or its environment variable, which wins.
+    executor.kernels = models::deepseek_v41::resolve_kernel_switches(
+        {.iq1m_matrix  = options.deepseek_iq1m_matrix,
+         .iq1m_codes12 = options.deepseek_iq1m_codes12,
+         .fused_swiglu = options.deepseek_fused_swiglu,
+         .dense_cublas = options.prefill_cublas});
     // Causal scoring keeps no context between requests.
     executor.checkpoints = options.context_cache.enabled &&
                            options.purpose == EnginePurpose::Generation;
@@ -411,6 +419,28 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
             publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
                                "DeepSeek-V4.1: long-prompt layer skip off");
         }
+    }
+    {
+        std::size_t iq1m_banks = 0;
+        for (const auto& bank : model->expert_banks()) {
+            iq1m_banks += std::size_t(bank.gate_up_type == QType::GGUF_IQ1_M ||
+                                      bank.down_type == QType::GGUF_IQ1_M);
+        }
+        const auto& k = executor.kernels;
+        const auto report = [&](bool on, const char* what, const char* detail) {
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                               "DeepSeek-V4.1: %s %s%s", what, on ? "ON" : "off",
+                               on ? detail : "");
+        };
+        char iq1m_text[160];
+        std::snprintf(iq1m_text, sizeof(iq1m_text), " (%zu of %zu blocks hold IQ1_M experts)",
+                      iq1m_banks, model->expert_banks().size());
+        report(k.iq1m_matrix, "IQ1_M wide MoE product (integer tensor cores, calls of over 8 tokens)",
+               iq1m_text);
+        report(k.iq1m_codes12, "IQ1_M 12-bit decode table (decode and verification kernels)",
+               iq1m_text);
+        report(k.fused_swiglu, "fused routed gate/up/clamped SwiGLU (decode and verification)", "");
+        report(k.dense_cublas, "dense prompt GEMMs through cuBLAS BF16 (--prefill-cublas)", "");
     }
     if (!executor.expert_split.empty()) {
         const std::uint32_t experts = model->config().num_experts;

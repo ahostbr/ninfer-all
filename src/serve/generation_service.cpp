@@ -274,6 +274,9 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.pending_timeout_ms       = options.pending_timeout_ms;
     engine_options.prefill_chunk            = options.prefill_chunk;
     engine_options.deepseek_prompt_skip     = options.deepseek_prompt_skip;
+    engine_options.deepseek_iq1m_matrix     = options.deepseek_iq1m_matrix;
+    engine_options.deepseek_iq1m_codes12    = options.deepseek_iq1m_codes12;
+    engine_options.deepseek_fused_swiglu    = options.deepseek_fused_swiglu;
     engine_options.decode_rounds_per_prefill = options.decode_rounds_per_prefill;
     engine_options.prefill_stall_budget_ms   = options.prefill_stall_budget_ms;
     engine_options.fast_prefill_kernel      = options.fast_prefill_kernel;

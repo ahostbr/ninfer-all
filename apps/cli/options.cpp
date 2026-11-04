@@ -169,6 +169,19 @@ std::string usage_text(const char* argv0) {
            "                                before its last 2668 skip the attention and experts\n"
            "                                of blocks 21-39 (the state kept is the full pass's;\n"
            "                                default off; NINFER_DS_PROMPT_SKIP=0|1 overrides)\n"
+           "  --deepseek-iq1m-matrix on|off\n"
+           "                                DeepSeek-V4.1 prompts: IQ1_M routed experts on\n"
+           "                                the integer tensor-core kernel, not the 8-column\n"
+           "                                vector one (default off; NINFER_DS_IQ1M_MATRIX=0|1\n"
+           "                                overrides)\n"
+           "  --deepseek-iq1m-codes12 on|off\n"
+           "                                DeepSeek-V4.1 decode: IQ1_M experts read through a\n"
+           "                                12-bit table of ready weights (default off;\n"
+           "                                NINFER_DS_IQ1M_CODES12=0|1 overrides)\n"
+           "  --deepseek-fused-swiglu on|off\n"
+           "                                DeepSeek-V4.1 decode: routed gate, up and clamped\n"
+           "                                SwiGLU in one kernel (default off;\n"
+           "                                NINFER_DS_FUSED_SWIGLU=0|1 overrides)\n"
            "  --prefill-chunk N             prefill chunk in tokens, a multiple of 128\n"
            "                                (default 1024; 4096 for native MoE experts\n"
            "                                in host memory or files); with an int8 or\n"
@@ -419,6 +432,33 @@ Options parse_options(int argc, char** argv) {
                 options.deepseek_prompt_skip = false;
             } else {
                 throw std::invalid_argument("--deepseek-prompt-skip accepts on or off");
+            }
+        } else if (arg == "--deepseek-iq1m-matrix") {
+            const std::string_view mode = value(arg);
+            if (mode == "on") {
+                options.deepseek_iq1m_matrix = true;
+            } else if (mode == "off") {
+                options.deepseek_iq1m_matrix = false;
+            } else {
+                throw std::invalid_argument("--deepseek-iq1m-matrix accepts on or off");
+            }
+        } else if (arg == "--deepseek-iq1m-codes12") {
+            const std::string_view mode = value(arg);
+            if (mode == "on") {
+                options.deepseek_iq1m_codes12 = true;
+            } else if (mode == "off") {
+                options.deepseek_iq1m_codes12 = false;
+            } else {
+                throw std::invalid_argument("--deepseek-iq1m-codes12 accepts on or off");
+            }
+        } else if (arg == "--deepseek-fused-swiglu") {
+            const std::string_view mode = value(arg);
+            if (mode == "on") {
+                options.deepseek_fused_swiglu = true;
+            } else if (mode == "off") {
+                options.deepseek_fused_swiglu = false;
+            } else {
+                throw std::invalid_argument("--deepseek-fused-swiglu accepts on or off");
             }
         } else if (arg == "--device") {
             options.device  = parse_device(value(arg));

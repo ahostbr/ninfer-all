@@ -548,6 +548,16 @@ struct EngineOptions {
     // is the full pass's up to the experts' summing order. Needs prompt spans (experts in host
     // memory or files). NINFER_DS_PROMPT_SKIP=0|1 overrides it.
     bool deepseek_prompt_skip          = false;
+    // DeepSeek-V4.1 kernel A/B switches (models/deepseek_v41/kernel_switches.h), each default off:
+    // IQ1_M routed experts of a prompt call (more than 8 tokens) on the integer tensor-core kernel
+    // instead of the 8-column vector one (NINFER_DS_IQ1M_MATRIX); decode and verification kernels
+    // reading IQ1_M through a 12-bit table of ready int8 words (NINFER_DS_IQ1M_CODES12); the routed
+    // gate and up rows and the clamped SwiGLU in one kernel at decode and verification widths
+    // (NINFER_DS_FUSED_SWIGLU). prefill_cublas also hands DeepSeek's wide dense prompt GEMMs to
+    // cuBLAS (NINFER_DS_PREFILL_CUBLAS).
+    bool deepseek_iq1m_matrix          = false;
+    bool deepseek_iq1m_codes12         = false;
+    bool deepseek_fused_swiglu         = false;
     // Decode rounds that run before a prefill chunk while other requests generate, proportionally
     // fewer (at least one) before a shorter prefill unit and more before a longer one. A decode
     // round takes tens of milliseconds and a chunk hundreds, so strict alternation (1) leaves

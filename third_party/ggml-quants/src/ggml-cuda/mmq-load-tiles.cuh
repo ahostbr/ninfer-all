@@ -3,6 +3,7 @@
 #include "vecdotq.cuh"
 
 #include "mmq.cuh"
+#include "iq1m_tile.h" // NInfer: IQ1_M tile loader shared with its host test
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_q1_0(
         const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
@@ -1091,6 +1092,68 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         x_ds[i*sram_stride             + kqsx] = make_half2(d1q, d1q*delta);
 #else
         x_ds[i*(MMQ_TILE_NE_K/4) + i/4 + kqsx] = make_half2(d1q, d1q*delta);
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    }
+}
+
+// NInfer: IQ1_M, which llama.cpp has no matrix kernel for. The tile is IQ2_XS's: int8 values (8 c - 7 or
+// 8 c - 9 for the grid's code c and the group's delta sign, see iq1m_tile.h) and one FP32 factor
+// d (2 s + 1) / 8 per 16 values, read by the q8_0_16 vec-dot over a D4 activation.
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_iq1_m(
+        const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int sram_stride = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + MMQ_TILE_NE_K*2);
+#else
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_IQ1_M, I);
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + txs.qs);
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+
+    // A thread takes 32 values of a 256-value block: eight threads a row.
+    constexpr int threads_per_row = MMQ_ITER_K / 32;
+    constexpr int nrows = warp_size / threads_per_row;
+    const int kqsx = threadIdx.x % threads_per_row;
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nwarps * nrows) {
+        int i = i0 + threadIdx.y*nrows + threadIdx.x/threads_per_row;
+
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
+        const block_iq1_m * bxi = (const block_iq1_m *) x + kbx0 + i*stride;
+
+        const uint16_t * sc = (const uint16_t *) bxi->scales;
+        iq1m_scale_t scale;
+        scale.u16 = ninfer::ops::gguf::iq1m::super_scale_bits(sc[0], sc[1], sc[2], sc[3]);
+
+        uint32_t w[8];
+        float    f[2];
+        ninfer::ops::gguf::iq1m::load_slice(iq1s_grid_gpu, (const uint8_t *) bxi, kqsx,
+                                            __half2float(scale.f16), sc[kqsx/2], w, f);
+
+#pragma unroll
+        for (int l = 0; l < 8; ++l) {
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+            x_qs[i*sram_stride + 8*kqsx + l] = (int) w[l];
+#else
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + 8*kqsx + l] = (int) w[l];
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        }
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        x_df[i*sram_stride                             + 2*kqsx+0] = f[0];
+        x_df[i*sram_stride                             + 2*kqsx+1] = f[1];
+#else
+        x_df[i*(2*MMQ_TILE_NE_K*2/QI8_0) + i/(QI8_0/4) + 2*kqsx+0] = f[0];
+        x_df[i*(2*MMQ_TILE_NE_K*2/QI8_0) + i/(QI8_0/4) + 2*kqsx+1] = f[1];
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     }
 }

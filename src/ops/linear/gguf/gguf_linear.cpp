@@ -206,14 +206,15 @@ void require_gguf(const Weight& w, const char* label) {
 }
 
 std::size_t gguf_project_workspace_bytes(std::span<const GgufShape> shapes,
-                                         std::int32_t min_tokens, std::int32_t max_tokens) {
+                                         std::int32_t min_tokens, std::int32_t max_tokens,
+                                         bool dequantize_wide) {
     if (shapes.empty() || min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("gguf workspace: invalid products or token interval");
     }
     const std::int32_t k = shapes.front().k;
     std::vector<int> layouts;
     std::size_t rows = 0;
-    bool dequantized = false;
+    bool dequantized = dequantize_wide && max_tokens > kDequantizedVectorColumns;
     for (const GgufShape& shape : shapes) {
         const auto block = gguf_block_shape(shape.qtype);
         if (!is_gguf(shape.qtype) || shape.rows <= 0 || shape.k != k || k <= 0 ||
@@ -264,7 +265,7 @@ std::size_t gguf_project_workspace_bytes(std::span<const GgufShape> shapes,
 }
 
 void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
-                  WorkspaceArena& workspace, cudaStream_t stream) {
+                  WorkspaceArena& workspace, cudaStream_t stream, bool dequantize_wide) {
     require_activation(x, "gguf product");
     if (products.empty()) { return; }
     for (const auto& p : products) { require_product(x, p); }
@@ -307,7 +308,9 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
     };
     std::vector<Activation> activations;
     std::int32_t plane_rows = 0;
-    bool dequantized        = false;
+    // Past kDequantizedVectorColumns the cuBLAS route takes every product when asked to.
+    const bool cublas       = dequantize_wide && t > kDequantizedVectorColumns;
+    bool dequantized        = cublas;
     for (const auto& p : products) {
         plane_rows = std::max(plane_rows, p.weight->n);
         dequantized |= !matrix_kernel(*p.weight);
@@ -329,7 +332,7 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
         const bool direct = p.f32 != nullptr && p.epilogue == GgufEpilogue::Store;
         float* out        = direct ? p.f32 + p.row : plane;
         const std::int64_t stride = direct ? p.f32_rows : w.n;
-        if (gguf::has_matrix_kernel(type)) {
+        if (!cublas && gguf::has_matrix_kernel(type)) {
             const int layout = gguf::matrix_activation_layout(type);
             auto found = std::find_if(activations.begin(), activations.end(), [&](const Activation& a) {
                 return a.layout == layout && a.columns == w.input_columns;

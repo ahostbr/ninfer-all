@@ -10,6 +10,7 @@
 // llama.cpp's vector kernels round integer scales (the 2- and 3-bit i-quants).
 
 #include "ggml_bridge_internal.cuh"
+#include "../../common/clamped_swiglu.h"
 #include "../../common/fixed_point.cuh"
 #include "../../common/device_route.h"
 
@@ -277,6 +278,10 @@ __device__ __forceinline__ void decode_words(const std::uint8_t* b, int sub,
     if constexpr (Cooperative && (std::is_same_v<D, Decoder<GGML_TYPE_Q4_K>> ||
                                   std::is_same_v<D, Decoder<GGML_TYPE_Q6_K>>)) {
         D::template decode<true>(b, sub, table, s);
+    } else if constexpr (Cooperative && std::is_same_v<D, Decoder<GGML_TYPE_IQ1_M>>) {
+        // IQ1_M's alternative form is the 12-bit code table (--deepseek-iq1m-codes12); `table`
+        // then holds kIq1mCodes12.
+        D::decode_codes12(b, sub, table, s);
     } else {
         D::decode(b, sub, table, s);
     }
@@ -706,6 +711,14 @@ struct Decoder<GGML_TYPE_IQ1_S> {
     }
 };
 
+// IQ1_M's 12-bit code table (gen_iq1m_codes12.py): entry (delta sign << 11) | grid index holds the
+// eight int8 weights 8 c - 7 / 8 c - 9 of that group as two words. 32 KiB, which a kernel copies to
+// shared memory; Strata's is the same table (ds4_iq1m_codes.inc).
+inline constexpr int kIq1mCodeWords = 8192;
+alignas(16) static const __device__ std::uint32_t kIq1mCodes12[kIq1mCodeWords] = {
+#include "ggml_bridge_iq1m_codes.inc"
+};
+
 template <>
 struct Decoder<GGML_TYPE_IQ1_M> {
     static constexpr int kBlockElems = 256, kBlockBytes = 56, kTableWords = 2048;
@@ -731,6 +744,31 @@ struct Decoder<GGML_TYPE_IQ1_M> {
             const std::uint32_t offset = (qhl & 0x08) ? 0x09090909u : 0x07070707u;
             s.w[2 * l]                 = int(__vsub4((g & 0x0F0F0F0Fu) << 3, offset));
             s.w[2 * l + 1]             = int(__vsub4(((g >> 4) & 0x0F0F0F0Fu) << 3, offset));
+        }
+    }
+    // The same slice through the 12-bit code table: a group's grid index and delta sign (a 12-bit
+    // code) select its eight weights, two words, from `codes` (kIq1mCodes12 in shared memory), where
+    // decode() expands the grid word and subtracts the delta's offset for each half. The words, the
+    // factors and dot() are decode()'s, so the products are the same bits.
+    __device__ __forceinline__ static void decode_codes12(const std::uint8_t* b, int u,
+                                                          const std::uint32_t* codes, Slice& s) {
+        const auto* sc = reinterpret_cast<const std::uint16_t*>(b + 48);
+        iq1m_scale_t scale;
+        scale.u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00F0) | ((sc[2] >> 4) & 0x0F00) | (sc[3] & 0xF000);
+        const float d          = __half2float(scale.f16);
+        const int tmp          = sc[u / 2] >> (6 * (u % 2));
+        s.f[0]                 = d * float(2 * (tmp & 7) + 1) * 0.125f;
+        s.f[1]                 = d * float(2 * ((tmp >> 3) & 7) + 1) * 0.125f;
+        const std::uint32_t qs = u32_a4(b + 4 * u);
+        const std::uint32_t qh = *reinterpret_cast<const std::uint16_t*>(b + 32 + 2 * u);
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const std::uint32_t nibble = (qh >> (4 * l)) & 0xF; // grid bits 8..10, then the delta sign
+            const std::uint32_t code =
+                ((qs >> (8 * l)) & 0xFF) | ((nibble & 7) << 8) | ((nibble & 8) << 8);
+            const uint2 w  = reinterpret_cast<const uint2*>(codes)[code];
+            s.w[2 * l]     = int(w.x);
+            s.w[2 * l + 1] = int(w.y);
         }
     }
     __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float) {
@@ -888,14 +926,21 @@ void launch_columns(const VecArgs& args, int columns, cudaStream_t stream) {
 // table holds the gate rows and the second the up rows, and each output row is silu(gate) * up.
 template <ggml_type type, int T, bool Fused, bool Cooperative = false>
 __launch_bounds__(kVecWarps * 32) __global__ void moe_kernel(MoeVecArgs p) {
-    using D                 = Decoder<type>;
-    constexpr int kTable    = D::kTableWords > 0 ? D::kTableWords : 4;
+    using D = Decoder<type>;
+    // IQ1_M with Cooperative reads its weights through the 12-bit code table (moe_launch).
+    constexpr bool kCodes12 = Cooperative && std::is_same_v<D, Decoder<GGML_TYPE_IQ1_M>>;
+    constexpr int kTable    = kCodes12 ? kIq1mCodeWords : D::kTableWords > 0 ? D::kTableWords : 4;
     constexpr int kPerBlock = D::kBlockElems / 32;
     constexpr int kRows     = 2;
     // Uniform per block, so it may leave before the barrier below.
     if (int(blockIdx.y) >= *p.active_count) { return; }
     __shared__ __align__(16) std::uint32_t table[kTable];
-    if constexpr (D::kTableWords > 0) {
+    if constexpr (kCodes12) {
+        const auto* src = reinterpret_cast<const uint4*>(kIq1mCodes12);
+        auto* dst       = reinterpret_cast<uint4*>(table);
+        for (int i = threadIdx.x; i < kIq1mCodeWords / 4; i += kVecWarps * 32) { dst[i] = src[i]; }
+        __syncthreads();
+    } else if constexpr (D::kTableWords > 0) {
         const std::uint32_t* src = D::table();
         for (int i = threadIdx.x; i < D::kTableWords; i += kVecWarps * 32) { table[i] = src[i]; }
         __syncthreads();
@@ -904,7 +949,9 @@ __launch_bounds__(kVecWarps * 32) __global__ void moe_kernel(MoeVecArgs p) {
     const int begin                = p.bounds[expert];
     const int end                  = p.bounds[expert + 1];
     const std::uint8_t* first      = p.first[expert];
-    const std::uint8_t* second     = Fused ? p.second[expert] : nullptr;
+    const std::uint8_t* second =
+        !Fused ? nullptr
+               : p.second != nullptr ? p.second[expert] : first + std::int64_t(p.rows) * p.row_bytes;
     const int warp                 = threadIdx.x >> 5;
     const int lane                 = threadIdx.x & 31;
     const int k                    = p.k;
@@ -985,8 +1032,15 @@ __launch_bounds__(kVecWarps * 32) __global__ void moe_kernel(MoeVecArgs p) {
             for (int j = 0; j < T; ++j) {
                 if (j >= n) { break; }
                 if constexpr (Fused) {
-                    p.out_bf16[std::int64_t(pair[j]) * p.rows + row0] =
-                        __float2bfloat16(vec_gate(acc[0][j], p.activation) * acc[1][j]);
+                    if (p.clamped) {
+                        // kernels::clamped_swiglu over the rows the product would have stored.
+                        const float sc = p.scale != nullptr ? p.scale[pair[j] / p.per_token] : 1.0f;
+                        p.out_bf16[std::int64_t(pair[j]) * p.rows + row0] = __float2bfloat16(
+                            ops::clamped_swiglu_value(acc[0][j], acc[1][j], sc, p.limit));
+                    } else {
+                        p.out_bf16[std::int64_t(pair[j]) * p.rows + row0] =
+                            __float2bfloat16(vec_gate(acc[0][j], p.activation) * acc[1][j]);
+                    }
                 } else {
 #pragma unroll
                     for (int r = 0; r < kRows; ++r) {
@@ -1805,6 +1859,11 @@ void moe_launch(const MoeVecArgs& args, int max_active, int chunk, bool fused,
     };
     if constexpr (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q6_K) {
         if (vec::cooperative_loads<type, vec::VectorFamily::Moe>(chunk)) { return launch.template operator()<true>(); }
+    }
+    if constexpr (type == GGML_TYPE_IQ1_M) {
+        // The 32 KiB table costs occupancy on the 8-column kernels, which re-decode a row once for
+        // eight columns anyway; it pays on the narrow decode and verification ones.
+        if (args.codes12 && chunk >= 1 && chunk <= 4) { return launch.template operator()<true>(); }
     }
     launch.template operator()<false>();
 }

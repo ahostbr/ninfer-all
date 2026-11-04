@@ -410,3 +410,18 @@ ninfer_add_test(ninfer_stream_cpu_test
   LIBRARIES ninfer_ops)
 target_include_directories(ninfer_gguf_expert_cpu_test PRIVATE
   "${PROJECT_SOURCE_DIR}/third_party/ggml-quants/src")
+
+# IQ1_M's matrix-kernel tile and 12-bit code table against ggml's dequantizer (T0833).
+ninfer_add_test(ninfer_iq1m_tile_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_iq1m_tile.cpp"
+  LIBRARIES ninfer_ops)
+target_include_directories(ninfer_iq1m_tile_test PRIVATE
+  "${PROJECT_SOURCE_DIR}/third_party/ggml-quants/src")
+ninfer_add_test(ninfer_clamped_swiglu_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_clamped_swiglu.cpp"
+  LIBRARIES ninfer_ops)
+# The GPU kernels behind the T0833 switches (needs a device: skips without one).
+ninfer_add_test(ninfer_gguf_iq1m_kernels_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gguf_iq1m_kernels.cpp"
+  LIBRARIES ninfer_ops)
+set_tests_properties(ninfer_gguf_iq1m_kernels_test PROPERTIES SKIP_RETURN_CODE 77)

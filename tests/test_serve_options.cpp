@@ -675,6 +675,26 @@ int main() {
         (void)parse({"ninfer-serve", "model.ninfer", "--deepseek-prompt-skip", "yes"});
     } catch (const std::invalid_argument&) { invalid_skip_rejected = true; }
     failures += check(invalid_skip_rejected, "--deepseek-prompt-skip accepted a value other than on|off");
+    {
+        // The T0833 kernel switches: off by default, on|off only.
+        const auto defaults = parse({"ninfer-serve", "model.ninfer"});
+        failures += check(!defaults.deepseek_iq1m_matrix && !defaults.deepseek_iq1m_codes12 &&
+                              !defaults.deepseek_fused_swiglu,
+                          "a DeepSeek kernel switch is on by default");
+        const auto on = parse({"ninfer-serve", "model.ninfer", "--deepseek-iq1m-matrix", "on",
+                               "--deepseek-iq1m-codes12", "on", "--deepseek-fused-swiglu", "on"});
+        failures += check(on.deepseek_iq1m_matrix && on.deepseek_iq1m_codes12 &&
+                              on.deepseek_fused_swiglu,
+                          "a DeepSeek kernel switch did not reach serving options");
+        for (const char* flag : {"--deepseek-iq1m-matrix", "--deepseek-iq1m-codes12",
+                                 "--deepseek-fused-swiglu"}) {
+            bool rejected = false;
+            try {
+                (void)parse({"ninfer-serve", "model.ninfer", flag, "yes"});
+            } catch (const std::invalid_argument&) { rejected = true; }
+            failures += check(rejected, "a DeepSeek kernel switch accepted a value other than on|off");
+        }
+    }
     failures += check(configured.media_cache_bytes == (256ULL << 20) &&
                           configured.media_live_bytes == (512ULL << 20) &&
                           configured.media_preprocess_threads == 6,

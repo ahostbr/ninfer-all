@@ -82,6 +82,16 @@ if(NINFER_ARCH_BLACKWELL AND CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.1
     "sm_120a kernels")
 endif()
 
+# Fork change W4 (docs/fork/WINDOWS_PORT.md): MSVC 19.38 (toolset 14.38) constant-folds
+# core::wide_add's overflow flag wrongly at /O2 (docs/fork/msvc_19_38_wide_add.cpp reproduces it;
+# tests/test_wide_math.cpp fails on it). 19.44 (toolset 14.44, VS 2022 17.14) does not. This machine's
+# default VS 2022 toolset is 14.38, so a plain vcvars64.bat picks the broken one.
+if(MSVC AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 19.40)
+  message(FATAL_ERROR
+    "MSVC ${CMAKE_CXX_COMPILER_VERSION} miscompiles core::wide_add; use toolset 14.44 "
+    "(vcvars64.bat -vcvars_ver=14.44)")
+endif()
+
 # NINFER_SM8X_COMPAT gates every Ampere/early-Ada compatibility path. ninfer_ops also sets it
 # PUBLIC for its own consumers, but that link is PRIVATE through ninfer_engine, so apps and tests
 # would not otherwise see it. Defining it globally keeps a single consistent answer for every

@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <cstring>
 #include <limits>
 #include <new>
@@ -45,6 +46,7 @@ struct ReadSlot {
     std::size_t requested = 0, needed = 0, have = 0, prefix = 0;
     int error = 0;
     bool done = false;
+    bool bounced = false; // a direct read through `bounce`, copied out when done
 };
 
 #if defined(__linux__)
@@ -169,18 +171,24 @@ struct FileReadQueue::Impl {
 
     // All allocation and validation precede submission. Completion handling cannot throw while
     // another operation can still write to a caller's output or this queue's bounce buffers.
+    // A direct read whose offset, length and destination are all aligned goes straight into its
+    // destination; any other one reads the aligned pages around it into the slot's bounce buffer.
     void prepare_slot(std::size_t index, const QueuedFileRead& read) {
         auto& slot = slots[index];
+        const bool in_place =
+            direct && read.offset % kAlignment == 0 && read.destination.size() % kAlignment == 0 &&
+            reinterpret_cast<std::uintptr_t>(read.destination.data()) % kAlignment == 0;
+        slot.bounced = direct && !in_place;
         slot.prefix = direct ? read.offset % kAlignment : 0;
         slot.offset = read.offset - slot.prefix;
         slot.needed = slot.prefix + read.destination.size();
         slot.requested = direct ? (slot.needed + kAlignment - 1) & ~(kAlignment - 1) : slot.needed;
-        if (direct && slot.requested > slot.capacity) {
+        if (slot.bounced && slot.requested > slot.capacity) {
             slot.bounce.reset(static_cast<std::uint8_t*>(
                 ::operator new(slot.requested, std::align_val_t{kAlignment})));
             slot.capacity = slot.requested;
         }
-        slot.data = direct ? slot.bounce.get() : read.destination.data();
+        slot.data = slot.bounced ? slot.bounce.get() : read.destination.data();
         slot.have = 0;
         slot.error = 0;
         slot.done = read.destination.empty();
@@ -231,7 +239,7 @@ struct FileReadQueue::Impl {
             const auto& read = reads[owner[index]];
             if (slots[index].error != 0) {
                 if (failure.empty()) { failure = failure_text(index, read); }
-            } else if (direct && !read.destination.empty()) {
+            } else if (slots[index].bounced && !read.destination.empty()) {
                 std::memcpy(read.destination.data(), slots[index].data + slots[index].prefix,
                             read.destination.size());
             }
@@ -395,7 +403,7 @@ struct FileReadQueue::Impl {
             }
             if (direct) {
                 for (std::size_t i = 0; i < group.size(); ++i) {
-                    if (!group[i].destination.empty()) {
+                    if (slots[i].bounced && !group[i].destination.empty()) {
                         std::memcpy(group[i].destination.data(), slots[i].data + slots[i].prefix,
                                     group[i].destination.size());
                     }

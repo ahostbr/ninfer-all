@@ -491,7 +491,8 @@ public:
                 "Qwen3.8-Flash-Next host or disk experts");
         }
         if (options.hybrid_experts.deepseek_delivery_requested()) {
-            throw std::invalid_argument("the --deepseek-* expert delivery options require DeepSeek-V4.1");
+            throw std::invalid_argument("the --deepseek-* expert delivery options and "
+                                        "--expert-host-mib require DeepSeek-V4.1");
         }
         if ((options.hybrid_experts.dma_share || options.hybrid_experts.cpu_threads != 0) &&
             options.expert_residency == ExpertResidency::Device) {

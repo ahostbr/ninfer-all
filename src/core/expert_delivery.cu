@@ -33,6 +33,8 @@ constexpr std::size_t kRoundExperts = 8;
 // carry out every swap that a prompt's counts justify.
 constexpr std::uint32_t kSettleRounds = 6;
 constexpr std::uint64_t kRoundFileBytes = 8ULL << 20;
+// The unit of a direct read's file offset, length and buffer address.
+constexpr std::uint64_t kPage = 4096;
 
 // needed[e] of a call: its pairs routed to expert e, and whether the table entry the split read
 // lies in the persistent cache.
@@ -386,7 +388,9 @@ struct ExpertDelivery::Impl {
     struct StagedCopy { std::byte* target; const std::uint8_t* source; std::size_t bytes; };
     std::vector<StagedCopy> batch_copies;
     std::vector<std::ifstream> files;
+    std::vector<std::uint64_t> file_sizes;
     std::unique_ptr<FileReadQueue> read_queue;
+    bool direct = false; // the queue reads past the page cache (ExpertDeliveryOptions::direct_reads)
     std::atomic<bool> stopping{false};
     std::atomic<std::uint32_t> finished{0}; // the last request whose service, post work included, ended
     std::thread service;
@@ -572,6 +576,8 @@ struct ExpertDelivery::Impl {
         }
         if (disk) {
             half_bytes = aligned(std::max<std::uint64_t>(options.staging_bytes / 2, 256));
+            // Direct reads fill whole pages from page-aligned staging positions.
+            if (options.direct_reads) { half_bytes = (half_bytes + kPage - 1) / kPage * kPage; }
             staging = std::make_unique<PinnedHostBuffer>(2 * half_bytes);
             allocation.pinned_bytes += staging->size();
             for (const auto& path : paths) {
@@ -579,8 +585,10 @@ struct ExpertDelivery::Impl {
                 if (!files.back()) {
                     throw std::runtime_error("expert delivery: cannot open " + path.string());
                 }
+                file_sizes.push_back(std::filesystem::file_size(path));
             }
-            read_queue = FileReadQueue::open(paths, false, 16);
+            read_queue = FileReadQueue::open(paths, options.direct_reads, 16);
+            direct = options.direct_reads && read_queue != nullptr;
         }
         const std::uint64_t granule = options.suspendable ? vmm::granularity(rank.device) : 1;
         if (!granule) {
@@ -1129,6 +1137,10 @@ struct ExpertDelivery::Impl {
         half = 1 - half;
     }
 
+    // A direct read covers the whole pages its bytes lie in, from a page-aligned staging position
+    // (the cursor stays page-aligned), and the copy starts `skip` bytes into them; so the queue
+    // reads it in place, with no bounce buffer and no second copy. A range whose last page runs
+    // past the end of its file is read as it is, through the queue's bounce.
     void stage(const Piece& piece, ExpertDeliveryStats& delta) {
         std::uint64_t destination = 0;
         for (const auto& extent : piece.extents) {
@@ -1137,11 +1149,17 @@ struct ExpertDelivery::Impl {
                 if (staging_cursor == half_bytes) { flush_reads(); }
                 auto* buffer = static_cast<std::uint8_t*>(staging->data()) +
                                half * half_bytes + staging_cursor;
-                const auto bytes = std::min(extent.bytes - within, half_bytes - staging_cursor);
-                batch_reads.push_back({extent.file, extent.offset + within,
-                                       {buffer, std::size_t(bytes)}});
-                batch_copies.push_back({piece.target + destination, buffer, std::size_t(bytes)});
-                staging_cursor += bytes;
+                const auto offset = extent.offset + within;
+                const auto skip   = direct ? offset % kPage : 0;
+                const auto bytes  = std::min(extent.bytes - within, half_bytes - staging_cursor - skip);
+                const auto pages  = direct ? (skip + bytes + kPage - 1) / kPage * kPage : bytes;
+                if (direct && offset - skip + pages <= file_sizes[extent.file]) {
+                    batch_reads.push_back({extent.file, offset - skip, {buffer, std::size_t(pages)}});
+                } else {
+                    batch_reads.push_back({extent.file, offset, {buffer + skip, std::size_t(bytes)}});
+                }
+                batch_copies.push_back({piece.target + destination, buffer + skip, std::size_t(bytes)});
+                staging_cursor += pages;
                 destination += bytes;
                 within += bytes;
                 delta.read_bytes += bytes;
@@ -1426,6 +1444,9 @@ struct ExpertDelivery::Impl {
             const auto s = layer.slot_of[std::size_t(e)];
             if (s >= 0 && !slots[std::size_t(s)].pending) { continue; }
             if (held >= 0 && bank_state[std::size_t(held)].valid[std::size_t(e)]) { continue; }
+            if (options.cpu.pinned_only && !layer.source.experts[std::size_t(e)].front().pinned) {
+                continue;
+            }
             order.emplace_back(needed[e] & kCountMask, e);
         }
         std::stable_sort(order.begin(), order.end(),
@@ -1740,7 +1761,9 @@ struct ExpertDelivery::Impl {
         if (experts.empty() || bank_lent[std::size_t(k)]) { return false; }
         // Disk experts are read on this thread: queued before compute is released, that read would
         // delay it, so serve leaves them to the post work.
-        if (pinned_only && layers[next].source.experts[std::size_t(experts.front())].front().pinned == nullptr) {
+        if (pinned_only && std::any_of(experts.begin(), experts.end(), [&](std::int32_t e) {
+                return layers[next].source.experts[std::size_t(e)].front().pinned == nullptr;
+            })) {
             return false;
         }
         claim_bank(k, next);

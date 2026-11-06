@@ -931,10 +931,15 @@ struct Executor::Impl {
         // host every split of disk experts decoded slower than copying every miss, so the CPU
         // computes disk experts only at an explicit share.
         // Under expert parallelism every rank copies all of its misses.
+        // Disk experts with a host tier (--expert-host-mib): the tier's experts split as host
+        // experts do and the files' are copied (ExpertCpuOptions::pinned_only).
+        const bool host_tier = model.expert_host_tier().bytes != 0;
         const bool cpu_share =
             expert_ranges.empty() &&
-            (options.expert_dma_share ? dma_share < 1
-                                      : model.expert_residency() == ExpertResidency::Host);
+            (options.expert_dma_share
+                 ? dma_share < 1
+                 : model.expert_residency() == ExpertResidency::Host || host_tier);
+        transport.direct_reads = host_tier;
         if (computes && cpu_share) {
             cpu_experts = std::make_unique<CpuExperts>(std::move(cpu_layers), hidden, width,
                 int(config.top_k_experts), config.swiglu_limit);
@@ -944,6 +949,7 @@ struct Executor::Impl {
             transport.cpu.share         = 1.0 - double(dma_share);
             transport.cpu.balance       = !options.expert_dma_share;
             transport.cpu.threads       = options.expert_cpu_threads;
+            transport.cpu.pinned_only   = host_tier && !options.expert_dma_share;
         }
         delivery = std::make_unique<ExpertDelivery>(device.rank(0), model.expert_files(),
                                                     std::move(sources), transport);

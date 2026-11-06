@@ -15,6 +15,10 @@
 #include <span>
 #include <vector>
 
+namespace ninfer {
+class StartupPhaseScope;
+}
+
 namespace ninfer::artifact {
 
 class Reader;
@@ -205,5 +209,17 @@ materialize(const Reader& reader, MaterializationPlan&& plan, DeviceContext& dev
             const StartupObserver* startup_observer      = nullptr,
             std::unique_ptr<EvictableWeightPool> backing = nullptr,
             const MaterializeOptions& options           = {});
+
+// Stored bytes and where a load keeps them on the host.
+struct HostReadTarget {
+    std::uint64_t offset   = 0; // logical artifact offset
+    std::uint64_t bytes    = 0;
+    std::byte* destination = nullptr;
+};
+
+// Writes every target's stored bytes to its destination with direct reads (past the page cache)
+// on several threads. Progress counts from 0 toward `total`. Returns the bytes read.
+std::uint64_t read_host_bytes(const Reader& reader, std::span<const HostReadTarget> targets,
+                              StartupPhaseScope& phase, std::uint64_t total);
 
 } // namespace ninfer::artifact

@@ -439,10 +439,16 @@ struct HybridExpertOptions {
     bool deepseek_short_prompt = false;
     std::uint32_t deepseek_short_prompt_tokens = 96;
     bool deepseek_profile_weights = false;
+    // DeepSeek-V4.1 disk experts (--expert-host-mib, T1192): up to this many bytes of the experts
+    // the routing profile ranks highest are read once at startup into pinned host memory and
+    // copied from there as host experts are; every other expert is read from the files. 0
+    // (default): every expert is read from the files.
+    std::uint64_t expert_host_bytes = 0;
     // Whether any of these differs from its default (for families that take none of them).
     [[nodiscard]] bool deepseek_delivery_requested() const noexcept {
         const HybridExpertOptions defaults{};
-        return deepseek_prefetch_ahead != defaults.deepseek_prefetch_ahead ||
+        return expert_host_bytes != defaults.expert_host_bytes ||
+               deepseek_prefetch_ahead != defaults.deepseek_prefetch_ahead ||
                deepseek_cache_settle != defaults.deepseek_cache_settle ||
                deepseek_short_prompt != defaults.deepseek_short_prompt ||
                deepseek_profile_weights != defaults.deepseek_profile_weights ||

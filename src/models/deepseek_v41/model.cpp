@@ -5,10 +5,12 @@
 #include "models/qwen3_5/frontend/tokenizer.h"
 #include "models/qwen3_5/load/bindings.h"
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 
 namespace ninfer::models::deepseek_v41 {
@@ -64,11 +66,13 @@ void tail(Bindings& b, WeightId id) {
 
 // Resolve stored GGUF rows directly. Disk mode validates without materializing the bank.
 // Host mode borrows the materializer's pinned parent. Neither path repacks model weights.
+// `logical` receives each expert's logical artifact offset.
 std::vector<ExpertBlob> expert_blobs(const artifact::Reader& reader,
                                     const artifact::ParameterReference& reference,
                                     const artifact::MaterializedArtifact& backing,
                                     std::uint64_t experts, std::uint64_t rows, std::uint64_t k,
-                                    QType& format, std::uint64_t& row_bytes) {
+                                    QType& format, std::uint64_t& row_bytes,
+                                    std::vector<std::uint64_t>& logical) {
     std::vector<ExpertBlob> result;
     const auto& parts = reference.binding.parts;
     if (parts.size() != 1) {
@@ -93,19 +97,104 @@ std::vector<ExpertBlob> expert_blobs(const artifact::Reader& reader,
         blob.bytes = rows * row_bytes;
         blob.zero_tail = kRowTail;
         const auto offset = start + e * blob.bytes;
+        logical.push_back(reader.directory().tensor(part.object).offset + offset);
         if (reference.residency == artifact::Residency::Pinned) {
             const auto* parent = backing.pinned_parent(part.object).data;
             blob.pinned = parent + offset;
             blob.pinned_region = reinterpret_cast<std::uintptr_t>(parent);
         } else {
-            const auto logical = reader.directory().tensor(part.object).offset + offset;
-            for (const auto& segment : reader.segments(logical, blob.bytes)) {
+            for (const auto& segment : reader.segments(logical.back(), blob.bytes)) {
                 blob.extents.push_back({segment.file_index, segment.file_offset, segment.bytes});
             }
         }
         result.push_back(std::move(blob));
     }
     return result;
+}
+
+// Disk experts kept in pinned host memory (LoadOptions::expert_host_bytes): the experts `profile`
+// ranks highest over every block, while their bytes fit `budget`. Without a profile every expert
+// ranks alike and the ties go to the lowest ids of each block in turn, an even share of every
+// block. Their blobs are read once with direct I/O, past the page cache, and pinned; from then on
+// the delivery copies them exactly as it copies host experts, and reads only the others from the
+// files. A block's kept experts lie in ascending order, its gate/up blobs before its down blobs, as
+// in the artifact, so a run of consecutive kept experts is still one copy. `logical`:
+// [block][blob][expert], each blob's logical artifact offset.
+ExpertHostTier pin_hot_experts(const artifact::Reader& reader, std::vector<ExpertBanks>& banks,
+                               const std::vector<std::array<std::vector<std::uint64_t>, 2>>& logical,
+                               std::uint64_t budget,
+                               const std::vector<std::vector<std::uint64_t>>* profile,
+                               const StartupObserver* observer, std::unique_ptr<HostPages>& pages) {
+    struct Candidate {
+        std::uint64_t count = 0, bytes = 0;
+        std::uint32_t expert = 0, block = 0;
+    };
+    if (profile && profile->size() != banks.size()) {
+        throw std::invalid_argument("--expert-host-mib: the routing profile's blocks differ from the "
+                                    "model's");
+    }
+    std::vector<Candidate> order;
+    std::vector<std::vector<unsigned char>> kept(banks.size());
+    double routes = 0;
+    for (std::uint32_t block = 0; block < banks.size(); ++block) {
+        const auto& experts = banks[block].delivery.experts;
+        if (profile && (*profile)[block].size() != experts.size()) {
+            throw std::invalid_argument("--expert-host-mib: the routing profile's experts differ "
+                                        "from the model's");
+        }
+        kept[block].assign(experts.size(), 0);
+        for (std::uint32_t e = 0; e < experts.size(); ++e) {
+            Candidate c{profile ? (*profile)[block][e] : 0, 0, e, block};
+            for (const auto& blob : experts[e]) { c.bytes += blob.bytes; }
+            routes += double(c.count);
+            order.push_back(c);
+        }
+    }
+    std::sort(order.begin(), order.end(), [](const Candidate& a, const Candidate& b) {
+        return std::tie(b.count, a.expert, a.block) < std::tie(a.count, b.expert, b.block);
+    });
+    ExpertHostTier tier;
+    tier.of     = std::uint32_t(order.size());
+    tier.ranked = profile != nullptr && routes > 0;
+    double covered = 0;
+    for (const auto& c : order) {
+        if (c.bytes > budget - tier.bytes) { continue; }
+        kept[c.block][c.expert] = 1;
+        tier.bytes += c.bytes;
+        covered += double(c.count);
+        ++tier.experts;
+    }
+    tier.profile_share = tier.ranked ? covered / routes : 0;
+    if (tier.bytes == 0) { return tier; }
+    pages = std::make_unique<HostPages>(std::size_t(tier.bytes));
+    std::vector<artifact::HostReadTarget> targets;
+    std::vector<ExpertBlob*> blobs;
+    std::byte* at = pages->data();
+    for (std::size_t block = 0; block < banks.size(); ++block) {
+        auto& experts = banks[block].delivery.experts;
+        for (std::size_t b = 0; b < 2; ++b) {
+            for (std::size_t e = 0; e < experts.size(); ++e) {
+                if (!kept[block][e]) { continue; }
+                auto& blob = experts[e][b];
+                targets.push_back({logical[block][b][e], blob.bytes, at});
+                blobs.push_back(&blob);
+                at += blob.bytes;
+            }
+        }
+    }
+    const StartupObserver none;
+    StartupPhaseScope phase(observer ? *observer : none, StartupPhase::WeightsMaterialize,
+                            StartupProgressUnit::Bytes, tier.bytes);
+    artifact::read_host_bytes(reader, targets, phase, tier.bytes);
+    pages->pin();
+    phase.complete(tier.bytes, tier.bytes);
+    const auto region = reinterpret_cast<std::uintptr_t>(pages->data());
+    for (std::size_t i = 0; i < blobs.size(); ++i) {
+        blobs[i]->pinned        = targets[i].destination;
+        blobs[i]->pinned_region = region;
+        blobs[i]->extents.clear();
+    }
+    return tier;
 }
 
 } // namespace
@@ -148,6 +237,10 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
                                   DeviceContext& device, const StartupObserver* observer) {
     if (!is_deepseek_v41(reader)) {
         throw artifact::ArtifactError("the artifact's text component is not DeepseekV41ForCausalLM");
+    }
+    if (options.expert_host_bytes != 0 && options.experts != ExpertResidency::Disk) {
+        throw std::invalid_argument("--expert-host-mib keeps part of the disk experts in host "
+                                    "memory (--expert-residency disk)");
     }
     TextConfig config = parse_text_config(reader.directory().component("text").config);
     const bool vision = options.vision != VisionPlacement::None;
@@ -389,18 +482,27 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
     auto backing = artifact::materialize(reader, std::move(materialization), device, observer);
     auto bound   = qwen3_5::loading::resolve_weights(std::move(pending), backing);
     std::vector<ExpertBanks> expert_banks;
+    std::vector<std::array<std::vector<std::uint64_t>, 2>> expert_offsets;
     for (const auto& reference : expert_references) {
         ExpertBanks bank;
+        auto& offsets = expert_offsets.emplace_back();
         auto gu = expert_blobs(reader, reference[0], backing, e, 2 * w, h, bank.gate_up_type,
-                               bank.gate_up_row_bytes);
+                               bank.gate_up_row_bytes, offsets[0]);
         auto down = expert_blobs(reader, reference[1], backing, e, h, w, bank.down_type,
-                                 bank.down_row_bytes);
+                                 bank.down_row_bytes, offsets[1]);
         for (std::size_t x = 0; x < gu.size(); ++x) {
             bank.delivery.experts.push_back({std::move(gu[x]), std::move(down[x])});
         }
         // Gate rows, up rows, the [gate; up] parent, down rows: the executor's expert tables.
         bank.delivery.aliases = {{0, 0}, {0, w * bank.gate_up_row_bytes}, {0, 0}, {1, 0}};
         expert_banks.push_back(std::move(bank));
+    }
+    std::unique_ptr<HostPages> expert_host;
+    ExpertHostTier expert_host_tier;
+    if (options.expert_host_bytes != 0) {
+        expert_host_tier = pin_hot_experts(reader, expert_banks, expert_offsets,
+                                           options.expert_host_bytes, options.expert_profile,
+                                           observer, expert_host);
     }
     auto model = std::unique_ptr<Model>(new Model(std::move(config), std::move(weights),
                                                   std::move(bound), std::move(resources),
@@ -413,6 +515,8 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
     model->vision_placement_ = options.vision;
     model->expert_residency_ = options.experts;
     model->expert_banks_     = std::move(expert_banks);
+    model->expert_host_      = std::move(expert_host);
+    model->expert_host_tier_ = expert_host_tier;
     if (options.experts == ExpertResidency::Disk) {
         for (const auto& file : reader.directory().files) {
             model->expert_files_.push_back(file.path ? options.artifact.parent_path() / *file.path

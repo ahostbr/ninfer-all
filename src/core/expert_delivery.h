@@ -79,6 +79,9 @@ struct ExpertCpuOptions {
     double share = 0;          // the share of a narrow call's missing experts the CPU computes
     bool balance = false;      // instead, the split whose copies and products end soonest
     std::uint32_t threads = 0; // the CPU pool, the service thread included; 0: pool_cpu_count()
+    // Only experts in pinned host memory go to the CPU; those in files are always copied (a file
+    // read for the CPU costs what the copy's does, and delays the products).
+    bool pinned_only = false;
 };
 
 struct ExpertDeliveryOptions {
@@ -88,6 +91,12 @@ struct ExpertDeliveryOptions {
     std::optional<std::uint64_t> cache_bytes;
     std::uint64_t keep_free_bytes = 512ULL << 20;
     std::uint64_t staging_bytes = 128ULL << 20; // disk only, two pinned halves
+    // Disk experts: misses are read with direct I/O (past the OS page cache, whole 4 KiB pages
+    // straight into the pinned staging, the queue's reads in flight together) instead of through
+    // the page cache, whose reads copy once more and on Windows may complete one by one on the
+    // calling thread. For a host tier (--expert-host-mib), whose pinned experts leave the page
+    // cache little room for the rest.
+    bool direct_reads = false;
     // Whole-layer device windows that hold the experts the cache does not. Two let the next layer
     // of a wide call (a prompt chunk, a wide verification) arrive while the current one computes;
     // one halves their memory and gives that up. Two fall back to one when memory is short.

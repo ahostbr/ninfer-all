@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
@@ -214,15 +215,42 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
             models::deepseek_v41::parse_text_config(reader.directory().component("text").config),
             table.path);
     }
-    inspect.complete();
+    // The routing profile ranks the experts the load keeps in host memory (--expert-host-mib) and
+    // fills the device expert cache: --expert-profile, else the family's built-in one where its
+    // geometry is this artifact's.
+    std::optional<models::ExpertRouteCounts> expert_profile;
+    if (options.expert_residency != ExpertResidency::Device) {
+        const auto text = models::deepseek_v41::parse_text_config(
+            reader.directory().component("text").config);
+        const std::vector<std::size_t> widths(text.num_hidden_layers,
+                                              std::size_t(text.num_experts));
+        if (!hybrid.routing_profile.empty()) {
+            expert_profile = models::read_expert_profile(hybrid.routing_profile,
+                                                         reader.artifact_id(), widths);
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                               "DeepSeek-V4.1: expert profile %s read for artifact %s: %zu layers "
+                               "of %u experts (counts by position in the artifact's kept experts)",
+                               hybrid.routing_profile.string().c_str(),
+                               models::expert_profile_artifact_id(reader.artifact_id()).c_str(),
+                               widths.size(), unsigned(text.num_experts));
+        } else {
+            expert_profile = models::builtin_expert_profile("deepseek-v4.1", widths);
+        }
+    }
+    if (hybrid.expert_host_bytes != 0 && options.expert_residency != ExpertResidency::Disk) {
+        throw std::invalid_argument("--expert-host-mib keeps part of the disk experts in host "
+                                    "memory (--expert-residency disk)");
+    }
     install_device_route_profile_for(options, device);
     StartupPhaseScope materialize(options.startup_observer, StartupPhase::TargetPlan);
     auto model = models::deepseek_v41::load_model(
         reader,
-        {.artifact = options.artifact_path,
-         .experts  = options.expert_residency,
-         .dspark   = dspark,
-         .vision   = vision},
+        {.artifact          = options.artifact_path,
+         .experts           = options.expert_residency,
+         .dspark            = dspark,
+         .vision            = vision,
+         .expert_host_bytes = hybrid.expert_host_bytes,
+         .expert_profile    = expert_profile ? &*expert_profile : nullptr},
         device, &options.startup_observer);
     // An image's span takes the release's 1024 prompt positions at most, fewer with
     // --vision-max-merged.
@@ -308,16 +336,7 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
                            "trained on",
                            options.max_context, model->config().max_position_embeddings);
     }
-    if (options.expert_residency != ExpertResidency::Device) {
-        const std::vector<std::size_t> widths(model->expert_banks().size(),
-                                              std::size_t(model->config().num_experts));
-        if (!hybrid.routing_profile.empty()) {
-            executor.expert_profile = models::read_expert_profile(hybrid.routing_profile,
-                                                                  model->info().artifact_id, widths);
-        } else {
-            executor.expert_profile = models::builtin_expert_profile("deepseek-v4.1", widths);
-        }
-    }
+    executor.expert_profile = std::move(expert_profile);
     // Causal scoring keeps no context between requests.
     executor.checkpoints = options.context_cache.enabled &&
                            options.purpose == EnginePurpose::Generation;
@@ -439,11 +458,21 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
     }
     if (options.expert_residency != ExpertResidency::Device) {
         const auto experts = memory.experts;
+        const auto& tier   = model->expert_host_tier();
+        char tier_text[320];
+        std::snprintf(tier_text, sizeof(tier_text),
+                      "the artifact's files, %u of %u experts (%.0f MiB, %s) kept in pinned host "
+                      "memory, the rest read with direct I/O into bounded buffers",
+                      tier.experts, tier.of, double(tier.bytes) / 1048576,
+                      tier.ranked ? ("the profile's highest, " +
+                                     std::to_string(int(std::lround(100 * tier.profile_share))) +
+                                     "% of its routes").c_str()
+                                  : "no routing profile: an even share of each block");
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
             "DeepSeek-V4.1: experts in %s, cache %.0f MiB (%u slots), %u layer bank(s) %.0f MiB, "
             "metadata %.1f MiB, pinned delivery %.1f MiB, pinned expert sources %.0f MiB",
-            options.expert_residency == ExpertResidency::Host
-                ? "pinned host memory"
+            options.expert_residency == ExpertResidency::Host ? "pinned host memory"
+            : tier.bytes != 0 ? tier_text
                 : "the artifact's files, read into bounded buffers through the page cache",
             double(experts.cache_bytes) / 1048576, experts.cache_slots, experts.banks,
             double(experts.bank_bytes) / 1048576, double(experts.metadata_bytes) / 1048576,

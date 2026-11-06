@@ -13,6 +13,7 @@
 #include "artifact/materializer.h"
 #include "core/device.h"
 #include "core/expert_delivery.h"
+#include "core/host_pages.h"
 #include "core/startup.h"
 #include "models/deepseek_v41/config.h"
 #include "models/qwen3_5/frontend/resources.h"
@@ -135,6 +136,21 @@ struct LoadOptions {
     bool dspark             = false; // bind the artifact's DSpark drafter
     // Binds the artifact's `vision` component, which must then exist, in this placement.
     VisionPlacement vision = VisionPlacement::None;
+    // Disk experts only (--expert-host-mib): up to this many bytes of experts are read once into
+    // pinned host memory and served from there; the rest stay in the files. They are the experts
+    // `expert_profile` ([block][expert] route counts) ranks highest over every block; without a
+    // profile, an even share of each block.
+    std::uint64_t expert_host_bytes = 0;
+    const std::vector<std::vector<std::uint64_t>>* expert_profile = nullptr;
+};
+
+// Disk experts kept in pinned host memory (LoadOptions::expert_host_bytes).
+struct ExpertHostTier {
+    std::uint64_t bytes = 0;         // pinned
+    std::uint32_t experts = 0;       // of `of`, over every block
+    std::uint32_t of = 0;
+    double profile_share = 0;        // of the profile's routes, the pinned experts' (0: no profile)
+    bool ranked = false;             // by a profile
 };
 
 class Model {
@@ -171,6 +187,8 @@ public:
     [[nodiscard]] const std::vector<std::filesystem::path>& expert_files() const noexcept {
         return expert_files_;
     }
+    // Disk experts: those kept in pinned host memory (empty without --expert-host-mib).
+    [[nodiscard]] const ExpertHostTier& expert_host_tier() const noexcept { return expert_host_tier_; }
     [[nodiscard]] const BoundWeight& weight(WeightId id) const { return bound_.at(id.index); }
     [[nodiscard]] std::span<const BoundWeight> weight_data() const noexcept { return bound_; }
     [[nodiscard]] ops::WeightInput input(WeightId id) const;
@@ -205,6 +223,9 @@ private:
     ExpertResidency expert_residency_ = ExpertResidency::Device;
     std::vector<ExpertBanks> expert_banks_;
     std::vector<std::filesystem::path> expert_files_;
+    // The pinned disk experts' bytes, which expert_banks_' pinned blobs point into.
+    std::unique_ptr<HostPages> expert_host_;
+    ExpertHostTier expert_host_tier_;
 };
 
 // Whether the artifact's text component is DeepSeek-V4.1, and whether it carries the DSpark drafter

@@ -257,6 +257,16 @@ cache and its rounds):
   reads through the OS page cache into bounded pinned transfer buffers, then copied to the device;
   NInfer maps no expert file into memory, so a miss never waits on a page fault inside a copy.
   Whatever the page cache holds is read at memory speed, the rest at the storage's.
+- **Disk with a host tier.** `--expert-residency disk --expert-host-mib N` keeps up to N MiB of
+  the experts the routing profile ranks highest (over every block) in pinned host memory, read
+  once at startup with direct I/O, and leaves the rest in the files: a host that cannot pin every
+  expert keeps the most routed ones there. A pinned expert is copied (or computed by the CPU
+  share) exactly as a host expert is; a file expert is copied after a direct read, past the page
+  cache, into the transfer buffers. The ranking is `--expert-profile`, else the built-in profile
+  where its geometry is the artifact's, else an even share of each block. A pack that keeps a
+  subset of the release's experts gets a profile from `tools/expert_profile_kept.py` (the
+  built-in counts at the pack's kept ids), which also prints the profile's route share per
+  budget. The startup log names the tier: experts kept, MiB, and that share.
 - **Layer banks and cache.** A prompt chunk's experts missing from the cache land in a whole-layer
   bank laid out like the resident bank; two banks let the next layer arrive while the current one
   computes. `--expert-cache-mib` (default: what is free after startup) holds the experts decode

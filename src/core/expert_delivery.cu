@@ -13,6 +13,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
 #include <exception>
 #include <fstream>
@@ -388,6 +389,18 @@ struct ExpertDelivery::Impl {
     std::vector<std::uint64_t> file_sizes;
     std::unique_ptr<FileReadQueue> read_queue;
     bool direct = false; // the queue reads past the page cache (ExpertDeliveryOptions::direct_reads)
+    // The served call's file reads so far, in seconds of wall time.
+    double read_clock = 0;
+    // The reader thread: a narrow call's staged file reads run there while this thread computes
+    // the CPU's products (started at the first such call). One read runs at a time: this thread
+    // reads nothing else until the reader is done.
+    std::thread reader;
+    std::mutex reader_mutex;
+    std::condition_variable reader_cv;
+    std::span<const QueuedFileRead> reader_job;
+    bool reader_busy = false, reader_stop = false;
+    double reader_seconds = 0;
+    std::exception_ptr reader_failure;
     std::atomic<bool> stopping{false};
     std::atomic<std::uint32_t> finished{0}; // the last request whose service, post work included, ended
     std::thread service;
@@ -767,6 +780,14 @@ struct ExpertDelivery::Impl {
         cudaStreamSynchronize(rank.stream);
         stopping.store(true, std::memory_order_release);
         if (service.joinable()) { service.join(); }
+        if (reader.joinable()) {
+            {
+                std::lock_guard lock(reader_mutex);
+                reader_stop = true;
+            }
+            reader_cv.notify_all();
+            reader.join();
+        }
         cudaStreamSynchronize(copies);
         cudaStreamSynchronize(rounds);
         for (auto event : copied) { cudaEventDestroy(event); }
@@ -1106,10 +1127,22 @@ struct ExpertDelivery::Impl {
         }
     }
 
+    // read_now, its wall time added to read_clock.
+    void timed_read(std::span<const QueuedFileRead> reads) {
+        const auto started = std::chrono::steady_clock::now();
+        read_now(reads);
+        read_clock += std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    }
+
     void flush_reads() {
         if (batch_reads.empty()) { return; }
         CUDA_CHECK(cudaEventSynchronize(copied[half]));
-        read_now(batch_reads);
+        timed_read(batch_reads);
+        issue_staged();
+    }
+
+    // The staged reads are in: their copies, then the other half.
+    void issue_staged() {
         for (const auto& copy : batch_copies) {
             CUDA_CHECK(cudaMemcpyAsync(copy.target, copy.source, copy.bytes,
                                        cudaMemcpyHostToDevice, copies));
@@ -1119,6 +1152,56 @@ struct ExpertDelivery::Impl {
         batch_copies.clear();
         staging_cursor = 0;
         half = 1 - half;
+    }
+
+    void read_loop() {
+        std::unique_lock lock(reader_mutex);
+        for (;;) {
+            reader_cv.wait(lock, [&] { return reader_stop || reader_busy; });
+            if (!reader_busy) { return; }
+            const auto job = reader_job;
+            lock.unlock();
+            std::exception_ptr error;
+            const auto started = std::chrono::steady_clock::now();
+            try { read_now(job); }
+            catch (...) { error = std::current_exception(); }
+            const double took =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+            lock.lock();
+            reader_seconds = took;
+            reader_failure = error;
+            reader_busy    = false;
+            reader_cv.notify_all();
+        }
+    }
+
+    // The staged reads start on the reader thread, into the half the last copies from it left.
+    void start_reads() {
+        CUDA_CHECK(cudaEventSynchronize(copied[half]));
+        if (!reader.joinable()) { reader = std::thread([this] { read_loop(); }); }
+        {
+            std::lock_guard lock(reader_mutex);
+            reader_job  = batch_reads;
+            reader_busy = true;
+        }
+        reader_cv.notify_all();
+    }
+
+    // Waits for the reader; returns the seconds waited and rethrows its failure.
+    double wait_reader() {
+        const auto started = std::chrono::steady_clock::now();
+        std::exception_ptr error;
+        {
+            std::unique_lock lock(reader_mutex);
+            reader_cv.wait(lock, [&] { return !reader_busy; });
+            read_clock += reader_seconds;
+            reader_seconds = 0;
+            error = std::exchange(reader_failure, nullptr);
+        }
+        const double waited =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        if (error) { std::rethrow_exception(error); }
+        return waited;
     }
 
     // A direct read covers the whole pages its bytes lie in, from a page-aligned staging position
@@ -1151,22 +1234,32 @@ struct ExpertDelivery::Impl {
         }
     }
 
-    void flush_pieces(ExpertDeliveryStats& delta) {
+    // The pinned pieces' copies first (`done`, when given, recorded after them), then the file
+    // pieces' reads and copies. With `defer` the reads still staged are left to the caller
+    // (start_reads, then wait_reader and issue_staged). Returns the pinned bytes.
+    std::uint64_t flush_pieces(ExpertDeliveryStats& delta, cudaEvent_t done = nullptr,
+                               bool defer = false) {
+        std::uint64_t pinned = 0;
         for (const auto& piece : pieces) {
-            if (piece.pinned) {
-                CUDA_CHECK(cudaMemcpyAsync(piece.target, piece.pinned, piece.bytes,
-                                           cudaMemcpyHostToDevice, copies));
-            } else {
-                stage(piece, delta);
-            }
+            if (!piece.pinned) { continue; }
+            CUDA_CHECK(cudaMemcpyAsync(piece.target, piece.pinned, piece.bytes,
+                                       cudaMemcpyHostToDevice, copies));
+            pinned += piece.bytes;
             delta.copied_bytes += piece.bytes;
         }
-        flush_reads();
+        if (done) { CUDA_CHECK(cudaEventRecord(done, copies)); }
+        for (const auto& piece : pieces) {
+            if (piece.pinned) { continue; }
+            stage(piece, delta);
+            delta.copied_bytes += piece.bytes;
+        }
+        if (!defer) { flush_reads(); }
         for (const auto& [target, bytes] : zeroes) {
             CUDA_CHECK(cudaMemsetAsync(target, 0, bytes, copies));
         }
         pieces.clear();
         zeroes.clear();
+        return pinned;
     }
 
     // Bytes of blob b written into slot s: zero what a larger earlier blob left past them, so the
@@ -1199,7 +1292,9 @@ struct ExpertDelivery::Impl {
             free.pop_back();
             return s;
         }
-        const auto victim = tier->admission_victim(li, e, float(pairs), call_routed);
+        const bool file    = layers[li].source.experts[std::size_t(e)].front().pinned == nullptr;
+        const auto victim  = tier->admission_victim(
+            li, e, float(pairs) * (file ? options.file_route_weight : 1.0F), call_routed);
         if (victim.expert < 0) { return -1; }
         const auto s = layers[victim.layer].slot_of[std::size_t(victim.expert)];
         if (s < 0 || slots[std::size_t(s)].pending) { return -1; }
@@ -1464,10 +1559,10 @@ struct ExpertDelivery::Impl {
     // missing ids without the CPU's pairs, its products and flag for the device.
     void compute_cpu(std::size_t li, const std::vector<std::int32_t>& cpu, std::uint32_t pairs,
                      const std::uint32_t* needed, ExpertDeliveryStats& delta,
-                     const std::function<void()>& issue) {
+                     const std::function<void(bool)>& issue) {
         auto* flag = static_cast<std::int32_t*>(host_flag->data());
         if (cpu.empty()) {
-            issue();
+            issue(false);
             if (*flag != 0) {
                 *flag = 0;
                 CUDA_CHECK(cudaMemcpyAsync(cpu_flag.p, flag, 4, cudaMemcpyHostToDevice, copies));
@@ -1500,8 +1595,13 @@ struct ExpertDelivery::Impl {
                 }
             }
         }
-        issue();
-        if (!reads.empty()) { read_now(reads); }
+        // When the CPU reads nothing itself, the copies' file reads run on the reader thread while
+        // it computes: the call then waits for the longer of the two, not for their sum.
+        const bool overlap = reads.empty();
+        issue(overlap);
+        const bool reading = overlap && !batch_reads.empty();
+        if (reading) { start_reads(); }
+        if (!reads.empty()) { timed_read(reads); }
         const auto* ids = static_cast<const std::int32_t*>(host_ids->data());
         ExpertCpuProducts::Work work;
         work.layer    = li;
@@ -1512,6 +1612,11 @@ struct ExpertDelivery::Impl {
         work.products = static_cast<std::byte*>(host_products->data());
         work.pool     = pool.get();
         const auto [used, microseconds] = options.cpu.products->compute(work);
+        delta.cpu_seconds += microseconds * 1e-6;
+        if (reading) {
+            delta.read_wait_seconds += wait_reader();
+            issue_staged();
+        }
         if (used > options.cpu.product_bytes) {
             throw std::logic_error("expert delivery: CPU products exceed their buffer");
         }
@@ -1603,6 +1708,13 @@ struct ExpertDelivery::Impl {
             if (bank_lent[std::size_t(k)]) { reclaim_bank(k, delta); }
         }
         const bool lent = !wide && any_lent();
+        read_clock = 0;
+        // A narrow call's copied misses, by source.
+        const auto copied_from = [&](std::int32_t e) {
+            if (wide) { return; }
+            ++(layer.source.experts[std::size_t(e)].front().pinned ? delta.pinned_misses
+                                                                  : delta.file_misses);
+        };
         std::vector<std::int32_t> lent_taken;
         const auto cpu = !wide && layer.cpu && (request.flags & kCpuCall) ? cpu_share(li, needed, held)
                                                                           : std::vector<std::int32_t>{};
@@ -1637,6 +1749,7 @@ struct ExpertDelivery::Impl {
                     }
                     ++delta.admissions;
                     point_slot(li, e, slot);
+                    copied_from(e);
                     continue;
                 }
             }
@@ -1648,9 +1761,11 @@ struct ExpertDelivery::Impl {
                 }
                 lent_taken.push_back(l);
                 admit_lent(l, li, e, delta);
+                copied_from(e);
                 continue;
             }
             to_bank.push_back(e);
+            copied_from(e);
         }
         // The tier learns from decode and verification only; a call below the last narrow one
         // starts a pass (a draft layer's repeated calls do not). It learns once the call's copies
@@ -1664,7 +1779,8 @@ struct ExpertDelivery::Impl {
             for (int e = 0; e < experts; ++e) {
                 const auto count = call_count[std::size_t(e)];
                 if (!count) { continue; }
-                tier->route(li, e, float(count));
+                const bool file = layer.source.experts[std::size_t(e)].front().pinned == nullptr;
+                tier->route(li, e, float(count) * (file ? options.file_route_weight : 1.0F));
                 layer.total[std::size_t(e)] += count;
             }
         };
@@ -1678,18 +1794,19 @@ struct ExpertDelivery::Impl {
         call_wide = wide;
         if (!to_bank.empty()) { fill_bank(k, li, to_bank); }
         const bool timed = options.cpu.balance && !cpu.empty() && !pieces.empty();
-        const auto copied_before = delta.copied_bytes;
-
-        const auto issue = [&] {
+        // The split's sample times the pinned copies alone: a file read ahead of its copies would
+        // count as copy time, and the split would then hand the CPU more pinned experts than it
+        // computes in the copies' time.
+        std::uint64_t timed_bytes = 0;
+        const auto issue = [&](bool defer) {
             if (timed) { CUDA_CHECK(cudaEventRecord(copies_begun, copies)); }
-            flush_pieces(delta);
-            if (timed) { CUDA_CHECK(cudaEventRecord(copies_done, copies)); }
+            timed_bytes = flush_pieces(delta, timed ? copies_done : nullptr, defer);
             learn();
         };
         if (layer.cpu && host_flag) {
             compute_cpu(li, cpu, request.width, needed, delta, issue);
         } else {
-            issue();
+            issue(false);
         }
         if (ranges_dirty) {
             CUDA_CHECK(cudaMemcpyAsync(lent_ranges.p, host_ranges->data(), host_ranges->size(),
@@ -1698,13 +1815,24 @@ struct ExpertDelivery::Impl {
         }
         upload_tables();
         CUDA_CHECK(cudaStreamSynchronize(copies));
-        if (timed) {
+        if (timed && timed_bytes != 0) {
             float milliseconds = 0;
             CUDA_CHECK(cudaEventElapsedTime(&milliseconds, copies_begun, copies_done));
-            split.copied(double(delta.copied_bytes - copied_before) / 1e6, 1e3 * double(milliseconds));
+            split.copied(double(timed_bytes) / 1e6, 1e3 * double(milliseconds));
         }
         delta.service_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - started).count();
+        if (!wide) {
+            delta.narrow_requests   = 1;
+            delta.narrow_routes     = delta.routes;
+            delta.narrow_hits       = delta.hits;
+            delta.narrow_misses     = delta.misses;
+            delta.narrow_admissions = delta.admissions + delta.lent_admissions;
+            delta.narrow_seconds    = delta.service_seconds;
+            delta.file_bytes      = delta.read_bytes;
+            delta.file_calls      = delta.read_bytes != 0 ? 1 : 0;
+            delta.read_seconds    = read_clock;
+        }
         add(delta);
     }
 
@@ -1780,6 +1908,12 @@ struct ExpertDelivery::Impl {
         {
             std::lock_guard lock(mutex);
             if (!failure) { failure = std::current_exception(); }
+        }
+        {
+            // The reader may still be reading into the staging, from batch_reads.
+            std::unique_lock lock(reader_mutex);
+            reader_cv.wait(lock, [&] { return !reader_busy; });
+            reader_failure = nullptr;
         }
         batch_reads.clear();
         batch_copies.clear();

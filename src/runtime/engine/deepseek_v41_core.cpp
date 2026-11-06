@@ -33,12 +33,14 @@
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <mutex>
 #include <optional>
 #include <set>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
 #include <variant>
 
@@ -54,6 +56,12 @@ std::uint64_t elapsed_ns(Clock::time_point from, Clock::time_point to) {
 
 double seconds(Clock::time_point from, Clock::time_point to) {
     return std::chrono::duration<double>(to - from).count();
+}
+
+// NINFER_DS_DECODE_LOG=0 turns the 5 s "decode experts" line off (T1192).
+bool decode_log_wanted() {
+    const char* env = std::getenv("NINFER_DS_DECODE_LOG");
+    return env == nullptr || std::string_view(env) != "0";
 }
 
 // A DSpark round verifies the drafts while each one's confidence is at least this (Strata's
@@ -486,9 +494,12 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
                                : "copied to the GPU")
                         : ("split between copies and " + cpu + (hybrid.dma_share
                                ? " (fixed share)" : " (by measured speeds)")).c_str(),
-            executor.expert_profile ? (hybrid.routing_profile.empty() ? "from the built-in profile"
-                                                                      : "from --expert-profile")
-                                    : "by the first requests");
+            tier.bytes != 0 ? (executor.expert_profile
+                                   ? "by the first requests (the profile ranks the host tier only)"
+                                   : "by the first requests")
+            : executor.expert_profile ? (hybrid.routing_profile.empty() ? "from the built-in profile"
+                                                                        : "from --expert-profile")
+                                      : "by the first requests");
     }
     if (vision_budget != 0) {
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
@@ -697,6 +708,11 @@ struct DeepSeekV41Core::Impl {
     const std::uint32_t dspark_block; // --spec dspark: the drafter's block; 0 is off
     const float dspark_floor;         // the confidence a kept draft reaches
     const DiagnosticObserver diagnostics;
+    // log_decode_experts: whether it logs (NINFER_DS_DECODE_LOG=0 silences it), the delivery
+    // counters and the time of its last line.
+    bool decode_log = decode_log_wanted();
+    ExpertDeliveryStats decode_mark;
+    Clock::time_point decode_mark_at{};
     static constexpr TokenId kBos = 0; // <｜begin▁of▁sentence｜>
 
     mutable std::mutex queue_mutex;
@@ -1068,6 +1084,7 @@ struct DeepSeekV41Core::Impl {
                 admit();
                 worked = step();
                 check_progress();
+                if (any_active()) { log_decode_experts(false); }
             } catch (...) { fail_engine(std::current_exception()); }
             publish_stats();
             if (!worked) {
@@ -1661,6 +1678,7 @@ struct DeepSeekV41Core::Impl {
 
     void finish(const std::shared_ptr<Request>& request, FinishReason reason) {
         save_expert_profile();
+        log_decode_experts(true);
         Request& r = *request;
         GenerationResult result;
         result.prompt              = r.prompt_summary;
@@ -1969,6 +1987,47 @@ struct DeepSeekV41Core::Impl {
         }
         if (r.branch_results.size() < branches.size()) { return; }
         finish_prompt(request);
+    }
+
+    // Every 5 s while requests decode, and when one finishes (NINFER_DS_DECODE_LOG=0 silences it): the
+    // decode and verification calls' expert deliveries since the last line, so a run shows where
+    // decode waits. The device cache share counts each call's distinct experts; a miss is copied
+    // from pinned host memory, read from the files and copied, or computed on the CPU.
+    void log_decode_experts(bool finishing) {
+        if (!decode_log) { return; }
+        const auto now = Clock::now();
+        if (decode_mark_at == Clock::time_point{}) {
+            decode_mark_at = now;
+            decode_mark    = instance.executor->expert_stats();
+            return;
+        }
+        if (!finishing && now - decode_mark_at < std::chrono::seconds(5)) { return; }
+        const auto current = instance.executor->expert_stats();
+        const auto d       = current - decode_mark;
+        const double span  = seconds(decode_mark_at, now);
+        decode_mark        = current;
+        decode_mark_at     = now;
+        if (d.narrow_requests == 0) { return; }
+        const auto calls = double(d.narrow_requests);
+        publish_diagnostic(diagnostics, DiagnosticLevel::Info,
+                           "DeepSeek-V4.1 decode experts | %.1fs | %llu calls, %.2f ms serving "
+                           "each | experts routed %llu, device cache %.1f%% | misses %llu: %llu "
+                           "pinned host copies, %llu file reads in %llu calls (%.0f MiB, %.0f ms "
+                           "reading, %.0f ms waited after the CPU), %llu on the CPU (%.0f ms) | "
+                           "%llu cache admissions",
+                           span, static_cast<unsigned long long>(d.narrow_requests),
+                           1e3 * d.narrow_seconds / calls,
+                           static_cast<unsigned long long>(d.narrow_routes),
+                           d.narrow_routes ? 100.0 * double(d.narrow_hits) / double(d.narrow_routes)
+                                           : 0.0,
+                           static_cast<unsigned long long>(d.narrow_misses),
+                           static_cast<unsigned long long>(d.pinned_misses),
+                           static_cast<unsigned long long>(d.file_misses),
+                           static_cast<unsigned long long>(d.file_calls),
+                           double(d.file_bytes) / 1048576.0, 1e3 * d.read_seconds,
+                           1e3 * d.read_wait_seconds, static_cast<unsigned long long>(d.cpu_experts),
+                           1e3 * d.cpu_seconds,
+                           static_cast<unsigned long long>(d.narrow_admissions));
     }
 
     // The prompt is in (and a branched read's branches): the request takes its first token and

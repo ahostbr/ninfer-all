@@ -263,10 +263,19 @@ cache and its rounds):
   expert keeps the most routed ones there. A pinned expert is copied (or computed by the CPU
   share) exactly as a host expert is; a file expert is copied after a direct read, past the page
   cache, into the transfer buffers. The ranking is `--expert-profile`, else the built-in profile
-  where its geometry is the artifact's, else an even share of each block. A pack that keeps a
-  subset of the release's experts gets a profile from `tools/expert_profile_kept.py` (the
-  built-in counts at the pack's kept ids), which also prints the profile's route share per
-  budget. The startup log names the tier: experts kept, MiB, and that share.
+  where its geometry is the artifact's (the release's, and the Coder build's recorded one), else
+  an even share of each block. Another pack that keeps a subset of the release's experts can take a
+  profile from `tools/expert_profile_kept.py` (the built-in counts at the pack's kept ids), which
+  also prints the profile's route share per budget. The startup log names the tier: experts kept, MiB, and that share. With a tier the
+  profile ranks the tier only: the device cache starts empty and the first prompt fills it with
+  the experts it routes most, as without a profile (a cache the profile had filled would take
+  none of them). A call's file reads run on a reader thread while the CPU computes its share, the
+  CPU split times the pinned copies alone, and each route to a file expert counts four times in
+  the device cache's tier, so the cache keeps the file experts a conversation uses. Every 5 s of
+  decode (and at each request's end) the log prints a `DeepSeek-V4.1 decode experts` line: calls
+  and serving time, device cache share, and misses split into pinned copies, file reads (MiB,
+  read time, time waited after the CPU) and CPU products (`NINFER_DS_DECODE_LOG=0` silences
+  it).
 - **Layer banks and cache.** A prompt chunk's experts missing from the cache land in a whole-layer
   bank laid out like the resident bank; two banks let the next layer arrive while the current one
   computes. `--expert-cache-mib` (default: what is free after startup) holds the experts decode

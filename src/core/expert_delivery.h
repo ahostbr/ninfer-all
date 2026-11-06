@@ -83,6 +83,8 @@ struct ExpertCpuOptions {
     std::uint32_t threads = 0; // the CPU pool, the service thread included; 0: pool_cpu_count()
     // Only experts in pinned host memory go to the CPU; those in files are always copied (a file
     // read for the CPU costs what the copy's does, and delays the products).
+    // Whenever the CPU's experts need no file read, a call's file reads for its copies run on a
+    // reader thread while the CPU computes. The split (balance) times a call's pinned copies alone.
     bool pinned_only = false;
 };
 
@@ -99,6 +101,11 @@ struct ExpertDeliveryOptions {
     // calling thread. For a host tier (--expert-host-mib), whose pinned experts leave the page
     // cache little room for the rest.
     bool direct_reads = false;
+    // Each route of a narrow call to an expert in a file counts this many times in the expert
+    // tier (its counts and a miss's admission), so the device cache keeps the file experts a
+    // conversation routes before host ones: their miss waits for a read, a host expert's for a
+    // copy or the CPU. 1: every expert alike.
+    float file_route_weight = 1;
     // Whole-layer device windows that hold the experts the cache does not. Two let the next layer
     // of a wide call (a prompt chunk, a wide verification) arrive while the current one computes;
     // one halves their memory and gives that up. Two fall back to one when memory is short.
@@ -143,6 +150,14 @@ struct ExpertDeliveryStats {
     // Host-to-device expert bytes (misses and prefetches); device copies from a bank into the cache.
     std::uint64_t read_bytes = 0, copied_bytes = 0, promoted_bytes = 0;
     double service_seconds = 0;
+    // Narrow calls (decode, verification) alone: their count and service time; their routes,
+    // hits, misses and admissions as above; their copied misses by source (pinned host memory,
+    // the files) and the calls with any file read; the file bytes they read, the reads' wall time
+    // and the part the service thread waited for after the CPU's products; the products' time.
+    std::uint64_t narrow_requests = 0, narrow_routes = 0, narrow_hits = 0, narrow_misses = 0;
+    std::uint64_t narrow_admissions = 0, pinned_misses = 0, file_misses = 0, file_calls = 0;
+    std::uint64_t file_bytes = 0;
+    double narrow_seconds = 0, read_seconds = 0, read_wait_seconds = 0, cpu_seconds = 0;
 };
 // Counters accumulated after `start` (startup warm-up work excluded from request statistics).
 [[nodiscard]] inline ExpertDeliveryStats operator-(ExpertDeliveryStats now,
@@ -165,6 +180,19 @@ struct ExpertDeliveryStats {
     now.copied_bytes -= start.copied_bytes;
     now.promoted_bytes -= start.promoted_bytes;
     now.service_seconds -= start.service_seconds;
+    now.narrow_requests -= start.narrow_requests;
+    now.narrow_admissions -= start.narrow_admissions;
+    now.narrow_misses -= start.narrow_misses;
+    now.narrow_hits -= start.narrow_hits;
+    now.narrow_routes -= start.narrow_routes;
+    now.pinned_misses -= start.pinned_misses;
+    now.file_misses -= start.file_misses;
+    now.file_calls -= start.file_calls;
+    now.file_bytes -= start.file_bytes;
+    now.narrow_seconds -= start.narrow_seconds;
+    now.read_seconds -= start.read_seconds;
+    now.read_wait_seconds -= start.read_wait_seconds;
+    now.cpu_seconds -= start.cpu_seconds;
     return now;
 }
 // Sum over ranks.
@@ -188,6 +216,19 @@ struct ExpertDeliveryStats {
     a.copied_bytes += b.copied_bytes;
     a.promoted_bytes += b.promoted_bytes;
     a.service_seconds += b.service_seconds;
+    a.narrow_requests += b.narrow_requests;
+    a.narrow_admissions += b.narrow_admissions;
+    a.narrow_misses += b.narrow_misses;
+    a.narrow_hits += b.narrow_hits;
+    a.narrow_routes += b.narrow_routes;
+    a.pinned_misses += b.pinned_misses;
+    a.file_misses += b.file_misses;
+    a.file_calls += b.file_calls;
+    a.file_bytes += b.file_bytes;
+    a.narrow_seconds += b.narrow_seconds;
+    a.read_seconds += b.read_seconds;
+    a.read_wait_seconds += b.read_wait_seconds;
+    a.cpu_seconds += b.cpu_seconds;
     return a;
 }
 struct ExpertDeliveryMemory {

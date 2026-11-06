@@ -603,9 +603,12 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
                                : "copied to the GPU")
                         : ("split between copies and " + cpu + (hybrid.dma_share
                                ? " (fixed share)" : " (by measured speeds)")).c_str(),
-            executor.expert_profile ? (hybrid.routing_profile.empty() ? "from the built-in profile"
-                                                                      : "from --expert-profile")
-                                    : "by the first requests");
+            tier.bytes != 0 ? (executor.expert_profile
+                                   ? "by the first requests (the profile ranks the host tier only)"
+                                   : "by the first requests")
+            : executor.expert_profile ? (hybrid.routing_profile.empty() ? "from the built-in profile"
+                                                                        : "from --expert-profile")
+                                      : "by the first requests");
     }
     if (vision_budget != 0) {
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
@@ -825,6 +828,9 @@ struct DeepSeekV41Core::Impl {
     // 1 for its earlier rows (prompt_skip.h); 0: no skip. Whether to log each prompt's prefill.
     std::uint32_t skip_keep = 0;
     bool prefill_log        = true;
+    // log_decode_experts: the delivery counters and the time of its last line.
+    ExpertDeliveryStats decode_mark;
+    Clock::time_point decode_mark_at{};
     // T0833: the delivery experiments this Engine runs (all off for scoring and device experts), and
     // whether a settle is owed once the Engine idles (touched by the worker alone).
     models::deepseek_v41::DeliveryFlags flags;
@@ -1211,6 +1217,7 @@ struct DeepSeekV41Core::Impl {
                 admit();
                 worked = step();
                 check_progress();
+                if (any_active()) { log_decode_experts(false); }
                 if (worked && flags.cache_settle && flags.settle_idle_ms != 0) { idle_settle_due = true; }
             } catch (...) { fail_engine(std::current_exception()); }
             publish_stats();
@@ -1793,6 +1800,7 @@ struct DeepSeekV41Core::Impl {
 
     void finish(const std::shared_ptr<Request>& request, FinishReason reason) {
         save_expert_profile();
+        log_decode_experts(true);
         Request& r = *request;
         GenerationResult result;
         result.prompt              = r.prompt_summary;
@@ -2144,6 +2152,47 @@ struct DeepSeekV41Core::Impl {
                            static_cast<unsigned long long>(experts.requests),
                            short_prompt(r) ? "; short prompt, rows of 8 through the narrow expert path"
                                            : "");
+    }
+
+    // Every 5 s while requests decode, and when one finishes (with the prefill line's switch): the
+    // decode and verification calls' expert deliveries since the last line, so a run shows where
+    // decode waits. The device cache share counts each call's distinct experts; a miss is copied
+    // from pinned host memory, read from the files and copied, or computed on the CPU.
+    void log_decode_experts(bool finishing) {
+        if (!prefill_log) { return; }
+        const auto now = Clock::now();
+        if (decode_mark_at == Clock::time_point{}) {
+            decode_mark_at = now;
+            decode_mark    = instance.executor->expert_stats();
+            return;
+        }
+        if (!finishing && now - decode_mark_at < std::chrono::seconds(5)) { return; }
+        const auto current = instance.executor->expert_stats();
+        const auto d       = current - decode_mark;
+        const double span  = seconds(decode_mark_at, now);
+        decode_mark        = current;
+        decode_mark_at     = now;
+        if (d.narrow_requests == 0) { return; }
+        const auto calls = double(d.narrow_requests);
+        publish_diagnostic(diagnostics, DiagnosticLevel::Info,
+                           "DeepSeek-V4.1 decode experts | %.1fs | %llu calls, %.2f ms serving "
+                           "each | experts routed %llu, device cache %.1f%% | misses %llu: %llu "
+                           "pinned host copies, %llu file reads in %llu calls (%.0f MiB, %.0f ms "
+                           "reading, %.0f ms waited after the CPU), %llu on the CPU (%.0f ms) | "
+                           "%llu cache admissions",
+                           span, static_cast<unsigned long long>(d.narrow_requests),
+                           1e3 * d.narrow_seconds / calls,
+                           static_cast<unsigned long long>(d.narrow_routes),
+                           d.narrow_routes ? 100.0 * double(d.narrow_hits) / double(d.narrow_routes)
+                                           : 0.0,
+                           static_cast<unsigned long long>(d.narrow_misses),
+                           static_cast<unsigned long long>(d.pinned_misses),
+                           static_cast<unsigned long long>(d.file_misses),
+                           static_cast<unsigned long long>(d.file_calls),
+                           double(d.file_bytes) / 1048576.0, 1e3 * d.read_seconds,
+                           1e3 * d.read_wait_seconds, static_cast<unsigned long long>(d.cpu_experts),
+                           1e3 * d.cpu_seconds,
+                           static_cast<unsigned long long>(d.narrow_admissions));
     }
 
     // Cache settle (T0833): rounds of the expert tier now, the compute stream idle. `cancel` is

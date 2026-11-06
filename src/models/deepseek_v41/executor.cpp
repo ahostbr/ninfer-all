@@ -940,6 +940,10 @@ struct Executor::Impl {
                  ? dma_share < 1
                  : model.expert_residency() == ExpertResidency::Host || host_tier);
         transport.direct_reads = host_tier;
+        // A file expert's miss waits for its read (about 2 ms for 8 MiB), a host one's for a copy
+        // (about 0.35 ms) or the CPU beside the copies: the device cache prefers the file experts
+        // a conversation routes. 4 is a guess between those, not a measurement.
+        transport.file_route_weight = host_tier ? 4.0F : 1.0F;
         if (computes && cpu_share) {
             cpu_experts = std::make_unique<CpuExperts>(std::move(cpu_layers), hidden, width,
                 int(config.top_k_experts), config.swiglu_limit);
@@ -976,6 +980,10 @@ struct Executor::Impl {
                 rank, model.expert_files(), delivery_sources(begin, end), peer);
         }
     }
+
+    // Whether the routing profile fills the device cache at startup: not with a host tier
+    // (--expert-host-mib), where it ranks the tier.
+    [[nodiscard]] bool seeds_cache() const { return model.expert_host_tier().bytes == 0; }
 
     // A rank's slice [first, last) of a routing profile ([layer][expert]).
     [[nodiscard]] std::optional<ExpertRouteCounts> profile_slice(std::uint32_t first,
@@ -3141,9 +3149,15 @@ struct Executor::Impl {
             }
         }
         if (delivery) {
+            // With a host tier the profile ranks the tier only; the device cache starts empty and
+            // the first prompt fills it with the experts it routes most (post(): a wide call
+            // promotes into free slots only, so a profile-filled cache would take none of them).
             const auto first =
-                profile_slice(expert_ranges.empty() ? 0 : expert_ranges[0].first,
-                              expert_ranges.empty() ? config.num_experts : expert_ranges[0].second);
+                seeds_cache()
+                    ? profile_slice(expert_ranges.empty() ? 0 : expert_ranges[0].first,
+                                    expert_ranges.empty() ? config.num_experts
+                                                          : expert_ranges[0].second)
+                    : std::nullopt;
             delivery->drain();
             delivery->prime(first ? &*first : nullptr);
             for (std::size_t r = 1; r < expert_peers.size(); ++r) {

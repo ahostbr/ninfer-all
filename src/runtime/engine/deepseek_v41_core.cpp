@@ -239,6 +239,7 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
         }
         engram = std::move(source.layout);
     }
+    inspect.complete();
     // The routing profile ranks the experts the load keeps in host memory (--expert-host-mib) and
     // fills the device expert cache: --expert-profile, else the family's built-in one where its
     // geometry is this artifact's.

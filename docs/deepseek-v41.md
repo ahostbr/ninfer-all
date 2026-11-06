@@ -268,6 +268,16 @@ cache and its rounds):
   Whatever the page cache holds is read at memory speed, the rest at the storage's.
   `--expert-mirror` spreads these reads over a second drive and `--expert-direct` lets the drive
   write them into device memory ([disk expert reads](expert-disk-reads.md)).
+- **Disk with a host tier.** `--expert-residency disk --expert-host-mib N` keeps up to N MiB of
+  the experts the routing profile ranks highest (over every block) in pinned host memory, read
+  once at startup with direct I/O, and leaves the rest in the files: a host that cannot pin every
+  expert keeps the most routed ones there. A pinned expert is copied (or computed by the CPU
+  share) exactly as a host expert is; a file expert is read through the page cache into the
+  transfer buffers and copied (fork port of 2026-11-14: the tier's direct reads were dropped). The ranking is `--expert-profile`, else the built-in profile
+  where its geometry is the artifact's, else an even share of each block. A pack that keeps a
+  subset of the release's experts gets a profile from `tools/expert_profile_kept.py` (the
+  built-in counts at the pack's kept ids), which also prints the profile's route share per
+  budget. The startup log names the tier: experts kept, MiB, and that share.
 - **Layer banks and cache.** A prompt chunk's experts missing from the cache land in a whole-layer
   bank laid out like the resident bank; two banks let the next layer arrive while the current one
   computes. `--expert-cache-mib` (default: what is free after startup) holds the experts decode

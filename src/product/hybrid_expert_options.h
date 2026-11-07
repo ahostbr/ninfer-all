@@ -93,11 +93,13 @@ bool parse_hybrid_expert_option(std::string_view option, HybridExpertOptions& ou
     } else if (option == "--expert-cache-adaptive") {
         out.adaptive_cache = true;
     } else if (option == "--expert-host-mib") {
-        const auto mib = parse_count(std::string(value()));
-        if (!mib || *mib > (1u << 24)) {
+        const std::string text(value());
+        std::uint32_t mib = 0;
+        const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), mib);
+        if (error != std::errc{} || end != text.data() + text.size() || mib > (1u << 24)) {
             throw std::invalid_argument("--expert-host-mib takes MiB in 0..16777216");
         }
-        out.expert_host_bytes = std::uint64_t(*mib) << 20;
+        out.expert_host_bytes = std::uint64_t(mib) << 20;
     } else if (option == "--expert-profile" || option == "--expert-profile-out") {
         const std::string path(value());
         if (path.empty()) { throw std::invalid_argument(std::string(option) + " takes a file path"); }

@@ -577,6 +577,13 @@ def _companions(model, recipe, sources) -> None:
                     source=source,
                 )
         elif name.startswith(("dflash/", "dflash2/")) and parameter.projection:
+            dspine = name.startswith("dflash/") and "dspine" in model.components["dflash"][
+                "config"
+            ].get("dflash_config", {})
+            if dspine and (name.startswith("dflash/dspine/") or name.endswith("/attention/output")):
+                # BF16, as official_recipes keeps them: the DSpine bridge's exact rounding, and an
+                # o_proj (5120x4096) no linear_add registers.
+                continue
             if name.endswith(
                 (
                     "/attention_conv/kernel_projection",

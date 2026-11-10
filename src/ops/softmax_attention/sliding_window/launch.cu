@@ -51,7 +51,7 @@ void dispatch_tokens(std::int32_t tokens, Launch&& launch) {
 SlidingWindowAttentionPlan
 sliding_window_attention_resolve_plan(std::uint32_t window, std::int32_t tokens, std::int32_t batch,
                                       SlidingWindowAttentionExecutionEnvelope envelope) {
-    if (window != 2048 && window != 4096) {
+    if (window != 2048 && window != 4096 && window != 8192) {
         throw std::invalid_argument("sliding_window_attention plan: unsupported window");
     }
     if (tokens < 1 || tokens > 16 || batch < 1 || batch > 8) {
@@ -113,9 +113,9 @@ void sliding_window_attention_launch(const Tensor& q, const Tensor& query_k, con
                                      const CyclicKVCacheLayerView& context,
                                      const SlidingWindowAttentionPlan& plan, Tensor& partial_acc,
                                      Tensor& partial_m, Tensor& partial_l, Tensor& out,
-                                     cudaStream_t stream) {
+                                     cudaStream_t stream, bool causal_block) {
     const bool direct = plan.route == SlidingWindowAttentionRoute::Direct;
-    if ((plan.window != 2048 && plan.window != 4096) ||
+    if ((plan.window != 2048 && plan.window != 4096 && plan.window != 8192) ||
         context.capacity != static_cast<std::uint32_t>(plan.window) ||
         plan.key_block != 32 || plan.reduce_warps != (plan.window == 2048 ? 4 : 1) ||
         plan.split_capacity < 1 || plan.split_capacity > kSlidingWindowMaxSplits ||
@@ -143,7 +143,8 @@ void sliding_window_attention_launch(const Tensor& q, const Tensor& query_k, con
                 static_cast<const __nv_bfloat16*>(context.v.data),
                 static_cast<int>(context.padded_capacity), plan.window - 1, plan.max_context, 1,
                 scale, static_cast<float*>(partial_acc.data), static_cast<float*>(partial_m.data),
-                static_cast<float*>(partial_l.data), static_cast<__nv_bfloat16*>(out.data)));
+                static_cast<float*>(partial_l.data), static_cast<__nv_bfloat16*>(out.data),
+                causal_block ? 1 : 0));
             CUDA_CHECK(cudaGetLastError());
         };
         if (direct) {
@@ -166,7 +167,7 @@ void sliding_window_attention_launch(const Tensor& q, const Tensor& query_k, con
             static_cast<int>(context.padded_capacity), plan.window - 1, plan.max_context,
             plan.split_capacity, scale, static_cast<float*>(partial_acc.data),
             static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
-            static_cast<__nv_bfloat16*>(out.data)));
+            static_cast<__nv_bfloat16*>(out.data), causal_block ? 1 : 0));
         CUDA_CHECK(cudaGetLastError());
 
         // Honour plan.reduce_warps rather than hardcoding one warp. The planner sets four for

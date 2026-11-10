@@ -18,7 +18,9 @@ constexpr std::int32_t kQHeads  = 32;
 constexpr std::int32_t kKVHeads = 8;
 constexpr float kExpectedScale  = 0.08838834764831844055f;
 
-bool registered_window(std::uint32_t window) { return window == 2048 || window == 4096; }
+bool registered_window(std::uint32_t window) {
+    return window == 2048 || window == 4096 || window == 8192;
+}
 
 void require_profile(AttentionHeadGeometry geometry, std::uint32_t window, const char* op) {
     if (!valid_attention_head_geometry(geometry) || geometry.head_dim != kHeadDim ||
@@ -26,7 +28,7 @@ void require_profile(AttentionHeadGeometry geometry, std::uint32_t window, const
         throw std::invalid_argument(std::string(op) + ": unsupported head geometry");
     }
     if (!registered_window(window)) {
-        throw std::invalid_argument(std::string(op) + ": supported windows are 2048 and 4096");
+        throw std::invalid_argument(std::string(op) + ": supported windows are 2048, 4096 and 8192");
     }
 }
 
@@ -116,7 +118,8 @@ void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tens
                               std::uint32_t window, float scale,
                               const CyclicKVCacheLayerView& context,
                               SlidingWindowAttentionExecutionEnvelope envelope,
-                              WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
+                              WorkspaceArena& workspace, Tensor& out, cudaStream_t stream,
+                              bool causal_block) {
     constexpr const char* op = "sliding_window_attention";
     require_profile(geometry, window, op);
     if (q.dtype != DType::BF16 || query_k.dtype != DType::BF16 || query_v.dtype != DType::BF16 ||
@@ -169,7 +172,7 @@ void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tens
     }
     detail::sliding_window_attention_launch(q, query_k, query_v, positions, valid_columns, lanes,
                                             scale, context, plan, partial.acc, partial.m, partial.l,
-                                            out, stream);
+                                            out, stream, causal_block);
 }
 
 } // namespace ninfer::ops

@@ -1,6 +1,8 @@
 #include "models/qwen3_5/program/structured_round.h"
 #include "models/qwen3_5/program/graph_execution.h"
 #include "models/qwen3_5/execution/linear.h"
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/context.h"
@@ -22,6 +24,7 @@
 #include "ninfer/ops/linear_pair.h"
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/prepare_masked_block.h"
+#include "ninfer/ops/dspine.h"
 #include "ninfer/ops/prepare_ragged_prefix.h"
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/rope.h"
@@ -389,6 +392,100 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
     }
 }
 
+// DSpine (Tencent): bridge weights as op arguments, and its serial-refinement tables. TG/TSV are
+// built once per device outside any graph capture (dflash_decode_batch / capture entry points) and
+// live for the process: [R, V] BF16 each, about 0.76 GB together at R 512, V 248320.
+ops::dspine::BridgeWeights dspine_bridge_weights(const ExecutionCore& execution) {
+    const auto& config = *execution.parameters.model.config().draft;
+    const auto& b      = *execution.parameters.draft->bridge;
+    const auto& d      = *config.dspine;
+    return {b.codebook.data,
+            b.read_weight.data,
+            b.early_read_weights.data,
+            b.feature_write_weights.data,
+            b.gate_weight.data,
+            b.gate_bias.data,
+            b.predecessor_gate_weight.data,
+            b.prev_weight.data,
+            static_cast<std::int32_t>(execution.parameters.model.config().text.hidden_size),
+            static_cast<std::int32_t>(d.code_size),
+            static_cast<std::int32_t>(d.rank),
+            static_cast<std::int32_t>(execution.parameters.model.config().text.vocab_size),
+            static_cast<std::int32_t>(config.num_hidden_layers),
+            d.bridge_eps};
+}
+
+struct DSpineTables {
+    Tensor tg, tsv_gate, tsv_value;
+};
+
+DSpineTables& dspine_tables_for_device() {
+    static std::array<DSpineTables, 16> tables{};
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    return tables.at(static_cast<std::size_t>(device));
+}
+
+void ensure_dspine_tables(ExecutionCore& execution) {
+    const auto& draft = execution.parameters.model.config().draft;
+    if (!draft || !draft->dspine) { return; }
+    auto& t = dspine_tables_for_device();
+    if (t.tg.data != nullptr) { return; }
+    const auto w      = dspine_bridge_weights(execution);
+    const auto stream = execution.device.stream;
+    const auto bytes  = static_cast<std::size_t>(w.rank) * w.vocab * sizeof(std::uint16_t);
+    void* tg          = nullptr;
+    void* tsg         = nullptr;
+    void* tsv         = nullptr;
+    CUDA_CHECK(cudaMalloc(&tg, bytes));
+    CUDA_CHECK(cudaMalloc(&tsg, bytes));
+    CUDA_CHECK(cudaMalloc(&tsv, bytes));
+    DSpineTables built{Tensor(tg, DType::BF16, {w.rank, w.vocab}),
+                       Tensor(tsg, DType::BF16, {w.rank, w.vocab}),
+                       Tensor(tsv, DType::BF16, {w.rank, w.vocab})};
+    ops::dspine::build_tsv(w, built.tsv_gate, built.tsv_value, stream);
+    // TG^T = head . (norm * W_last), projected 16 columns at a time so the decode-sized workspace
+    // fits, then transposed into the rank-major table.
+    const auto& head   = execution.parameters.draft->output_head;
+    const DType ldtype = target_logits_dtype(head);
+    constexpr std::int32_t kChunk = 16;
+    void* staging     = nullptr;
+    void* input_bytes = nullptr;
+    void* chunk_bytes = nullptr;
+    CUDA_CHECK(
+        cudaMalloc(&staging, static_cast<std::size_t>(w.vocab) * kChunk * dtype_size(ldtype)));
+    CUDA_CHECK(cudaMalloc(&input_bytes,
+                          static_cast<std::size_t>(w.hidden) * w.rank * sizeof(std::uint16_t)));
+    CUDA_CHECK(cudaMalloc(&chunk_bytes,
+                          static_cast<std::size_t>(w.vocab) * kChunk * sizeof(std::uint16_t)));
+    Tensor input(input_bytes, DType::BF16, {w.hidden, w.rank});
+    ops::dspine::tg_input(w, execution.parameters.draft->final_norm, input, stream);
+    for (std::int32_t r0 = 0; r0 < w.rank; r0 += kChunk) {
+        const std::int32_t n = std::min(kChunk, w.rank - r0);
+        execution.work.reset();
+        Tensor columns(static_cast<std::uint16_t*>(input_bytes) +
+                           static_cast<std::size_t>(w.hidden) * r0,
+                       DType::BF16, {w.hidden, n});
+        Tensor out(staging, ldtype, {w.vocab, n});
+        project(columns, head, out, execution.work, stream);
+        Tensor chunk(chunk_bytes, DType::BF16, {n, w.vocab});
+        ops::dspine::transpose_to_rank_major(out, chunk, stream);
+        // chunk is [n, V] rank-fastest; scatter into rows r0..r0+n of the [R, V] table.
+        CUDA_CHECK(cudaMemcpy2DAsync(static_cast<std::uint16_t*>(tg) + r0,
+                                     static_cast<std::size_t>(w.rank) * sizeof(std::uint16_t),
+                                     chunk_bytes, static_cast<std::size_t>(n) * sizeof(std::uint16_t),
+                                     static_cast<std::size_t>(n) * sizeof(std::uint16_t),
+                                     static_cast<std::size_t>(w.vocab), cudaMemcpyDeviceToDevice,
+                                     stream));
+    }
+    execution.work.reset();
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaFree(staging));
+    CUDA_CHECK(cudaFree(input_bytes));
+    CUDA_CHECK(cudaFree(chunk_bytes));
+    t = built;
+}
+
 void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& frame,
                         std::int32_t batch_size, std::uint32_t k, DFlashEnvelopes envelopes) {
     if (state.execution.parameters.model.config().draft->dflash2) {
@@ -417,6 +514,15 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                                   state.execution.device.stream);
         Tensor residual =
             state.execution.work.alloc(DType::BF16, {dimension(target.hidden_size), columns});
+        const bool dspine = config.dspine.has_value();
+        ops::dspine::BridgeStash stash;
+        if (dspine) {
+            stash.raw = state.execution.work.alloc(DType::BF16,
+                                                   {dimension(target.hidden_size), columns});
+            stash.rms = state.execution.work.alloc(DType::FP32, {columns});
+            stash.q   = state.execution.work.alloc(
+                DType::BF16, {static_cast<std::int32_t>(config.dspine->rank), columns});
+        }
         embed_tokens(ids.view({columns}), state.execution.parameters.text.token_embedding,
                      state.execution.parameters.text.token_embedding_signs, residual,
                      state.execution.device.stream);
@@ -485,8 +591,11 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                         static_cast<float>(1.0 / std::sqrt(double(config.attention.head_dim))),
                         dflash_state(state).local_layer(config.compact_layer_index(layer)),
                         envelopes.local, state.execution.work, attention_batch,
-                        state.execution.device.stream);
+                        state.execution.device.stream, dspine);
                 } else {
+                    if (dspine) {
+                        throw std::logic_error("DSpine drafts have sliding-window layers only");
+                    }
                     ops::context_softmax_attention(
                         query_batch, key_batch, value_batch, frontiers, valid_columns, full_rows,
                         {dimension(config.attention.head_dim),
@@ -513,6 +622,13 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                 project_add(roots.intermediate, weight.mlp.down, residual, state.execution.work,
                             state.execution.device.stream);
             }
+            if (dspine) {
+                const auto bridge = dspine_bridge_weights(state.execution);
+                ops::dspine::bridge_write(
+                    residual, ids.view({columns}), width, batch_size, bridge, layer,
+                    layer + 1 == dimension(config.num_hidden_layers) ? &stash : nullptr,
+                    state.execution.work, state.execution.device.stream);
+            }
         }
 
         Tensor packed =
@@ -535,7 +651,48 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
         ops::rmsnorm(packed, state.execution.parameters.draft->final_norm, config.rms_norm_eps,
                      false, proposal_hidden, state.execution.device.stream);
         Tensor flat_drafts = drafts.view({static_cast<std::int32_t>(k) * batch_size});
-        if (state.execution.proposal_head == ProposalHead::Full) {
+        if (dspine) {
+            const auto& d           = *config.dspine;
+            const std::int32_t rows = static_cast<std::int32_t>(k) * batch_size;
+            const auto& head        = state.execution.parameters.draft->output_head;
+            const auto& tables      = dspine_tables_for_device();
+            if (tables.tg.data == nullptr) {
+                throw std::logic_error("DSpine tables were not built before the proposal");
+            }
+            // The last layer's pre-write raw rows 1..k, packed like `packed` above, times the
+            // final norm: the refinement's base scores read the head at that input.
+            Tensor raw_packed =
+                state.execution.work.alloc(DType::BF16, {dimension(target.hidden_size), rows});
+            const auto* raw_source = static_cast<const std::byte*>(stash.raw.data) +
+                                     static_cast<std::size_t>(dimension(target.hidden_size)) *
+                                         element_bytes;
+            CUDA_CHECK(cudaMemcpy2DAsync(raw_packed.data, row_bytes, raw_source, source_pitch,
+                                         row_bytes, static_cast<std::size_t>(batch_size),
+                                         cudaMemcpyDeviceToDevice, state.execution.device.stream));
+            Tensor raw_scaled =
+                state.execution.work.alloc(DType::BF16, {dimension(target.hidden_size), rows});
+            ops::dspine::scale_by_norm(raw_packed, state.execution.parameters.draft->final_norm,
+                                       raw_scaled, state.execution.device.stream);
+            const DType ldtype = target_logits_dtype(head);
+            Tensor logits =
+                state.execution.work.alloc(ldtype, {dimension(target.vocab_size), rows});
+            project(proposal_hidden, head, logits, state.execution.work,
+                    state.execution.device.stream);
+            Tensor candidates = state.execution.work.alloc(
+                DType::I32, {static_cast<std::int32_t>(d.head_topk), rows});
+            ops::dspine::topk_columns(
+                logits,
+                dimension(state.execution.parameters.model.resources().public_token_count),
+                static_cast<std::int32_t>(d.head_topk), candidates, state.execution.device.stream);
+            Tensor base = state.execution.work.alloc(ldtype, {dimension(target.vocab_size), rows});
+            project(raw_scaled, head, base, state.execution.work, state.execution.device.stream);
+            ops::dspine::refine_greedy(candidates, base, stash, ids.view({columns}), width,
+                                       batch_size, tables.tg, tables.tsv_gate, tables.tsv_value,
+                                       state.execution.parameters.draft->bridge->gate_bias.data,
+                                       static_cast<std::int32_t>(d.rank),
+                                       static_cast<std::int32_t>(d.head_topk), flat_drafts,
+                                       state.execution.device.stream);
+        } else if (state.execution.proposal_head == ProposalHead::Full) {
             Tensor logits = state.execution.work.alloc(
                 DType::BF16,
                 {dimension(target.vocab_size), static_cast<std::int32_t>(k) * batch_size});
@@ -745,6 +902,7 @@ void capture_dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_s
                                  std::uint32_t k, DFlashEnvelopes envelopes,
                                  ops::CausalAttentionExecutionEnvelope target_envelope,
                                  DecodeGraphDefinition& definition) {
+    ensure_dspine_tables(state.execution);
     auto body = dflash_decode_batch_body(state, batch_size, k, envelopes, target_envelope);
     capture_graph(state, definition, body);
 }
@@ -753,6 +911,7 @@ void dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size, std
                          DFlashEnvelopes envelopes,
                          ops::CausalAttentionExecutionEnvelope target_envelope,
                          DecodeGraphExecutable* executable) {
+    ensure_dspine_tables(state.execution);
     auto body = dflash_decode_batch_body(state, batch_size, k, envelopes, target_envelope);
     run_prepared(state, executable, body);
 }

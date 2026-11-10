@@ -11,6 +11,12 @@ struct SlidingWindowAttentionPolicy {
     const std::int32_t* positions;
     int padded_context;
     int window_mask;
+    // DSpine: a live query column sees the block's own temporary keys at or before it only.
+    bool causal_block = false;
+
+    __device__ __forceinline__ bool allow_query(int token, int key) const {
+        return !causal_block || key <= token;
+    }
 
     __device__ __forceinline__ int context_count(int value) const { return min(value, window_mask); }
 
@@ -43,7 +49,7 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
         const __nv_bfloat16* __restrict__ context_k, const __nv_bfloat16* __restrict__ context_v,
         int padded_context, int window_mask, int max_context, int split_capacity, float scale,
         float* __restrict__ partial_acc, float* __restrict__ partial_m,
-        float* __restrict__ partial_l, __nv_bfloat16* __restrict__ out) {
+        float* __restrict__ partial_l, __nv_bfloat16* __restrict__ out, int causal_block) {
     pdl::enter_streaming();
     const int batch = static_cast<int>(blockIdx.z);
     const std::int64_t lane_elements =
@@ -55,6 +61,7 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
         .positions      = batch_positions,
         .padded_context = padded_context,
         .window_mask = window_mask,
+        .causal_block   = causal_block != 0,
     };
     context_query_split_partial_body<SlidingWindowAttentionPolicy, Tokens, WarpsPerCta,
                                      KeyBlock, DirectOutput>(

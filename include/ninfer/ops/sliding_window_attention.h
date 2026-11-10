@@ -19,7 +19,8 @@ struct SlidingWindowAttentionExecutionEnvelope {
 };
 
 /**
- * Symmetric non-causal sliding-window grouped-query attention.
+ * Symmetric non-causal sliding-window grouped-query attention (causal_block: a live query column
+ * sees only the temporary query keys at or before it, as a DSpine draft block requires).
  *
  * The registered profiles are D=128, Hq=32, Hkv=8 (group 4), window/cyclic capacity 2048 or
  * 4096, scale=1/sqrt(128), T=1..16, and B=1..8. q/out are contiguous BF16 [128,32,T,B],
@@ -54,7 +55,8 @@ void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tens
                               std::uint32_t window, float scale,
                               const CyclicKVCacheLayerView& context,
                               SlidingWindowAttentionExecutionEnvelope envelope,
-                              WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
+                              WorkspaceArena& workspace, Tensor& out, cudaStream_t stream,
+                              bool causal_block = false);
 
 /**
  * Return transient capacity for every T in the inclusive optimized interval at the exact batch

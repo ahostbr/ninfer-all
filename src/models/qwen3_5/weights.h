@@ -206,10 +206,17 @@ struct SelectorWeights {
     WeightId hidden_projection, predecessor_codebook, successor_codebook;
 };
 
+// DSpine code bridge, BF16 as converted (`dflash/dspine/*`).
+struct DSpineBridgeWeights {
+    WeightId codebook, read_weight, early_read_weights, feature_write_weights;
+    WeightId gate_weight, gate_bias, predecessor_gate_weight, prev_weight;
+};
+
 struct DraftWeights {
     WeightId feature_projection, context_norm, final_norm;
     std::vector<DraftBlockWeights> layers;
     std::optional<SelectorWeights> selector;
+    std::optional<DSpineBridgeWeights> bridge;
     WeightId token_embedding, output_head;
     WeightUseId output_head_use;
 };

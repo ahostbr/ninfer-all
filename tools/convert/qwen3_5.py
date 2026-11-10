@@ -178,8 +178,10 @@ def draft_config(raw: dict, target: dict, backend: str) -> dict:
     _fixed(raw, "model_type", "qwen3", backend)
     _fixed(raw, "hidden_act", "silu", backend)
     _fixed(raw, "attention_bias", False, backend)
-    # DSpine drafts are block-causal (dflash_config.draft_block_causal); DFlash and DFlash2 are not.
-    _fixed(raw, "is_causal", backend == "dspine", backend)
+    # A DSpine draft (Tencent; DFlash layers plus a code bridge) is converted as the dflash
+    # component: it is block-causal, which plain DFlash and DFlash2 are not.
+    dspine = backend == "dflash" and "selected_prefix_code_bridge" in raw.get("dflash_config", {})
+    _fixed(raw, "is_causal", dspine, backend)
     for key, value in (
         ("hidden_size", target["hidden_size"]),
         ("vocab_size", target["vocab_size"]),
@@ -271,8 +273,8 @@ def draft_config(raw: dict, target: dict, backend: str) -> dict:
                 _fixed(scope, key, expected, backend)
             if scope.get("final_logit_softcapping") not in (None, 0, 0.0):
                 raise ValueError("DFlash2 final_logit_softcapping must be disabled")
-    if backend == "dspine":
-        output.update(_dspine_extra(raw, draft, result["num_hidden_layers"]))
+    if dspine:
+        output["dspine"] = _dspine_extra(raw, draft, result["num_hidden_layers"])
     result["dflash_config"] = output
     return result
 
@@ -913,15 +915,15 @@ class _Builder:
                     "candidate_selector." + role,
                     (target["vocab_size"], rank),
                 )
-        if backend == "dspine":
-            self.dspine_bridge(store, config, target)
+        if "dspine" in draft:
+            self.dspine_bridge(store, config, target, backend)
 
-    def dspine_bridge(self, store, config, target):
+    def dspine_bridge(self, store, config, target, backend):
         """The code bridge stays BF16 (dspine_mlx quantize_draft keeps it unquantized: the
         refinement tail depends on its exact rounding). The zero terminal projection and the
         version scalars are checked by the loader of the source, not stored."""
         h, v, n = target["hidden_size"], target["vocab_size"], config["num_hidden_layers"]
-        extra = config["dflash_config"]
+        extra = config["dflash_config"]["dspine"]
         c, r = extra["code_size"], extra["rank"]
         src = "selected_prefix_bridge."
         for name, field, shape in (
@@ -934,7 +936,7 @@ class _Builder:
             ("predecessor_gate_weight", "predecessor_gate.weight", (r, c)),
             ("prev_weight", "prev.weight", (r, c)),
         ):
-            self.add("dspine/bridge/" + name, store, src + field, shape)
+            self.add(backend + "/dspine/" + name, store, src + field, shape)
 
 
 def build_model(
@@ -951,7 +953,6 @@ def build_model(
         "mtp",
         "dflash",
         "dflash2",
-        "dspine",
     }:
         raise ValueError("select text and supported optional components")
     companions = {} if companions is None else companions
@@ -965,7 +966,7 @@ def build_model(
     if "mtp" in selected:
         architecture = "Qwen3_5MoeMTP" if "num_experts" in config else "Qwen3_5MTP"
         records["mtp"] = {"config": {"architectures": [architecture]}, "target": "text"}
-    for backend in ("dflash", "dflash2", "dspine"):
+    for backend in ("dflash", "dflash2"):
         if backend in selected:
             if backend not in companions:
                 raise ValueError(f"selected {backend} requires its source")
@@ -996,7 +997,7 @@ def build_model(
         else "lm_head.weight"
     )
     head_inputs = ("text/final_hidden",) + tuple(
-        c + "/final_hidden" for c in ("mtp", "dflash", "dflash2", "dspine") if c in selected
+        c + "/final_hidden" for c in ("mtp", "dflash", "dflash2") if c in selected
     )
     builder.add("text/output_head", base, head_source, (r, h), inputs=head_inputs)
     builder.add("text/final_norm", base, text_prefix + "norm.weight", (h,))
@@ -1022,7 +1023,7 @@ def build_model(
         builder.block("mtp/layers/0/", "mtp.layers.0.", head, config, "full_attention")
     if "vision" in selected:
         builder.vision(base, records["vision"]["config"], h)
-    for backend in ("dflash", "dflash2", "dspine"):
+    for backend in ("dflash", "dflash2"):
         if backend in selected:
             if (
                 backend == "dflash2"

@@ -39,8 +39,8 @@ def _optional(model, recipe, *, method=grouped_absmax):
             else:
                 format = Q5
             _assign(recipe, name, format, method=method)
-        elif name.startswith(("mtp/", "dflash/", "dflash2/", "dspine/")):
-            if name.startswith("dspine/bridge/"):
+        elif name.startswith(("mtp/", "dflash/", "dflash2/")):
+            if name.startswith("dflash/dspine/"):
                 continue  # BF16: the DSpine refinement depends on its exact rounding
             if name.endswith(
                 (
@@ -53,7 +53,7 @@ def _optional(model, recipe, *, method=grouped_absmax):
             ):
                 continue
             _assign(recipe, name, Q8, method=method)
-    for backend in ("dflash", "dflash2", "dspine"):
+    for backend in ("dflash", "dflash2"):
         if backend not in model.components:
             continue
         layers = model.components[backend]["config"]["num_hidden_layers"]

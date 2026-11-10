@@ -670,6 +670,14 @@ public:
                                               tensor(w.selector->predecessor_codebook),
                                               tensor(w.selector->successor_codebook)};
         }
+        if (w.bridge) {
+            const auto& b = *w.bridge;
+            out.bridge    = DSpineBridgeParameters{
+                tensor(b.codebook),        tensor(b.read_weight),
+                tensor(b.early_read_weights), tensor(b.feature_write_weights),
+                tensor(b.gate_weight),     tensor(b.gate_bias),
+                tensor(b.predecessor_gate_weight), tensor(b.prev_weight)};
+        }
         return out;
     }
 

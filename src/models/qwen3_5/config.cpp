@@ -253,7 +253,7 @@ DraftConfig draft(const Json& value, const TextConfig& target, bool dflash2) {
                          "selector_rank", "selector_top_k"},
                         {}, "DFlash2 config");
     } else {
-        require_members(config, {"target_layer_ids", "mask_token_id"}, {}, "DFlash config");
+        require_members(config, {"target_layer_ids", "mask_token_id"}, {"dspine"}, "DFlash config");
     }
     const auto& taps = config.at("target_layer_ids");
     if (!taps.is_array() || taps.empty()) {
@@ -279,6 +279,18 @@ DraftConfig draft(const Json& value, const TextConfig& target, bool dflash2) {
             throw ArtifactError("DFlash2 conv group does not divide hidden width");
         }
         out.dflash2 = extra;
+    }
+    if (!dflash2 && config.contains("dspine")) {
+        const auto& d = config.at("dspine");
+        require_members(d, {"block_size", "code_size", "rank", "bridge_eps", "head_topk"}, {},
+                        "DSpine config");
+        DSpineConfig extra{dimension(d, "block_size"), dimension(d, "code_size"),
+                           dimension(d, "rank"), positive_float(d, "bridge_eps"),
+                           dimension(d, "head_topk")};
+        if (extra.head_topk > target.vocab_size) {
+            throw ArtifactError("DSpine head_topk exceeds the target vocabulary");
+        }
+        out.dspine = extra;
     }
     return out;
 }

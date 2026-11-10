@@ -109,6 +109,17 @@ struct DFlash2Config {
     std::uint32_t selector_top_k   = 0;
 };
 
+// Tencent DSpine (github.com/Tencent/DSpine): a DFlash draft whose block attention is causal and
+// whose every layer ends in a code-bridge write; proposals come from a serial refinement over the
+// target head's top `head_topk` candidates. Present only on a dflash component converted from one.
+struct DSpineConfig {
+    std::uint32_t block_size = 0;
+    std::uint32_t code_size  = 0;
+    std::uint32_t rank       = 0;
+    float bridge_eps         = 0;
+    std::uint32_t head_topk  = 0;
+};
+
 struct DraftConfig {
     AttentionConfig attention;
     std::uint32_t intermediate_size       = 0;
@@ -121,6 +132,7 @@ struct DraftConfig {
     std::vector<std::uint32_t> target_layer_ids;
     std::uint32_t mask_token_id = 0;
     std::optional<DFlash2Config> dflash2;
+    std::optional<DSpineConfig> dspine;
 
     [[nodiscard]] std::uint32_t local_layer_count() const noexcept {
         return static_cast<std::uint32_t>(std::count(layer_types.begin(), layer_types.end(),

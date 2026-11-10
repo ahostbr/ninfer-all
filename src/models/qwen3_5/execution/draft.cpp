@@ -25,6 +25,7 @@
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/prepare_masked_block.h"
 #include "ninfer/ops/dspine.h"
+#include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/prepare_ragged_prefix.h"
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/rope.h"
@@ -444,11 +445,11 @@ void ensure_dspine_tables(ExecutionCore& execution) {
                        Tensor(tsg, DType::BF16, {w.rank, w.vocab}),
                        Tensor(tsv, DType::BF16, {w.rank, w.vocab})};
     ops::dspine::build_tsv(w, built.tsv_gate, built.tsv_value, stream);
-    // TG^T = head . (norm * W_last), projected 16 columns at a time so the decode-sized workspace
+    // TG^T = head . (norm * W_last), projected 8 columns at a time so the decode-sized workspace
     // fits, then transposed into the rank-major table.
     const auto& head   = execution.parameters.draft->output_head;
     const DType ldtype = target_logits_dtype(head);
-    constexpr std::int32_t kChunk = 16;
+    constexpr std::int32_t kChunk = 8; // within the planned proposal-width scratch
     void* staging     = nullptr;
     void* input_bytes = nullptr;
     void* chunk_bytes = nullptr;
@@ -606,9 +607,21 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                         envelopes.full, state.execution.work, attention_batch,
                         state.execution.device.stream);
                 }
-                project_add(
-                    roots.attention.view({dimension(config.attention.query_width()), columns}),
-                    weight.output, residual, state.execution.work, state.execution.device.stream);
+                if (dspine) {
+                    // DSpine's o_proj (5120 x 4096) has no registered linear_add: project, then add.
+                    Tensor attended = state.execution.work.alloc(
+                        DType::BF16, {dimension(target.hidden_size), columns});
+                    project(
+                        roots.attention.view({dimension(config.attention.query_width()), columns}),
+                        weight.output, attended, state.execution.work,
+                        state.execution.device.stream);
+                    ops::residual_add(attended, residual, state.execution.device.stream);
+                } else {
+                    project_add(
+                        roots.attention.view({dimension(config.attention.query_width()), columns}),
+                        weight.output, residual, state.execution.work,
+                        state.execution.device.stream);
+                }
             }
             {
                 nvtx::ScopedRange mlp_range(nvtx::Name::DFlashMlp, nvtx::Category::PostMixer,

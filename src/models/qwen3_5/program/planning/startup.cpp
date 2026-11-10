@@ -1137,6 +1137,15 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                         proposal_drafts, proposal_drafts, batch, batch));
                     return finish(layout);
                 }
+                // DSpine (draft.cpp): the last bridge write's stash lives through the proposal.
+                const bool dspine = draft->dspine.has_value();
+                const std::int32_t dspine_rank =
+                    dspine ? static_cast<std::int32_t>(draft->dspine->rank) : 0;
+                if (dspine) {
+                    matrix(layout, DType::BF16, dimension(config.hidden_size), tokens);
+                    matrix(layout, DType::FP32, 1, tokens);
+                    matrix(layout, DType::BF16, dspine_rank, tokens);
+                }
                 {
                     auto attention = layout.scope();
                     (void)workspace::dflash_attention(layout, config, *draft, tokens);
@@ -1153,8 +1162,28 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                           dimension(draft->attention.num_key_value_heads)},
                                          {0, plan.capacity}, width, width, batch)));
                     for (const auto& block : parameters.draft->layers) {
-                        add_scratch(layout, block.output, tokens, tokens);
+                        if (dspine) {
+                            // o_proj as a plain projection into a temporary, then residual_add.
+                            auto projected = layout.scope();
+                            matrix(layout, DType::BF16, dimension(config.hidden_size), tokens);
+                            linear_scratch(layout, block.output, tokens, tokens);
+                        } else {
+                            add_scratch(layout, block.output, tokens, tokens);
+                        }
                     }
+                }
+                if (dspine) {
+                    // ops::dspine::bridge_write scratch.
+                    auto bridge = layout.scope();
+                    const auto code = static_cast<std::int32_t>(draft->dspine->code_size);
+                    matrix(layout, DType::BF16, dimension(config.hidden_size), tokens);
+                    matrix(layout, DType::FP32, 1, tokens);
+                    matrix(layout, DType::BF16, code, tokens);
+                    matrix(layout, DType::BF16, code, tokens);
+                    for (int i = 0; i < 4; ++i) {
+                        matrix(layout, DType::BF16, dspine_rank, tokens);
+                    }
+                    matrix(layout, DType::BF16, dimension(config.hidden_size), tokens);
                 }
                 {
                     auto mlp = layout.scope();
@@ -1184,6 +1213,21 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                        ? parameters.proposal->head
                                        : parameters.draft->output_head;
                 linear_scratch(layout, head, proposal_drafts * batch, proposal_drafts * batch);
+                if (dspine) {
+                    // The refinement: raw rows, their norm-scaled copy, candidate logits, top-k
+                    // ids and base logits (FP32 covers either logits dtype), each head projection
+                    // with its scratch.
+                    const auto rows = proposal_drafts * batch;
+                    const auto& full = parameters.draft->output_head;
+                    matrix(layout, DType::BF16, dimension(config.hidden_size), rows);
+                    matrix(layout, DType::BF16, dimension(config.hidden_size), rows);
+                    matrix(layout, DType::FP32, dimension(config.vocab_size), rows);
+                    linear_scratch(layout, full, rows, rows);
+                    matrix(layout, DType::I32, static_cast<std::int32_t>(draft->dspine->head_topk),
+                           rows);
+                    matrix(layout, DType::FP32, dimension(config.vocab_size), rows);
+                    linear_scratch(layout, full, rows, rows);
+                }
                 return finish(layout);
             };
 

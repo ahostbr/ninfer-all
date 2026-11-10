@@ -1746,6 +1746,8 @@ ProgramImpl::retained_device_kv_pages(const SharedPrefixHandle& shared) const no
 
 void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32_t main_tokens,
                                             std::uint32_t backend_tokens) {
+    // A drafter without a paged backend cache (DSpine: sliding-window layers only) maps none.
+    if (backend_kv_cache() == nullptr) { backend_tokens = 0; }
     if (!sequence.kv || main_tokens > capacity || backend_tokens > capacity) {
         throw std::logic_error("KV materialization request is outside the sequence bundle");
     }
@@ -1762,6 +1764,7 @@ void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32
 
 void ProgramImpl::commit_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
                                      std::uint32_t backend_tokens) {
+    if (backend_kv_cache() == nullptr) { backend_tokens = 0; }
     if (!sequence.kv || main_tokens > capacity || backend_tokens > capacity ||
         (backend_tokens != 0 && !sequence.kv->backend)) {
         throw std::logic_error("KV commit request is outside the sequence bundle");
@@ -1775,6 +1778,7 @@ void ProgramImpl::commit_sequence_kv(SequenceState& sequence, std::uint32_t main
 
 void ProgramImpl::trim_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
                                    std::uint32_t backend_tokens) {
+    if (backend_kv_cache() == nullptr) { backend_tokens = 0; }
     if (!sequence.kv || main_tokens > capacity || backend_tokens > main_tokens) {
         throw std::logic_error("KV trim request is outside the sequence bundle");
     }

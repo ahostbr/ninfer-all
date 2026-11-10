@@ -230,8 +230,14 @@ detail::PhysicalResources positive_difference(detail::PhysicalResources value,
 } // namespace
 
 KVEntitlementShape ProgramImpl::kv_entitlement_shape() const noexcept {
-    return KVEntitlementShape{
-        .capacity = capacity, .draft_window = draft_window, .backend = speculative_backend};
+    // A DFlash drafter with sliding-window layers only (DSpine) has no paged backend cache, so it
+    // reserves no backend pages.
+    const bool pageless_draft =
+        speculative_backend == SpeculativeBackend::DFlash && backend_kv_cache() == nullptr;
+    return KVEntitlementShape{.capacity     = capacity,
+                              .draft_window = draft_window,
+                              .backend = pageless_draft ? SpeculativeBackend::None
+                                                        : speculative_backend};
 }
 
 std::uint32_t ProgramImpl::concurrent_output_budget(std::uint32_t prompt_tokens) const noexcept {

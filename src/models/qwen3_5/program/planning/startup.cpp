@@ -1218,7 +1218,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     // ids and base logits (FP32 covers either logits dtype), each head projection
                     // with its scratch.
                     const auto rows = proposal_drafts * batch;
-                    const auto& full = parameters.draft->output_head;
+                    const auto& full = parameters.text.output_head;
                     matrix(layout, DType::BF16, dimension(config.hidden_size), rows);
                     matrix(layout, DType::BF16, dimension(config.hidden_size), rows);
                     matrix(layout, DType::FP32, dimension(config.vocab_size), rows);

@@ -447,7 +447,8 @@ void ensure_dspine_tables(ExecutionCore& execution) {
     ops::dspine::build_tsv(w, built.tsv_gate, built.tsv_value, stream);
     // TG^T = head . (norm * W_last), projected 8 columns at a time so the decode-sized workspace
     // fits, then transposed into the rank-major table.
-    const auto& head   = execution.parameters.draft->output_head;
+    // The target LM head (the draft's own head is unbound when a proposal head is selected).
+    const auto& head   = execution.parameters.text.output_head;
     const DType ldtype = target_logits_dtype(head);
     constexpr std::int32_t kChunk = 8; // within the planned proposal-width scratch
     void* staging     = nullptr;
@@ -667,7 +668,7 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
         if (dspine) {
             const auto& d           = *config.dspine;
             const std::int32_t rows = static_cast<std::int32_t>(k) * batch_size;
-            const auto& head        = state.execution.parameters.draft->output_head;
+            const auto& head        = state.execution.parameters.text.output_head;
             const auto& tables      = dspine_tables_for_device();
             if (tables.tg.data == nullptr) {
                 throw std::logic_error("DSpine tables were not built before the proposal");

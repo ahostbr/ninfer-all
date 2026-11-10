@@ -51,3 +51,9 @@ layers `target_layer_ids` [1,16,31,46,61], `hidden_norm`, mask token 248070), bl
 - This fork's remote (`ahostbr/ninfer-all`) is PUBLIC: commits stay local until Ryan OKs a push.
 
 Reference clone (read-only): `G:/REPO_CLONES/_untrusted/DSpine` (github.com/Tencent/DSpine, 321b0fc).
+
+## Status 2026-11-10 (UNVERIFIED by Ryan)
+Ported and running: 1b81a20a..76c35c85 (fork/audited, pushed). Greedy refinement only (sampled mode not ported); no golden-number unit test yet.
+Artifact: `G:\Models\litesuite\ninfer\swift15_nvfp4_dspine_p.ninfer` (Swift-1.5 27B NVFP4, `--recipe qwen3_8_27b_nvfp4_nvidia --components text,dflash --proposal --source dflash=<DSpine>`), launch recipe beside it (64K x 2 lanes). Build: `C:\Users\Ryan\.litesuite\llm\ninfer-all-dspine-76c35c85`. LiteTUI points at both (settings.json; backup settings.json.bak-pre-dspine-20261110).
+Measured (greedy, 300 tokens, decode tok/s and accepted/round; no draft 74.8): Rust quicksort draft 7 306.2 (5.84), draft 15 401.6 (9.06); Python ISO parser 295.8 (5.75) / 340.7 (7.67); prose 130.7 (2.56) / 113.8 (2.77). Greedy output identical to no-draft at draft 1/3/7; at 15 one near-tie diverges (16-column verification rounding).
+Runtime changes beyond the plan: o_proj 5120x4096 run as project + residual_add (no registered linear_add); 8192 cyclic append; a drafter with sliding layers only reserves no paged backend KV; TG/candidates read the target head (the draft head is unbound under --lm-head-draft).

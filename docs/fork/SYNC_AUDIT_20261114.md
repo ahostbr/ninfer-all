@@ -35,7 +35,7 @@ removes:
 | `.github/scripts/quiet-upload-progress.cjs` | silences the upload progress bars of the script above | **removed** |
 | `scripts/pods/attach_dflash2.py` | the rented-host harness, as the rest of `scripts/pods/` | **removed** |
 | `tests/release/test_hf_client.py`, `test_compiler_cache_finish.py`, `test_cuda12_glibc_patch.py` | tests that import the removed `.github/scripts` | **removed** |
-| `tests/pods/test_attach_dflash2.py` | the test of the removed `scripts/pods/attach_dflash2.py` (removed in commit `T1310` after the merge) | **removed** |
+| `tests/pods/test_attach_dflash2.py` | the test of the removed `scripts/pods/attach_dflash2.py` (removed by the docs commit after the merge) | **removed** |
 
 `.github/FUNDING.yml` and `.github/pull_request_template.md` stay, as on `fork/audited` (text only).
 

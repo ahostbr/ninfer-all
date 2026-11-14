@@ -40,7 +40,7 @@ int launch_configuration_tests() {
         return path.string();
     };
     const std::string base = write("base.ini", "model = from-file.ninfer\n"
-                                               "host = 0.0.0.0\n"
+                                               "host = 127.0.0.1\n"  // fork cut N30: loopback only
                                                "port = 9000\n"
                                                "api-key = do-not-log\n"
                                                "max-context = 32768\n"
@@ -51,7 +51,7 @@ int launch_configuration_tests() {
                                                "models-max = 2\n");
     const auto layered =
         parse({"ninfer-serve", "--config", base, "--port", "9100", "--spec", "none"});
-    failures += check(layered.artifact_path == "from-file.ninfer" && layered.host == "0.0.0.0" &&
+    failures += check(layered.artifact_path == "from-file.ninfer" && layered.host == "127.0.0.1" &&
                           layered.port == 9100 && layered.max_context == 32768 &&
                           layered.api_key == "do-not-log" && layered.device_profile == "off",
                       "a configuration file's options and artifact did not reach the server");

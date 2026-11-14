@@ -90,6 +90,8 @@ if(MSVC AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 19.40)
   message(FATAL_ERROR
     "MSVC ${CMAKE_CXX_COMPILER_VERSION} miscompiles core::wide_add; use toolset 14.44 "
     "(vcvars64.bat -vcvars_ver=14.44)")
+endif()
+
 # CUDA 13.2.0 and 13.2.1 (nvcc 13.2.51 and 13.2.78) miscompile ggml's IQ1_S, IQ2_S and IQ3_S
 # integer tensor-core products for sm_120a (src/ops/linear/gguf/ggml_mmq_iq1_s.cu, _iq2_s.cu and
 # _iq3_s.cu). The PTX their cicc emits is already wrong: 13.4.3's ptxas assembles it into the same

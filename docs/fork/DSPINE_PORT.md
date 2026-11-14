@@ -1,5 +1,11 @@
 # DSpine draft port plan (fork, 2026-11-10, UNVERIFIED)
 
+> **Superseded on 2026-11-14.** The upstream sync (merge `c6a560d1`, see
+> [SYNC_AUDIT_20261114.md](SYNC_AUDIT_20261114.md) section 6) replaced this port with upstream's own DSpine:
+> a separate drafter artifact run with `--spec dspine --draft-model`. An artifact made by this port's
+> converter (the drafter inside the `dflash` component) is refused by builds from that merge on
+> (`DFlash config: unknown member dspine`). This file records the port as it was.
+
 Ryan 2026-11-10 ~00:5x EST: "Yes do it ourself. Now while he stays on pz" (after "won't it also help the non-nvfp4?" and "the swift and normal 27b?").
 
 ## What DSpine is

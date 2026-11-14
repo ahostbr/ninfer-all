@@ -10,7 +10,8 @@ Status: static analysis, plus a build whose configure and build logs contain no 
 proofs (a build with the network blocked, the running server with no outbound connection) are not
 done; section 6 says exactly what is missing.
 
-This fork is local. Nothing in it is pushed. Each cut is its own commit where the files allow it, so a
+This fork's branch `fork/audited` is pushed to its own public remote (as of the 2026-11-14 sync). Later upstream
+syncs are audited in their own files ([SYNC_AUDIT_20261114.md](SYNC_AUDIT_20261114.md)). Each cut is its own commit where the files allow it, so a
 cut is un-done with `git revert <sha>` (section 7).
 
 ## 1. How to re-check (paste and run)

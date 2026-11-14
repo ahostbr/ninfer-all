@@ -1531,6 +1531,9 @@ struct ExpertDelivery::Impl {
             const auto s = layer.slot_of[std::size_t(e)];
             if (s >= 0 && !slots[std::size_t(s)].pending) { continue; }
             if (held >= 0 && bank_state[std::size_t(held)].valid[std::size_t(e)]) { continue; }
+            if (options.cpu.pinned_only && !layer.source.experts[std::size_t(e)].front().pinned) {
+                continue;
+            }
             order.emplace_back(needed[e] & kCountMask, e);
         }
         std::stable_sort(order.begin(), order.end(),

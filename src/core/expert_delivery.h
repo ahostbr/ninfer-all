@@ -83,6 +83,9 @@ struct ExpertCpuOptions {
     double share = 0;          // the share of a narrow call's missing experts the CPU computes
     bool balance = false;      // instead, the split whose copies and products end soonest
     std::uint32_t threads = 0; // the CPU pool, the service thread included; 0: pool_cpu_count()
+    // Only experts in pinned host memory go to the CPU; those in files are always copied (a file
+    // read for the CPU costs what the copy's does, and delays the products).
+    bool pinned_only = false;
 };
 
 struct ExpertDeliveryOptions {

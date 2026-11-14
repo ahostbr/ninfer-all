@@ -196,23 +196,17 @@ std::vector<RepeatedRange> take_repeated_ranges(std::vector<CopyRange>& ranges) 
 constexpr std::uint64_t kHostPieceBytes = 16ULL << 20U;
 constexpr std::size_t kHostReadThreads  = 8;
 
-// An object's stored bytes and where the load keeps them on the host.
-struct HostReadTarget {
-    std::uint64_t offset   = 0; // logical artifact offset
-    std::uint64_t bytes    = 0;
-    std::byte* destination = nullptr;
-};
-
 struct AlignedDelete {
     void operator()(std::byte* data) const noexcept {
         ::operator delete(data, std::align_val_t{kPayloadAlignment});
     }
 };
 
-// Writes every target's stored bytes to its destination. Direct reads skip the page cache, which
-// would otherwise hold a second copy of everything the host keeps, and run on several threads:
-// each takes the next piece of the merged spans into its own aligned staging buffer and copies the
-// targets' bytes out of it. Progress counts from 0 toward `total`. Returns the bytes read.
+} // namespace
+
+// Declared in materializer.h. Direct reads skip the page cache, which would otherwise hold a second
+// copy of everything the host keeps, and run on several threads: each takes the next piece of the
+// merged spans into its own aligned staging buffer and copies the targets' bytes out of it.
 std::uint64_t read_host_bytes(const Reader& reader, std::span<const HostReadTarget> targets,
                               StartupPhaseScope& phase, std::uint64_t total) {
     std::vector<CopyRange> ranges;
@@ -315,6 +309,8 @@ std::uint64_t read_host_bytes(const Reader& reader, std::span<const HostReadTarg
     phase.progress(copied, total);
     return read;
 }
+
+namespace {
 
 // The NVFP4 divisor of the stored object's row `first_row`, from its stored bytes (`host`) or its
 // file. A selected piece names the row it starts at: the piece's own geometry places its divisors

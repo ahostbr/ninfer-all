@@ -33,6 +33,10 @@ inline constexpr const char* kHybridExpertHelp =
     "                                straight into device memory through the kernel modules\n"
     "                                in kernel/ninfer-direct (auto, the default: when they are\n"
     "                                loaded and a self-test read passes)\n"
+    "  --expert-host-mib N           DeepSeek-V4.1 disk experts: keep up to N MiB of the\n"
+    "                                experts the routing profile ranks highest in pinned host\n"
+    "                                memory (copied like host experts) and read the rest from\n"
+    "                                the files with direct I/O (default 0: all from the files)\n"
     "  Flash-Next-only expert options:\n"
     "  --expert-misses staged|mapped GGUF experts: copy misses into device staging while the\n"
     "                                cached experts run (default), or read host experts across\n"
@@ -110,6 +114,12 @@ bool parse_hybrid_expert_option(std::string_view option, HybridExpertOptions& ou
         }
     } else if (switch_option(option, "expert-cache-adaptive",
                              [&](bool on) { out.adaptive_cache = on; })) {
+    } else if (option == "--expert-host-mib") {
+        const auto mib = parse_count(std::string(value()));
+        if (!mib || *mib > (1u << 24)) {
+            throw std::invalid_argument("--expert-host-mib takes MiB in 0..16777216");
+        }
+        out.expert_host_bytes = std::uint64_t(*mib) << 20;
     } else if (option == "--expert-profile" || option == "--expert-profile-out") {
         const std::string path(value());
         if (path.empty()) { throw std::invalid_argument(std::string(option) + " takes a file path"); }

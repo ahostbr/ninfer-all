@@ -447,6 +447,11 @@ struct HybridExpertOptions {
     std::filesystem::path mirror;
     // Disk experts: NVMe reads straight into device memory (ExpertDirect).
     ExpertDirect direct = ExpertDirect::Auto;
+    // DeepSeek-V4.1 disk experts (--expert-host-mib, T1192): up to this many bytes of the experts
+    // the routing profile ranks highest are read once at startup into pinned host memory and
+    // copied from there as host experts are; every other expert is read from the files. 0
+    // (default): every expert is read from the files.
+    std::uint64_t expert_host_bytes = 0;
 };
 
 // The n-gram table of Qwen3.8-Flash-Next's per-layer embedding or DeepSeek-V4.1-Flash's Engram: the

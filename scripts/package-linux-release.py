@@ -234,6 +234,8 @@ def main():
         (repo / 'scripts/run.sh', 'run.sh'),
     ):
         shutil.copy2(source, package / destination)
+    # Launch configurations for the published models (docs/recipes.md).
+    shutil.copytree(repo / 'configs', package / 'configs')
     distro = dict(line.split('=', 1) for line in Path('/etc/os-release').read_text().splitlines()
                   if '=' in line)
     # Fork cut N19: docker/ is removed, so no entrypoint or Dockerfile is packaged.

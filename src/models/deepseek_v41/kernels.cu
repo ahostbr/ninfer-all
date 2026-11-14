@@ -1,6 +1,7 @@
 #include "models/deepseek_v41/kernels.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
+#include "ops/common/route_order.cuh"
 #include "ops/common/silu.h"
 
 #include <cublas_v2.h>
@@ -127,29 +128,119 @@ __device__ __forceinline__ float pow2_ceil(float x) {
     return __uint_as_float(unsigned(e + 127) << 23);
 }
 
-// fp8 (E4M3, ue8m0 scale) of a 32-value group held by 8 aligned lanes, four values each.
-__device__ __forceinline__ float4 fp8_group(float4 v) {
+// fp8 (E4M3, ue8m0 scale) of a 32-value group held by 8 aligned lanes, four values each: the
+// rounded codes' values in `r` and the group's scale in `s`; the result is r * s.
+__device__ __forceinline__ float4 fp8_group(float4 v, float4& r, float& s) {
     const float amax = group_max<8>(amax4(v));
-    const float s    = pow2_ceil(fmaxf(amax, 1e-4f) * (1.0f / 448.0f));
-    const auto q = [s](float x) { return round_e4m3(fminf(fmaxf(x / s, -448.0f), 448.0f)) * s; };
-    return make_float4(q(v.x), q(v.y), q(v.z), q(v.w));
+    s                = pow2_ceil(fmaxf(amax, 1e-4f) * (1.0f / 448.0f));
+    const float d    = s;
+    const auto q = [d](float x) { return round_e4m3(fminf(fmaxf(x / d, -448.0f), 448.0f)); };
+    r = make_float4(q(v.x), q(v.y), q(v.z), q(v.w));
+    return make_float4(r.x * s, r.y * s, r.z * s, r.w * s);
+}
+__device__ __forceinline__ float4 fp8_group(float4 v) {
+    float4 r;
+    float s;
+    return fp8_group(v, r, s);
 }
 
 // fp4 (E2M1, E8M0 scale) of a 32-value group held by 8 aligned lanes.
-__device__ __forceinline__ float4 fp4_e8m0_group(float4 v) {
+__device__ __forceinline__ float4 fp4_e8m0_group(float4 v, float4& r, float& s) {
     const float amax = group_max<8>(amax4(v));
-    const float s    = pow2_ceil(fmaxf(amax, 6.0f * 1.17549435e-38f) * (1.0f / 6.0f));
-    const auto q = [s](float x) { return round_e2m1(fminf(fmaxf(x / s, -6.0f), 6.0f)) * s; };
-    return make_float4(q(v.x), q(v.y), q(v.z), q(v.w));
+    s                = pow2_ceil(fmaxf(amax, 6.0f * 1.17549435e-38f) * (1.0f / 6.0f));
+    const float d    = s;
+    const auto q = [d](float x) { return round_e2m1(fminf(fmaxf(x / d, -6.0f), 6.0f)); };
+    r = make_float4(q(v.x), q(v.y), q(v.z), q(v.w));
+    return make_float4(r.x * s, r.y * s, r.z * s, r.w * s);
+}
+__device__ __forceinline__ float4 fp4_e8m0_group(float4 v) {
+    float4 r;
+    float s;
+    return fp4_e8m0_group(v, r, s);
 }
 
 // fp4 (E2M1, E4M3 scale) of a 16-value group held by 4 aligned lanes.
-__device__ __forceinline__ float4 fp4_e4m3_group(float4 v) {
+__device__ __forceinline__ float4 fp4_e4m3_group(float4 v, float4& r, float& s) {
     const float amax = group_max<4>(amax4(v));
-    const float s =
-        round_e4m3(fminf(fmaxf(amax, 6.0f * 0.001953125f) / 6.0f, 448.0f));
-    const auto q = [s](float x) { return round_e2m1(fminf(fmaxf(x / s, -6.0f), 6.0f)) * s; };
-    return make_float4(q(v.x), q(v.y), q(v.z), q(v.w));
+    s = round_e4m3(fminf(fmaxf(amax, 6.0f * 0.001953125f) / 6.0f, 448.0f));
+    const float d = s;
+    const auto q = [d](float x) { return round_e2m1(fminf(fmaxf(x / d, -6.0f), 6.0f)); };
+    r = make_float4(q(v.x), q(v.y), q(v.z), q(v.w));
+    return make_float4(r.x * s, r.y * s, r.z * s, r.w * s);
+}
+
+// ---- Packed caches ------------------------------------------------------------------------------
+// The caches keep the codes of the roundings above and their scales; a value is its code's value
+// times its group's scale, exactly the BF16 value the rounding gave (an E4M3 or E2M1 value times a
+// power of two, or an E2M1 value times an E4M3 scale, has at most six significant bits).
+
+// The E4M3 code of an E4M3 value (|r| <= 448), the sign kept for zeros.
+__device__ __forceinline__ unsigned e4m3_code(float r) {
+    const unsigned bits = __float_as_uint(r);
+    const unsigned sign = (bits >> 24) & 0x80u;
+    const float a       = fabsf(r);
+    if (a < 0.015625f) { return sign | unsigned(a * 512.0f); } // subnormal: m * 2^-9
+    const unsigned e = ((bits >> 23) & 0xFFu) - 127u + 7u;
+    return sign | (e << 3) | ((bits >> 20) & 7u);
+}
+__device__ __forceinline__ float e4m3_value(unsigned c) {
+    const unsigned e = (c >> 3) & 15u, m = c & 7u;
+    const float a    = e == 0 ? float(m) * 0.001953125f
+                              : __uint_as_float(((e - 7u + 127u) << 23) | (m << 20));
+    return (c & 0x80u) != 0 ? -a : a;
+}
+
+// The E2M1 code of an E2M1 value (|r| <= 6).
+__device__ __forceinline__ unsigned e2m1_code(float r) {
+    const unsigned bits = __float_as_uint(r);
+    const unsigned sign = (bits >> 28) & 8u;
+    const float a       = fabsf(r);
+    if (a < 1.0f) { return sign | (a == 0.5f ? 1u : 0u); }
+    const unsigned e = ((bits >> 23) & 0xFFu) - 127u + 1u;
+    return sign | (e << 1) | ((bits >> 22) & 1u);
+}
+__device__ __forceinline__ float e2m1_value(unsigned n) {
+    const unsigned e = (n >> 1) & 3u, m = n & 1u;
+    const float a = e == 0 ? (m != 0 ? 0.5f : 0.0f) : __uint_as_float(((e - 1u + 127u) << 23) | (m << 22));
+    return (n & 8u) != 0 ? -a : a;
+}
+
+// A power-of-two scale as its E8M0 code (the float's exponent field) and back.
+__device__ __forceinline__ unsigned e8m0_code(float s) { return __float_as_uint(s) >> 23; }
+__device__ __forceinline__ float e8m0_value(unsigned c) { return __uint_as_float(c << 23); }
+
+__device__ __forceinline__ unsigned e4m3_codes4(float4 r) {
+    return e4m3_code(r.x) | (e4m3_code(r.y) << 8) | (e4m3_code(r.z) << 16) | (e4m3_code(r.w) << 24);
+}
+__device__ __forceinline__ unsigned e2m1_codes4(float4 r) {
+    return e2m1_code(r.x) | (e2m1_code(r.y) << 4) | (e2m1_code(r.z) << 8) | (e2m1_code(r.w) << 12);
+}
+
+// Eight BF16 values of E4M3 codes (two words, value 0 in the low byte) times scale s.
+__device__ __forceinline__ uint4 e4m3_bf16x8(uint2 codes, float s) {
+    uint4 out;
+    unsigned* w = &out.x;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const unsigned word = i < 2 ? codes.x : codes.y;
+        const int shift     = (i & 1) * 16;
+        const __nv_bfloat162 pair = __floats2bfloat162_rn(e4m3_value((word >> shift) & 0xFFu) * s,
+                                                          e4m3_value((word >> (shift + 8)) & 0xFFu) * s);
+        w[i] = *reinterpret_cast<const unsigned*>(&pair);
+    }
+    return out;
+}
+// Eight BF16 values of E2M1 codes (one word, value 0 in the low nibble) times scale s.
+__device__ __forceinline__ uint4 e2m1_bf16x8(unsigned codes, float s) {
+    uint4 out;
+    unsigned* w = &out.x;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const __nv_bfloat162 pair = __floats2bfloat162_rn(e2m1_value((codes >> (8 * i)) & 15u) * s,
+                                                          e2m1_value((codes >> (8 * i + 4)) & 15u) * s);
+        w[i] = *reinterpret_cast<const unsigned*>(&pair);
+    }
+    return out;
 }
 
 // The rotation of four values at offset `at` (a multiple of 4) of a row whose last kRope values of
@@ -457,10 +548,14 @@ __global__ void kv_post_kernel(KvPostArgs a) {
     const int at  = 4 * threadIdx.x;
     float4 v      = latent_norm(ld4(a.kv + t * a.kv_stride + at), a.norm, a.eps);
     v             = bf16r4(rope4(v, at, kLatent, float(a.positions[t]), a.freq, false));
-    v             = fp8_group(v);
+    float4 r;
+    float s;
+    (void)fp8_group(v, r, s);
     const int seq = a.sequences != nullptr ? a.sequences[t] : a.sequence;
     const int pos = a.slots != nullptr ? a.slots[t] : a.positions[t];
-    st_bf16x4(a.cache + seq * a.seq_stride + std::int64_t(pos % a.ring) * kLatent + at, v);
+    std::uint8_t* row = a.cache + seq * a.seq_stride + std::int64_t(pos % a.ring) * kWindowRowBytes;
+    *reinterpret_cast<unsigned*>(row + at) = e4m3_codes4(r);
+    if ((at & 31) == 0) { row[kLatent + at / 32] = std::uint8_t(e8m0_code(s)); }
 }
 
 __device__ __forceinline__ float4 load4(const float* p) { return ld4(p); }
@@ -544,13 +639,25 @@ __global__ void latent_post_kernel(LatentArgs a) {
         const float4 wv = ld4(a.key_norm + at);
         k = bf16r4(make_float4(k.x * inv * wv.x, k.y * inv * wv.y, k.z * inv * wv.z, k.w * inv * wv.w));
         k = bf16r4(rope4(k, at, kIndex, g, a.freq, false));
-        k = fp4_e8m0_group(k);
-        st_bf16x4(a.index_cache + seq * a.index_seq_stride + std::int64_t(j) * kIndex + at, k);
+        float4 r;
+        float s;
+        (void)fp4_e8m0_group(k, r, s);
+        *reinterpret_cast<std::uint16_t*>(a.index_cache + seq * a.index_seq_stride +
+                                          std::int64_t(j) * kKeyRowBytes + at / 2) =
+            std::uint16_t(e2m1_codes4(r));
+        if ((at & 31) == 0) {
+            a.index_scales[seq * a.index_scale_seq_stride + std::int64_t(j) * kKeyScaleBytes + at / 32] =
+                std::uint8_t(e8m0_code(s));
+        }
     }
     float4 v = ld4(a.latent + std::int64_t(t) * kLatent + at);
     v        = bf16r4(rope4(v, at, kLatent, g, a.freq, false));
-    v        = fp4_e4m3_group(v);
-    st_bf16x4(a.kv_cache + seq * a.kv_seq_stride + std::int64_t(j) * kLatent + at, v);
+    float4 r;
+    float s;
+    (void)fp4_e4m3_group(v, r, s);
+    std::uint8_t* row = a.kv_cache + seq * a.kv_seq_stride + std::int64_t(j) * kLatentRowBytes;
+    *reinterpret_cast<std::uint16_t*>(row + at / 2) = std::uint16_t(e2m1_codes4(r));
+    if ((at & 15) == 0) { row[kLatent / 2 + at / 16] = std::uint8_t(e4m3_code(s)); }
 }
 
 // ---- Indexer ------------------------------------------------------------------------------------
@@ -571,8 +678,12 @@ __global__ void __launch_bounds__(kScoreKeys) index_scores_kernel(ScoreArgs a) {
         visible[r] = r < rows ? (a.positions[t0 + r] + 1) / a.ratio : 0;
         most       = max(most, visible[r]);
     }
-    const int j0 = blockIdx.x * kScoreKeys;
-    if (j0 >= most) { return; }
+    // Listed rows: column s of group blockIdx.y stands for the position its list gives.
+    const bool listed = a.list != nullptr;
+    const std::int32_t* list = listed ? a.list + std::int64_t(blockIdx.y) * a.capacity : nullptr;
+    const int columns = listed ? a.counts[blockIdx.y] * a.block : most;
+    const int s0      = blockIdx.x * kScoreKeys;
+    if (s0 >= columns) { return; }
     for (int r = 0; r < rows; ++r) {
         const auto* src = reinterpret_cast<const uint4*>(a.q + std::int64_t(t0 + r) * a.heads * kIndex);
         auto* dst       = reinterpret_cast<uint4*>(q_s[r]);
@@ -582,20 +693,48 @@ __global__ void __launch_bounds__(kScoreKeys) index_scores_kernel(ScoreArgs a) {
         }
     }
     __syncthreads();
-    const int j = j0 + threadIdx.x;
+    const int s = s0 + threadIdx.x;
+    if (s >= columns) { return; }
+    const int j = listed ? list[s / a.block] * a.block + s % a.block : s;
     if (j >= most) { return; }
+    // Rows that do not keep the position's block take -inf; the key is read only for a row that
+    // does.
+    bool needed = false;
+#pragma unroll
+    for (int r = 0; r < G; ++r) {
+        if (j >= visible[r]) { continue; }
+        if (a.candidates != nullptr) {
+            const int b = j / a.block;
+            const std::uint32_t word =
+                a.candidates[std::int64_t(t0 + r) * a.candidate_words + b / 32];
+            if (((word >> (b % 32)) & 1U) == 0) {
+                a.out[std::int64_t(t0 + r) * a.width + s] = -INFINITY;
+                continue;
+            }
+        }
+        needed = true;
+    }
+    if (!needed) { return; }
     const int seq = a.sequences != nullptr ? a.sequences[t0] : a.sequence;
     __nv_bfloat162 k[kIndex / 2];
     {
         const auto* src = reinterpret_cast<const uint4*>(a.keys + seq * a.key_seq_stride +
-                                                         std::int64_t(j) * kIndex);
+                                                         std::int64_t(j) * kKeyRowBytes);
+        const unsigned scales = *reinterpret_cast<const unsigned*>(
+            a.key_scales + seq * a.key_scale_seq_stride + std::int64_t(j) * kKeyScaleBytes);
 #pragma unroll
-        for (int i = 0; i < kIndex / 8; ++i) {
+        for (int i = 0; i < kIndex / 32; ++i) {
             const uint4 w = src[i];
-            k[4 * i]     = *reinterpret_cast<const __nv_bfloat162*>(&w.x);
-            k[4 * i + 1] = *reinterpret_cast<const __nv_bfloat162*>(&w.y);
-            k[4 * i + 2] = *reinterpret_cast<const __nv_bfloat162*>(&w.z);
-            k[4 * i + 3] = *reinterpret_cast<const __nv_bfloat162*>(&w.w);
+            const float s = e8m0_value((scales >> (8 * i)) & 0xFFu);
+            const unsigned words[4] = {w.x, w.y, w.z, w.w};
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const uint4 v = e2m1_bf16x8(words[q], s);
+                k[16 * i + 4 * q]     = *reinterpret_cast<const __nv_bfloat162*>(&v.x);
+                k[16 * i + 4 * q + 1] = *reinterpret_cast<const __nv_bfloat162*>(&v.y);
+                k[16 * i + 4 * q + 2] = *reinterpret_cast<const __nv_bfloat162*>(&v.z);
+                k[16 * i + 4 * q + 3] = *reinterpret_cast<const __nv_bfloat162*>(&v.w);
+            }
         }
     }
 #pragma unroll
@@ -605,10 +744,7 @@ __global__ void __launch_bounds__(kScoreKeys) index_scores_kernel(ScoreArgs a) {
         if (a.candidates != nullptr) {
             const int b = j / a.block;
             const std::uint32_t word = a.candidates[std::int64_t(t) * a.candidate_words + b / 32];
-            if (((word >> (b % 32)) & 1U) == 0) {
-                a.out[std::int64_t(t) * a.width + j] = -INFINITY;
-                continue;
-            }
+            if (((word >> (b % 32)) & 1U) == 0) { continue; }
         }
         float acc = 0.0f;
         for (int h = 0; h < a.heads; ++h) {
@@ -623,7 +759,7 @@ __global__ void __launch_bounds__(kScoreKeys) index_scores_kernel(ScoreArgs a) {
             }
             acc = fmaf(fmaxf(d0 + d1, 0.0f), w_s[r][h], acc);
         }
-        a.out[std::int64_t(t) * a.width + j] = acc;
+        a.out[std::int64_t(t) * a.width + s] = acc;
     }
 }
 
@@ -727,23 +863,47 @@ __device__ __forceinline__ bool chosen(float v, bool in_range, unsigned threshol
     return ok && (key > threshold || (same && before < equal));
 }
 
+// How many of the listed columns (`blocks` ascending blocks of `block` positions) stand for
+// positions below n: a prefix of them, through the last listed block that starts below n.
+__device__ int listed_below(const std::int32_t* list, int blocks, int block, int n) {
+    __shared__ int s_last;
+    if (threadIdx.x == 0) { s_last = -1; }
+    __syncthreads();
+    for (int i = threadIdx.x; i < blocks; i += kSelectThreads) {
+        if (list[i] * block < n && (i + 1 == blocks || list[i + 1] * block >= n)) { s_last = i; }
+    }
+    __syncthreads();
+    const int last = s_last;
+    __syncthreads();
+    return last < 0 ? 0 : last * block + min(block, n - list[last] * block);
+}
+
 __global__ void __launch_bounds__(kSelectThreads)
     select_topk_kernel(const float* __restrict__ scores, int width, const std::int32_t* positions,
-                       int ratio, int k, std::int32_t* __restrict__ out) {
+                       int ratio, int k, ListedRows listed, std::int32_t* __restrict__ out) {
     const int t      = blockIdx.x;
     const int n      = (positions[t] + 1) / ratio;
     const float* row = scores + std::int64_t(t) * width;
+    // Listed rows: the columns that stand for visible positions, and the positions they stand for.
+    const std::int32_t* list =
+        listed.list != nullptr ? listed.list + std::int64_t(t / listed.group) * listed.capacity
+                               : nullptr;
+    const int columns =
+        list != nullptr ? listed_below(list, listed.counts[t / listed.group], listed.block, n) : n;
     unsigned threshold = 0;
     int equal          = 0;
-    radix_threshold(row, n, k, threshold, equal);
+    radix_threshold(row, columns, k, threshold, equal);
     int equal_seen = 0, written = 0;
-    for (int base = 0; base < n; base += kSelectThreads) {
+    for (int base = 0; base < columns; base += kSelectThreads) {
         const int i   = base + threadIdx.x;
-        const float v = i < n ? row[i] : -INFINITY;
-        const bool c  = chosen(v, i < n, threshold, equal, equal_seen);
+        const float v = i < columns ? row[i] : -INFINITY;
+        const bool c  = chosen(v, i < columns, threshold, equal, equal_seen);
         int total     = 0;
         const int at  = block_scan(c ? 1 : 0, total) + written;
-        if (c && at < k) { out[std::int64_t(t) * k + at] = i; }
+        if (c && at < k) {
+            out[std::int64_t(t) * k + at] =
+                list != nullptr ? list[i / listed.block] * listed.block + i % listed.block : i;
+        }
         written += total;
     }
     for (int i = written + threadIdx.x; i < k; i += kSelectThreads) {
@@ -754,12 +914,13 @@ __global__ void __launch_bounds__(kSelectThreads)
 __global__ void __launch_bounds__(kSelectThreads)
     select_candidates_kernel(const float* __restrict__ scores, int width,
                              const std::int32_t* positions, int ratio, int block, int keep,
-                             std::uint32_t* __restrict__ mask, int words, float* __restrict__ scratch) {
+                             std::uint32_t* __restrict__ mask, int words,
+                             float* __restrict__ scratch, int stride) {
     const int t      = blockIdx.x;
     const int n      = (positions[t] + 1) / ratio;
     const int blocks = (n + block - 1) / block;
     const float* row = scores + std::int64_t(t) * width;
-    float* maxima    = scratch + std::int64_t(t) * words * 32;
+    float* maxima    = scratch + std::int64_t(t) * stride;
     std::uint32_t* bits = mask + std::int64_t(t) * words;
     for (int w = threadIdx.x; w < words; w += kSelectThreads) { bits[w] = 0; }
     for (int b = threadIdx.x; b < blocks; b += kSelectThreads) {
@@ -779,6 +940,30 @@ __global__ void __launch_bounds__(kSelectThreads)
             atomicOr(bits + b / 32, 1U << (b % 32));
         }
     }
+}
+
+// Group blockIdx.x's listed blocks: the set bits of its rows' masks, in ascending order.
+__global__ void __launch_bounds__(kSelectThreads)
+    candidate_lists_kernel(const std::uint32_t* __restrict__ mask, int words, int tokens, int group,
+                           int capacity, std::int32_t* __restrict__ list,
+                           std::int32_t* __restrict__ counts) {
+    const int g    = blockIdx.x;
+    const int t0   = g * group;
+    const int rows = min(group, tokens - t0);
+    std::int32_t* own = list + std::int64_t(g) * capacity;
+    int written       = 0;
+    for (int base = 0; base < words; base += kSelectThreads) {
+        const int w        = base + threadIdx.x;
+        std::uint32_t bits = 0;
+        for (int r = 0; w < words && r < rows; ++r) { bits |= mask[std::int64_t(t0 + r) * words + w]; }
+        int total = 0;
+        int at    = block_scan(__popc(bits), total) + written;
+        for (; bits != 0; bits &= bits - 1U, ++at) {
+            if (at < capacity) { own[at] = w * 32 + __ffs(int(bits)) - 1; }
+        }
+        written += total;
+    }
+    if (threadIdx.x == 0) { counts[g] = min(written, capacity); }
 }
 
 // ---- Sparse attention ---------------------------------------------------------------------------
@@ -809,7 +994,7 @@ __device__ __forceinline__ float key_reduce16(float (&v)[16], int lane) {
 __device__ int attention_keys(const AttentionArgs& a, int t, int* keys) {
     __shared__ int s_compressed;
     const int p   = a.positions[t];
-    const int lo  = max(0, p - a.window_size + 1);
+    const int lo  = max(max(0, min(a.window_floor, p)), p - a.window_size + 1);
     const int win = p + 1 - lo;
     for (int i = threadIdx.x; i < win; i += blockDim.x) { keys[i] = (lo + i) % a.ring; }
     if (threadIdx.x == 0) { s_compressed = 0; }
@@ -845,8 +1030,8 @@ __global__ void __launch_bounds__(kAttnThreads) sparse_attention_kernel(Attentio
     const int chunk = ((n + active - 1) / active + kTile - 1) / kTile * kTile;
     const int lo = split * chunk, hi = min(n, lo + chunk);
     const int seq = a.sequences != nullptr ? a.sequences[t] : a.sequence;
-    const __nv_bfloat16* window     = a.window + seq * a.window_seq_stride;
-    const __nv_bfloat16* compressed = a.compressed != nullptr ? a.compressed + seq * a.compressed_seq_stride : nullptr;
+    const std::uint8_t* window     = a.window + seq * a.window_seq_stride;
+    const std::uint8_t* compressed = a.compressed != nullptr ? a.compressed + seq * a.compressed_seq_stride : nullptr;
 
     const int head0 = group * kAttnHeads + 2 * warp;
     float q[2][16], acc[2][16];
@@ -866,19 +1051,39 @@ __global__ void __launch_bounds__(kAttnThreads) sparse_attention_kernel(Attentio
     }
     float mx[2] = {-INFINITY, -INFINITY}, l[2] = {0.0f, 0.0f};
 
-    // Each thread moves four 16-byte words of a tile: row r = threadIdx.x / 16, words c + 16 i.
+    // Each thread moves four 16-byte words (eight values each) of a tile: row r = threadIdx.x /
+    // 16, words c + 16 i. It loads their codes and scales (a window row's E4M3 codes and E8M0
+    // scales, a compressed row's E2M1 codes and E4M3 scales) and stores their BF16 values.
     constexpr int kWords = kLatent / 8;
     const int r = threadIdx.x / 16, c = threadIdx.x % 16;
-    uint4 next[4];
+    uint2 next[4];
+    unsigned next_scales = 0;
+    int next_kind        = 0; // 0: no row, 1: a window row, 2: a compressed row
     const auto fetch = [&](int tile, int count) {
-#pragma unroll
-        for (int i = 0; i < 4; ++i) { next[i] = make_uint4(0, 0, 0, 0); }
+        next_kind = 0;
         if (r < count) {
             const int key = keys[tile + r];
-            const __nv_bfloat16* row = key >= 0 ? window + std::int64_t(key) * kLatent
-                                                : compressed + std::int64_t(-1 - key) * kLatent;
+            if (key >= 0) {
+                const std::uint8_t* row = window + std::int64_t(key) * kWindowRowBytes;
+                next_scales             = 0;
 #pragma unroll
-            for (int i = 0; i < 4; ++i) { next[i] = reinterpret_cast<const uint4*>(row)[c + 16 * i]; }
+                for (int i = 0; i < 4; ++i) {
+                    const int w = c + 16 * i;
+                    next[i]     = *reinterpret_cast<const uint2*>(row + 8 * w);
+                    next_scales |= unsigned(row[kLatent + w / 4]) << (8 * i);
+                }
+                next_kind = 1;
+            } else {
+                const std::uint8_t* row = compressed + std::int64_t(-1 - key) * kLatentRowBytes;
+                next_scales             = 0;
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const int w = c + 16 * i;
+                    next[i].x   = *reinterpret_cast<const unsigned*>(row + 4 * w);
+                    next_scales |= unsigned(row[kLatent / 2 + w / 2]) << (8 * i);
+                }
+                next_kind = 2;
+            }
         }
     };
     const int lane_key = ((lane & 16) ? 8 : 0) + ((lane & 8) ? 4 : 0) + ((lane & 4) ? 2 : 0) +
@@ -887,7 +1092,13 @@ __global__ void __launch_bounds__(kAttnThreads) sparse_attention_kernel(Attentio
     for (int tile = lo; tile < hi; tile += kTile) {
         const int count = min(kTile, hi - tile);
 #pragma unroll
-        for (int i = 0; i < 4; ++i) { reinterpret_cast<uint4*>(kv_s[r])[c + 16 * i] = next[i]; }
+        for (int i = 0; i < 4; ++i) {
+            const unsigned code = (next_scales >> (8 * i)) & 0xFFu;
+            reinterpret_cast<uint4*>(kv_s[r])[c + 16 * i] =
+                next_kind == 1   ? e4m3_bf16x8(next[i], e8m0_value(code))
+                : next_kind == 2 ? e2m1_bf16x8(next[i].x, e4m3_value(code))
+                                 : make_uint4(0, 0, 0, 0);
+        }
         static_assert(kTile * kWords == 4 * kAttnThreads, "four words per thread and tile");
         __syncthreads();
         if (tile + kTile < hi) { fetch(tile + kTile, min(kTile, hi - tile - kTile)); }
@@ -1045,7 +1256,7 @@ __global__ void route_kernel(const float* __restrict__ logits, const float* __re
         const float x  = logits[std::int64_t(t) * experts + e];
         const float sp = x > 20.0f ? x : log1pf(expf(x));
         s              = sqrtf(sp);
-        sel[e]         = s + bias[e];
+        sel[e]         = ops::route_order(s + bias[e]);
     }
     __syncthreads();
     if (e < experts) {
@@ -1185,12 +1396,12 @@ __global__ void unscale_columns_kernel(Out* __restrict__ out, std::int64_t strid
     for (int r = threadIdx.x; r < rows; r += blockDim.x) { scale_value(column[r], s); }
 }
 
-// Block per position, 64 threads: one 16-byte word each.
-__global__ void ring_copy_kernel(const __nv_bfloat16* __restrict__ src, int src_ring,
-                                 __nv_bfloat16* __restrict__ dst, int dst_ring, int begin) {
+// Block per position, one 16-byte word of the packed row per thread.
+__global__ void ring_copy_kernel(const std::uint8_t* __restrict__ src, int src_ring,
+                                 std::uint8_t* __restrict__ dst, int dst_ring, int begin) {
     const int p = begin + blockIdx.x;
-    reinterpret_cast<uint4*>(dst + std::int64_t(p % dst_ring) * kLatent)[threadIdx.x] =
-        reinterpret_cast<const uint4*>(src + std::int64_t(p % src_ring) * kLatent)[threadIdx.x];
+    reinterpret_cast<uint4*>(dst + std::int64_t(p % dst_ring) * kWindowRowBytes)[threadIdx.x] =
+        reinterpret_cast<const uint4*>(src + std::int64_t(p % src_ring) * kWindowRowBytes)[threadIdx.x];
 }
 
 __global__ void f32_to_bf16_kernel(const float* in, __nv_bfloat16* out, std::int64_t n) {
@@ -1444,7 +1655,15 @@ void index_scores(const ScoreArgs& args, cudaStream_t stream) {
     if (args.heads > kScoreHeads || (args.group != 1 && args.group != 4)) {
         throw std::invalid_argument("deepseek_v41 index_scores: at most 32 heads, groups of 1 or 4");
     }
-    const dim3 grid(blocks_for(args.width, kScoreKeys), blocks_for(args.tokens, args.group));
+    if (args.list != nullptr &&
+        (args.candidates == nullptr || args.counts == nullptr || args.capacity <= 0 ||
+         std::int64_t(args.capacity) * args.block > args.width)) {
+        throw std::invalid_argument("deepseek_v41 index_scores: listed rows need candidates and "
+                                    "a width of their capacity");
+    }
+    const std::int64_t columns =
+        args.list != nullptr ? std::int64_t(args.capacity) * args.block : args.width;
+    const dim3 grid(blocks_for(columns, kScoreKeys), blocks_for(args.tokens, args.group));
     if (args.group == 4) {
         index_scores_kernel<4><<<grid, kScoreKeys, 0, stream>>>(args);
     } else {
@@ -1455,17 +1674,43 @@ void index_scores(const ScoreArgs& args, cudaStream_t stream) {
 
 void select_candidates(const float* scores, int width, int tokens, const std::int32_t* positions,
                        int ratio, int block, int keep, std::uint32_t* mask, int words,
-                       float* scratch, cudaStream_t stream) {
+                       float* scratch, int stride, cudaStream_t stream) {
     if (tokens <= 0) { return; }
-    select_candidates_kernel<<<tokens, kSelectThreads, 0, stream>>>(scores, width, positions, ratio,
-                                                                    block, keep, mask, words, scratch);
+    if (block <= 0 || stride < (width + block - 1) / block) {
+        throw std::invalid_argument(
+            "deepseek_v41 select_candidates: the scratch stride must hold a row's blocks");
+    }
+    select_candidates_kernel<<<tokens, kSelectThreads, 0, stream>>>(
+        scores, width, positions, ratio, block, keep, mask, words, scratch, stride);
     check_launch("select_candidates");
+}
+
+void candidate_lists(const std::uint32_t* mask, int words, int tokens, int group, int capacity,
+                     std::int32_t* list, std::int32_t* counts, cudaStream_t stream) {
+    if (tokens <= 0) { return; }
+    if (group <= 0 || capacity <= 0) {
+        throw std::invalid_argument("deepseek_v41 candidate_lists: a positive group and capacity");
+    }
+    candidate_lists_kernel<<<blocks_for(tokens, group), kSelectThreads, 0, stream>>>(
+        mask, words, tokens, group, capacity, list, counts);
+    check_launch("candidate_lists");
 }
 
 void select_topk(const float* scores, int width, int tokens, const std::int32_t* positions,
                  int ratio, int k, std::int32_t* out, cudaStream_t stream) {
+    select_topk(scores, width, tokens, positions, ratio, k, ListedRows{}, out, stream);
+}
+
+void select_topk(const float* scores, int width, int tokens, const std::int32_t* positions,
+                 int ratio, int k, const ListedRows& listed, std::int32_t* out,
+                 cudaStream_t stream) {
     if (tokens <= 0) { return; }
-    select_topk_kernel<<<tokens, kSelectThreads, 0, stream>>>(scores, width, positions, ratio, k, out);
+    if (listed.list != nullptr && (listed.counts == nullptr || listed.group <= 0 ||
+                                   listed.block <= 0 || listed.capacity <= 0)) {
+        throw std::invalid_argument("deepseek_v41 select_topk: listed rows need their counts");
+    }
+    select_topk_kernel<<<tokens, kSelectThreads, 0, stream>>>(scores, width, positions, ratio, k,
+                                                              listed, out);
     check_launch("select_topk");
 }
 
@@ -1581,10 +1826,11 @@ void unscale_columns(__nv_bfloat16* out, std::int64_t out_stride, int out_rows, 
     check_launch("unscale_columns");
 }
 
-void ring_copy(const __nv_bfloat16* src, int src_ring, __nv_bfloat16* dst, int dst_ring, int begin,
+void ring_copy(const std::uint8_t* src, int src_ring, std::uint8_t* dst, int dst_ring, int begin,
                int end, cudaStream_t stream) {
     if (end <= begin) { return; }
-    ring_copy_kernel<<<end - begin, kLatent / 8, 0, stream>>>(src, src_ring, dst, dst_ring, begin);
+    static_assert(kWindowRowBytes % 16 == 0, "whole 16-byte words per window row");
+    ring_copy_kernel<<<end - begin, kWindowRowBytes / 16, 0, stream>>>(src, src_ring, dst, dst_ring, begin);
     check_launch("ring_copy");
 }
 

@@ -18,8 +18,10 @@ system for `Qwen3_5ForCausalLM` / `Qwen3_5MoeForCausalLM` on one RTX 5090 (`sm_1
 `max_concurrency` 1..8, every KV profile (BF16, INT8-G64, FP8-E4M3FN-row256, NVFP4-G16, K8V4),
 and every speculative backend (none, MTP, DFlash, DFlash2).
 
-In this line the mode runs on one device: pipeline stages (`--devices` with more than one entry)
-are rejected with it, and so are the checkpoint catalog's own policies (`--auto-long-anchors`,
+The mode also runs over pipeline stages and tensor parallelism (`--devices` with more than one
+entry), where `ninfer-serve` selects it only when `--use-alt-prefix-caching` is named. Its state
+images are sharded over the ranks like the live state, and its copies run on every rank's stream.
+The checkpoint catalog's own policies are rejected with it (`--auto-long-anchors`,
 `--auto-prefix-grid`, `--context-cache-policy`, `--release-diverged-checkpoints`,
 `--thorough-admission-search`, `--recency-eviction`, `--value-aware-demote`, the disk tier). Host
 restores and snapshot copies take the rank-stream form of the KV and StateImage copy routines, and a
@@ -32,8 +34,9 @@ Coexistence rules:
   `--use-original-prefix-caching` is given or an option only the catalog serves selects the
   catalog: its capacities (`--device-state-slots`, `--host-state-slots`, `--host-kv-mib`,
   `--max-private-continuations`, `--max-shared-prefixes`, `--max-long-anchors-per-continuation`),
-  anchors and policies, the disk tier, slot files, pipeline `--devices`, `--no-prefix-reuse` or a
-  `--graft`. With `--use-alt-prefix-caching` named, those options are rejected instead; Hybrid-only
+  anchors and policies, the disk tier, slot files, several `--devices`, `--no-prefix-reuse` or a
+  `--graft`. With `--use-alt-prefix-caching` named, several `--devices` keep Hybrid and the other
+  options are rejected instead; Hybrid-only
   options are rejected with the catalog. `--host-cache-mib` applies to both modes (in Hybrid mode
   it sizes the Host slab pool). Gemma 4 and Qwen3.8-Flash-Next run context caches of their own,
   and their Engine reports the Legacy mode.
@@ -59,15 +62,15 @@ Hybrid mode configures itself: the only capacity a deployment chooses is `--host
 | §5.4 unified Host slab pool | implemented: KV blocks, snapshot images (split over slabs) and snapshot tails share one pinned pool; GDSF and the dead-KV sweep decide the split at run time |
 | §6 admission as the Engine's materialization transaction | implemented: staging reserves every Device page and the state slot, Host restores run on a dedicated restore stream, and activation forks the lane at once; its Device work queues behind the copies it reads, layer by layer (§6.4, §6.5, §12.1) |
 | §6.6 prefetching the blocked head | implemented: Host-only path blocks are copied into spare Device cache while the FIFO head waits |
-| §7.1 taps | implemented: exact taps (explicit, generation opener, structural) split the chunk; flexible taps (prompt tail, ladder) are realized at chunk boundaries at no extra forward pass |
+| §7.1 taps | implemented: exact taps (explicit, generation opener, structural) are taken inside the prefill pass (§7.2) or, where it cannot take them, split the chunk; flexible taps (prompt tail, ladder) are realized at chunk boundaries at no extra forward pass |
 | §7.4 tap publication | implemented: deferred until the anchoring blocks commit (a frontier inside a block, or an MTP backend one token behind); exact-frontier tails are copied into cache-owned pages |
 | §7.6 block publication, write-through | implemented: blocks join the tree at every commit; a lane's blocks are written to Host in one batch when it releases them |
-| §7.7 endpoint snapshots at finish and consistent abort | implemented |
+| §7.7 endpoint snapshots at finish and consistent abort | implemented; a turn ended by a stop string publishes the state from where the match began; the catalog returns the sequence to that state before Finish |
 | §6.2 cost model | implemented: the Engine's context-cost coefficients (prefill and Host-to-Device transfer) rank sources and value snapshots |
 | §5.5 persistence across restarts | implemented (opt-in `--prefix-cache-file`) |
 | §12.2 in-flight prefix coalescing | implemented: requests sharing a new prefix with a lane still prefilling wait for its snapshot at the divergence instead of prefilling the prefix again; in this line a request is admitted while another prefills with `--concurrent-prefill`, or without it only while every staged prefill is a last chunk that can share a pass, so coalescing needs the option |
 | reuse-loss attribution | implemented: the request log's `materialization` record carries `cached_prefix_tokens` (longest cached block prefix, reusable or not), and `restored_host_bytes` |
-| §7.2–§7.3 zero-split GDN state tap and phase alignment | not implemented: an exact tap costs one prefill split (about 15 ms per turn on 27B); flexible taps avoid it, and requests resuming from an endpoint skip the opener tap (§7.1) |
+| §7.2 in-pass exact taps | implemented for text chunks on one device without a masked drafter, up to four a chunk; vision chunks, tensor parallelism and DFlash/DFlash2 split the chunk at the tap. Ternary Bonsai 2 27B on an RTX 4090: a 213-token first prompt with a system-block tap prefilled in 47.1 ms instead of 52.8 (47.5 instead of 53.3 with MTP) |
 | §11.2 KV transfer Op | copy-engine path only (`cudaMemcpy2DAsync` runs over consecutive pages and slabs) |
 | §6.3 persistent backfill proof | not issued: a blocked FIFO head is never overtaken (a proof with a growth reserve moved latency from short to long requests without a net gain, §6.3) |
 | §12 optional features other than 12.1 and 12.2, §13.2 Op qualification | not implemented |
@@ -156,13 +159,12 @@ addressable**.
 | LMCache | Layer-wise pipelined KV loading overlapped with compute. |
 | GreedyDual-Size-Frequency (Cherkasova, 1998) | Size- and cost-aware eviction with O(1) aging via an inflation value `L`. |
 
-NInfer-specific additions in the design (1 and 2 are not implemented, §7.2):
+NInfer-specific additions in the design:
 
-1. The GDN **state tap**: chunked GDN already produces the state at every 64-token intra-chunk
-   boundary, so exposing it costs one extra state write.
-2. **Phase alignment** by identity-transition padding, so taps land on absolute page boundaries.
-3. One pinned **slab pool** for both KV and state.
-4. **Dead-KV** accounting: KV that no snapshot can reach has zero reuse value.
+1. The **in-pass tap**: the prefill pass runs each GDN layer's convolution and recurrence up to an
+   exact tap into the snapshot slot and continues from it, so the tap costs no extra pass (§7.2).
+2. One pinned **slab pool** for both KV and state.
+3. **Dead-KV** accounting: KV that no snapshot can reach has zero reuse value.
 
 ---
 
@@ -211,7 +213,6 @@ x8, restores move 24–27 GB/s.
 | H2D snapshot | ≈ 3.9 ms |
 | H2D 100 k tokens INT8 KV (3.38 GB) | ≈ 68 ms |
 | Prefill, 27B, ~121 k context (README median) | ≈ 4.2 k tok/s, so 100 k tokens ≈ 24 s |
-| GDN tap write (144 MiB) inside a chunk (zero-split tap, not implemented) | ≈ 0.09 ms |
 | Write-through rate at 4.2 k tok/s INT8 prefill | ≈ 140 MB/s (0.3 % of PCIe) |
 
 Consequences:
@@ -253,8 +254,9 @@ Ownership against AGENTS.md boundaries:
 
 - **Core** owns physical primitives: the paged KV cache's record-addressed Host copies, which
   copy runs of consecutive pages and slabs as one strided transfer per plane.
-- **Ops** gain nothing: the zero-split GDN tap (§7.2–§7.3) and a KV page transfer kernel (§11.2)
-  are not implemented. Taps are Device copies of the committed StateImage.
+- **Ops** gain nothing: an in-pass tap (§7.2) calls the convolution and recurrence Ops once per
+  piece, and a KV page transfer kernel (§11.2) is not implemented. Flexible taps are Device copies
+  of the committed StateImage.
 - **Program** owns the whole cache: exact identity, physical residency, refs, eviction, taps.
   There is no cross-layer logical/physical split, because the cache's policy decisions are
   local physical facts. In Hybrid mode `ResourceManager`, `MaterializationPlanner`,
@@ -351,6 +353,7 @@ struct Snapshot {
     uint32_t restore_pins;
     SnapshotKind kind;                  // Tap | Endpoint | OutputBoundary | Boundary (§9.3)
     bool superseded;                    // §9.3
+    bool branch_point;                  // §9.3
     // Host eviction (GDSF)
     double   gdsf_h; uint32_t freq;
     uint64_t last_hit_tick;
@@ -378,8 +381,21 @@ struct Snapshot {
   Hybrid mode. Active admission still requires `M ≥ max(L, C)`.
 - **Device state pool**: `C` active slots plus `D = device_snapshot_slots` snapshot slots in the
   existing slot-indexed layout (`ssm_states [128,128,Hv,C+D]` per layer, and so on). Snapshot slots
-  are also the staging destination for taps (§7.4). Default `D = C + 1` with a Host tier (one
-  resident snapshot per live conversation plus one staging slot) and `C + 2` without one.
+  are also the staging destination for taps (§7.4). Default `D = C + 2`, with or without a Host
+  tier: one resident snapshot per live conversation, one staging slot, and one more for a shared
+  prefix or another conversation. A Host tier smaller than the conversations it serves cannot
+  stand in for the last one, since their images take the slabs their blocks need: in the replay of
+  issue #222's workloads (§9.3; two lanes, four conversations of 8,900-token turns, KV k8v4),
+  `C + 1` reused 0 % of the prompt tokens with a 1 GiB Host tier and 1.7 % with 2 GiB, `C + 2`
+  27 % and 71 %. Over the whole replay `C + 2` cut the modelled prefill time by 5.5 %: by 27 % on
+  the cases a 2 GiB tier changed, 8.7 % on those a 4 GiB tier changed (13 faster, 11 slower, by up
+  to 43 %), and within 2 % with 8 and 12 GiB. The slot costs one StateImage of VRAM (about
+  147 MiB for Qwen3.8-27B with MTP), which automatic sizing takes from Device KV. A default `D`
+  yields to the KV capacity: when an explicit capacity, or automatic sizing's floor
+  `M = max(L, C)` beside its headroom, does not fit beside `D` slots, the capacity resolver
+  (`runtime/engine/kv_capacity.cpp`, from the per-slot bytes on the target's capacity curve) keeps
+  the largest `D ≥ 1` that fits, the plan is built again with it, and startup logs the change. A
+  given `D` is kept; a capacity that does not fit beside it fails naming `--device-snapshot-slots`.
 - **HostSlabPool**: one pinned allocation of `host_cache_bytes`, divided into slabs. A slab holds
   one block bundle: the Main page packed with its Host page layout, then the backend page at the
   next 4 KiB boundary; `slab_bytes` is that record rounded up to 4 KiB. A snapshot image uses
@@ -424,8 +440,10 @@ directory, or `--host-cache-mib 0`, so an unusable location fails before any cac
   (absolute artifact path, size and modification time, prefill signature, KV storage, speculative
   backend, RoPE scaling, the control vectors' digest, and the product binary's identity — build id plus executable size and
   time, so any rebuild invalidates it) and its Host geometry equal the running Engine's, and its
-  size matches its tables. The file (format 3) holds the header, the block table, the snapshot
-  table and only then the slab bytes, so the loader chooses before it reads any slab. A Host tier
+  size matches its tables. The file (format 5) holds the header, the block table, the snapshot
+  table (each snapshot's anchor, tail, kind, the hits it still counted, and its branch-point and
+  periodic flags, §9.3) and only then the
+  slab bytes, so the loader chooses before it reads any slab. A Host tier
   that holds the whole file restores all of it. A smaller one restores whole snapshots, greedily
   by the GDSF density of §9.3 without its time-dependent base — (1 + hits) × the prefill a
   restore saves from the root, per byte of image, tail and anchor path — each with the path
@@ -455,8 +473,13 @@ directory, or `--host-cache-mib 0`, so an unusable location fails before any cac
    list) whose tail tokens equal `prompt[64·(anchor.depth+1) .. F)`, with **`F ≤ n − 1`**. At
    least one prompt token is always prefilled, so logits, continuation hidden and MTP/DFlash
    bridges come from the normal path. No full-hit path exists.
-3. Frontiers inside a Vision token span are not valid resume points. Tap placement never creates
-   them, and match rejects them defensively.
+3. Frontiers inside a media item's token span are not valid resume points, and neither are
+   frontiers past the item inside the block it begins in (`media_exclusion`). A block's key
+   carries every item that begins before the block's end, while a snapshot's tail is compared as
+   tokens alone and media tokens are placeholders: an item that begins in the frontier's own
+   partial block would be in no key. Taps and endpoints are never placed there (a tap that would
+   be moves to the item's first token), and match rejects such frontiers defensively, which also
+   retires snapshots a file saved before this rule holds.
 
 Complexity is O(k + snapshots on path). A 240 k prompt is 3,750 hash probes and exact 256 B
 compares: tens of microseconds.
@@ -627,10 +650,11 @@ did not fit beside the active sequences while the head waited.
 
 ### 7.1 Tap planning
 
-`plan_taps(n, base F_s, hints, existing frontiers, Vision exclusions)` returns taps sorted by
-position, each `{p, placement}` with `F_s < p ≤ n − 1`, `p` not strictly inside a Vision token span
-(a candidate inside one moves to the span start), and no existing or already-planned snapshot at
-or near `p` on this path.
+`plan_taps(n, base F_s, hints, existing frontiers, media exclusions)` returns taps sorted by
+position, each `{p, placement}` with `F_s < p ≤ n − 1`, `p` not strictly inside a media item's
+exclusion (its token span, extended to the end of the block it begins in, §6.1; a candidate
+inside one moves to the item's first token), and no existing or already-planned snapshot at or
+near `p` on this path.
 
 Candidates, in priority order:
 
@@ -642,8 +666,9 @@ Candidates, in priority order:
 | 4 | `n − 1` ("prompt tail") | flexible | regenerate / retry of the same prompt |
 | 5 | geometric ladder: for k = 0,1,…, `n − G·2^k` (G = `tap_ladder_tokens`), snapped back to a message boundary within the minimum gap | flexible | edits deep in history. Spacing grows with distance, so there are about log2(n/G) taps |
 
-- **Exact** taps split the prefill chunk at `p` (one more forward pass each) and snapshot there.
-  Semantic boundaries are where later prompts diverge, so the exact position is worth the split.
+- **Exact** taps snapshot the state at `p` itself. The prefill pass takes up to four of them
+  inside a chunk (§7.2); elsewhere a tap splits the chunk at `p` (one more forward pass). Semantic
+  boundaries are where later prompts diverge, so the exact position is worth it.
 - **Flexible** taps never split: the snapshot is taken at the end of the chunk that reaches `p`, or
   at the start of the prompt's final chunk when `p` lies in it (the prompt tail always does). A
   chunk boundary costs nothing beyond the snapshot copy.
@@ -655,7 +680,7 @@ Candidates, in priority order:
   candidate redundant: a non-explicit candidate is dropped when an accepted tap, an existing
   snapshot on the path or the base lies at most 64 tokens before it. Ladder candidates keep
   `tap_min_gap` (default `max(1024, chunk)`) on both sides instead. The opener therefore absorbs
-  the prompt tail in chat traffic, leaving one split per request.
+  the prompt tail in chat traffic, leaving one exact tap per request.
 - Only markers with explicit evidence (a client-named breakpoint) are priority 1. Protocol-automatic
   markers (OpenAI default caching, Anthropic automatic `cache_control`) are planned as structural
   boundaries, but they mark the conversation's latest turn rather than a prefix conversations
@@ -685,68 +710,35 @@ Candidates, in priority order:
 Tap placement is a function of the prompt, so it is deterministic. Endpoint snapshots are exact
 (§7.7).
 
-Exact taps are the only prefill splits in Hybrid mode. The chat template's rewrite execution
+Exact taps that the pass cannot take are the only prefill splits in Hybrid mode. The chat template's rewrite execution
 frontiers (after each assistant header, after `<think>`, after the reasoning close) split Legacy
 prefill for its rewrite checkpoints and execution provenance. Hybrid captures nothing there, so a
 Hybrid lane ignores them. Each split is a whole extra pass over the model. A short chat turn used
-to prefill as four passes (reuse point, opener, `<think>`, reasoning close). Now it takes two (to
-the opener, then the rest), or one when the opener is dropped, unless a client breakpoint or
-structural boundary falls inside the new tokens.
+to prefill as four passes (reuse point, opener, `<think>`, reasoning close). Now it takes one, with
+its exact taps inside the pass, or two with a tap the pass cannot take.
 
-### 7.2 Phase-aligned chunked GDN
+### 7.2 In-pass exact taps
 
-**Not implemented** (§7.2 and §7.3 together form the zero-split tap). The implemented tap copies
-the lane's committed StateImage at a chunk boundary (≈0.25 ms D2D), so only exact taps pay a split.
-Build this only if measurement shows the remaining exact-tap split matters.
+A text prefill chunk on one device takes up to four exact taps strictly inside it without ending
+the pass at them (`TextContext::set_gdn_taps`):
 
-The chunked GDN kernel's intra-chunk grid is relative to the call start. To make every internal
-boundary an absolute multiple of 64, the Op gains a `phase = base % 64` parameter:
+- Before the chunk, each tap reserves a staging snapshot slot (as a chunk-boundary tap does, §7.4);
+  a tap without a free slot, inside an exclusion or at most at the lane's last capture ends the
+  chunk at it instead.
+- Every GDN layer runs its causal convolution and its gated delta rule once per piece: from the
+  lane's source slot to the first tap's slot, from each tap's slot to the next, and from the last
+  tap's slot to the destination. Each call starts its chunk grid at the piece's first column, as
+  the pass split at the tap would, so the tapped convolution history and recurrent state equal
+  that pass's. The attention layers, the MLPs and the KV writes run over the whole chunk.
+- The final norm's column `p − 1` is copied into the slot's continuation hidden.
+- After the chunk the taps are published as pending taps (§7.4); a chunk that did not take them
+  (its length or a vision span did not hold them all) releases the slots, and the tap splits the
+  next chunk.
 
-- The kernel treats the call as if it were left-padded by `phase` virtual tokens with
-  `k = 0, v = 0, g = 0, β = 0`. For such a token, `α = exp(0) = 1` exactly and
-  `delta = 0 · (v − αS·k) = 0` exactly, so `S ← 1·S + outer(0, k) = S` **bit-exactly**.
-- Padded outputs are not written.
-- Padding is by predicated loads, with no workspace copy.
-- `phase = 0` is the current behaviour, bit for bit.
-
-Prefill chunks remain `--prefill-chunk` tokens long. The **first** chunk after a non-aligned base
-is `chunk − phase` tokens long, so every later chunk starts page-aligned. This is one boundary
-change in `TextContext::prefill`. In Hybrid mode no `prefill_split_frontier_` or
-`rewrite_execution_frontiers` split is requested (both remain for Legacy).
-
-### 7.3 Tap Op contracts
-
-**Not implemented** (the design of the zero-split tap, with §7.2).
-
-For each prefill unit with taps `T_u = T ∩ (unit_begin, unit_end]`, `|T_u| ≤ taps_per_unit`
-(default 4, bounded by free snapshot slots):
-
-1. **GDN state tap**: `gated_delta_net(..., StateTapSet taps)`. For each tap `j`, the kernel writes
-   the FP32 state after absolute position `p_j` for every value head into
-   `snapshot_slot[j].ssm_state[layer]`.
-   - Stores use `st.global.cs` (streaming) to avoid displacing prefill working sets in L2.
-   - Oracle: the FP64 naive recurrence evaluated to `p_j` (op-development §numerical).
-   - Exactness criterion: the tapped state is **bit-identical** to the final state of a separate
-     call on the same inputs ending at `p_j` with the same phase. Same chunk grid, same
-     arithmetic.
-2. **Conv tap**: per GDN layer, copy the `kernel_width − 1 = 3` pre-conv projected columns
-   `[p_j − 3, p_j)`, taken from the current unit's projection output or the previous conv history
-   when `p_j − unit_begin < 3`, into the slot's conv history. Exact copy, exact oracle.
-3. **Hidden tap**: the continuation hidden at column `p_j − 1`, stored for completeness. It is
-   never used for a full hit (§6.1).
-4. **DFlash/DFlash2 ring tap**: after the unit's context K/V materialisation, and *before* the
-   ring is overwritten, assemble `slot.ring = ring(positions [p_j − S, p_j))`. Each position comes
-   from the pre-unit ring if `< unit_begin`, otherwise from the unit's freshly materialised K/V.
-   The materialiser writes this unit's context K/V to a unit staging buffer first; the ring commit
-   and the tap gathers both read from it. Exact copy.
-   - The DFlash Full (paged) pool is committed through the chunk at unit commit, so its pages
-     belong to the tree like Main pages.
-5. **MTP**: MTP KV is paged. Tap snapshots carry no MTP state. A resume performs the Program's
-   existing MTP bridge from the resumed frontier, as for any Program-resumed frontier today.
-
-If no snapshot slot is free when the unit starts, the tap is skipped and counted
-(`taps_skipped_no_slot`). In practice D2H of a slot (≈4 ms) finishes long before the next unit
-(≥0.3 s).
+Vision chunks, tensor parallelism (whose GDN heads are divided over the ranks) and a masked
+drafter (DFlash, DFlash2: its context ring in the image would have to end at the tap too) split
+the chunk at the tap. MTP needs nothing: tap snapshots carry no MTP state, and a resume runs the
+MTP bridge from the resumed frontier.
 
 ### 7.4 Tap publication
 
@@ -809,6 +801,40 @@ At terminal settlement (Finish, or Cancel after at least one committed unit):
    (§9.1), inserted in **reverse block order**, so deeper blocks are evicted before shallower
    ones.
 3. Free `Duplicate` and growth pages. Release the active state slot.
+
+**A turn that a stop string ends.** The visible text ends where the stop string's match began,
+and a state that has read tokens of the match continues no later prompt. The output session
+reports the round in which a match prefix is first held back and the number of the round's tokens
+before it (`OutputDecision::stop_hold_after`), and whether a finish cuts the output there
+(`stop_cut`; a stop string that stays in the output ends inside the round's last token and cuts
+nothing the state has read).
+
+- The match begins in the round that ends the turn: the Engine commits only the round's tokens
+  before it (`CommitDecision::accepted_tokens`), so `F_end` is that position and step 1 publishes
+  the endpoint as for any turn, with every speculative backend and without the hybrid cache too.
+- The match begins in an earlier round: the lane keeps the state after exactly the tokens before it
+  in a device snapshot slot of its own (`HybridLaneState::hold`), replaced when a later match
+  begins. A round without drafts (or the prompt's last step) has not read the token that begins the
+  match, so the lane's StateImage is copied. An MTP round folds the row's replay records once more,
+  with that many columns and the kept image as destination, before the fold that commits the
+  round, and copies the target's hidden at that column: the same state transition a round ending
+  there commits. At Finish the kept state is published as the turn's `Snapshot{Endpoint}` at its
+  frontier (its tail copied from the lane's page, as a tap's), under the conditions of step 1.
+  The state at `F_end` is not published. Any other finish drops the kept state.
+- A DFlash or DFlash2 round keeps the same folded image and hidden. Its image also carries the
+  drafter's local context, which ends at the round's base until the next round appends the
+  round's target features: the kept image takes a copy of the lane's context and the features of
+  the tokens before the match (`enqueue_dflash_context_append` with the kept image as
+  destination), through the pinned ingress that a terminal row's append uses, so the host waits
+  for it. A row whose image is a pending fork keeps nothing. A round without drafts keeps its
+  image only when the context already ends at the frontier (after a prompt).
+- The checkpoint catalog keeps the same state in a Device StateImage of the lane's own, outside
+  the catalog's slots (`models::stop_hold_slots`, one for each concurrent request;
+  `ContextCacheOptions::stop_hold_images`, dropped at startup when the KV capacity does not fit
+  beside them). The terminal commit copies it back over the lane's image and cuts the ledger, the
+  prefix identity and the KV extents to its frontier, so Finish catalogs an ordinary endpoint
+  there. A checkpoint of the sequence past that frontier, or an image the sequence shares, keeps
+  the turn as it ended.
 
 `Disabled` requests (Serve warmup, `--no-prefix-reuse`) never insert nodes or snapshots.
 Their pages are freed at terminal.
@@ -907,6 +933,14 @@ while retention policy lives in the Program's index.
 
 Two lists are kept, *backed* and *unbacked*, and backed entries are always consumed first.
 
+A snapshot tail joins the list only when its snapshot holds no Device slot, and it joins when the
+snapshot gives the slot up (§9.2). The slot image is restorable only together with its tail, and
+it costs at most one page per slot. A tail evicted alone left its snapshot in the slot but no
+longer complete on the Device, so Host eviction (§9.3) deleted the snapshot instead of keeping its
+Device copy. A larger Host tier backs more tails, which this list consumes first, so a rotation
+of conversations resuming from slot snapshots reused fewer prompt tokens with 4 GiB than with
+2 GiB (the numbers are in §9.3).
+
 ### 9.2 Device snapshot slots
 
 Slots hold at most `D` images. A sequence about to snapshot past its previous snapshot (the one
@@ -918,8 +952,9 @@ comes from its own lineage when it can. A tap or endpoint takes a slot in this o
    copy or, without one, is deleted;
 3. a slot owned by a Device-only snapshot (no Host copy: the Host tier is full, disabled or
    evicted it): the one with the lowest GDSF priority (§9.3), and only when the new snapshot's
-   estimated priority (no hits, and the blocks since the sequence's previous snapshot its own) is
-   at least as high. The snapshot is lost, and `L` rises to its priority;
+   estimated priority (the hits its lineage carries, §9.3, and the blocks since the sequence's
+   previous snapshot its own) is at least as high. The snapshot is lost, and `L` rises to its
+   priority;
 4. the least recently hit Host-backed snapshot's slot, which loses only its Device copy.
 
 Otherwise the tap or endpoint is skipped, and `L` rises to its estimated priority, as if it had
@@ -930,7 +965,8 @@ Host eviction had made Device-only in their slots for good. Without the rise, no
 owners that are never hit again: decision reads about a stream of new states hit each state's
 snapshot two or three times, and once those snapshots filled the Host tier and the slots, every
 later state's snapshot was refused (about 50 states into a run on an RTX 3090 with an 8 GiB Host
-tier) and every read prefilled its state again.
+tier) and every read prefilled its state again. A snapshot that keeps its Host copy when its
+slot goes puts its tail on the Device LRU (§9.1).
 
 ### 9.3 Host (superseded snapshots first, then GDSF; dead-KV first)
 
@@ -940,23 +976,45 @@ deeper snapshot on its path, the snapshot it resumed from becomes *superseded*, 
 previous tap it captured in the same prompt when the new snapshot is a tap, before the new snapshot
 takes a Device slot or Host slabs: only a request diverging before the newer snapshot (a retry, an
 edit) can still use them. The endpoint leaves the prompt's last tap retained, since a next turn
-whose template re-renders the reply (stripped thinking) resumes from that tap. A hit on a superseded
-snapshot retains it again, until that lineage moves on. A `Boundary` snapshot (a tap at a client
-breakpoint or structural boundary, or at the divergence of coalesced requests, §12.2) may be shared
-by conversations, so it is superseded only while no other conversation has continued from it: while
-the tree below it is a single chain. Until then it is just its lineage's snapshot. A request with
-`CacheRetentionHint::Disposable` (the decision endpoints' reads) has no lineage, since no request
-continues it, and supersedes nothing it resumed from. The first of several reads that share a
-boundary would otherwise supersede it with its endpoint, so far the only branch below the boundary,
-and the boundary would then give up its Device slot and Host slabs first while the other reads
-still wait to resume from it.
+whose template re-renders the reply (stripped thinking) resumes from that tap. For the same reason
+an endpoint supersedes the snapshot its request resumed from only when that is an endpoint too (a
+client that echoes the generated text resumes its next turn from the new endpoint): a tap or
+boundary stays retained. A short follow-up turn captures no tap of its own (it is shorter than the
+minimum tap separation), so its endpoint used to supersede the tap a re-rendering client's next
+turn resumes from, and that turn missed under pressure. A hit on a superseded
+snapshot retains it again, until that lineage moves on: the hit is as likely the same conversation
+coming back, such as the next turn after a retry that resumed from the same tap. A tap that only the
+next tap of its own prompt superseded is different. No request has resumed from it, so a hit on it
+comes from a request that diverged from that prompt after the tap (another question about the same
+document, an edit). Requests branch there, and each branch would supersede it again as it moves on,
+so the hit makes the tap a *branch point*: nothing supersedes it, and GDSF alone values it (§5.5
+saves the flag). A `Boundary` snapshot (a tap at a client breakpoint or structural boundary, or at
+the divergence of coalesced requests, §12.2) may be shared by conversations, so it is superseded
+only while no other conversation has continued from it: while the tree below it is a single chain.
+Until then it is just its lineage's snapshot. A request with `CacheRetentionHint::Disposable` (the
+decision endpoints' reads) has no lineage, since no request continues it, and supersedes nothing it
+resumed from. The first of several reads that share a boundary would otherwise supersede it with its
+endpoint, so far the only branch below the boundary, and the boundary would then give up its Device
+slot and Host slabs first while the other reads still wait to resume from it.
 
 Allocation of `k` slabs:
 
 1. **Dead KV sweep**: pop host-resident nodes with `live_snapshots_below == 0`,
    `active_refs == 0` and no pins, leaves first. These can never produce a hit.
-2. Otherwise evict the oldest superseded snapshot entirely (both copies; `L` is unchanged), then
-   repeat step 1.
+2. Otherwise the oldest superseded snapshot gives up its host copy (`L` is unchanged), then
+   repeat step 1. One still complete on the Device keeps that copy, whose slot goes first when a
+   new snapshot needs one (§9.2); any other is deleted. Deleting the Device copy here too would let
+   a lane's block write-through into a small Host tier at release delete the superseded taps of
+   its prompt, and with them every snapshot the next question about the same document could resume
+   from. For the same reason a lane's Host writes skip the newest tap that a later tap of its
+   prompt superseded: its block write-through, whose blocks are that tap's own, and the image
+   writes of its later taps and endpoint. When other conversations hold the Device slots, the taps
+   of a new document's first question pass one slot along, each keeping only its Host copy, and the
+   write-through used to evict them for their own blocks; the second question then recomputed the
+   whole document (115,210 tokens after a four-conversation rotation with an 8 GiB Host tier, in
+   the replay of §5.4). Once the Host tier is full, the next tap's image takes the same slabs:
+   with the slot tails of §9.1 and without this rule, a 115,210-token document asked about after a
+   three-conversation rotation with a 2 GiB Host tier was recomputed by all ten questions.
 3. Otherwise evict the retained snapshot with minimum `H`, then repeat step 1 (its exclusive path
    has just become dead). Update `L := H(victim)`. A victim still complete on the Device (image in
    a device slot and tail resident) only gives up its host copy and stays restorable.
@@ -964,8 +1022,13 @@ Allocation of `k` slabs:
 A snapshot image write stops at step 3 when the victim is worth more than the new snapshot
 (`H(victim) > H(new)`): GDSF never inserts what it would evict next, and the new snapshot stays
 Device-only (§9.2). `L` still rises to `H(new)`, as if the new snapshot had been inserted and
-evicted, so retained snapshots that are not hit again age out. KV block writes (write-through at
-release) are not bounded this way.
+evicted, so retained snapshots that are not hit again age out. A lane's block write-through at
+release stops at step 3 the same way at a victim worth more than the lane's most valuable retained
+snapshot (`retained_priority` of the snapshots it published), and at every retained victim when
+the lane published none: the blocks are worth what the snapshots anchored on them are worth.
+Unbounded, a conversation's release evicted retained snapshots of the other conversations, which
+are worth more, for blocks no snapshot of its own needed, and the next turn of each of them
+prefilled its context again.
 
 ```text
 H(s)  = L_s + F(s) · C(s) / Z(s)                // L_s: L when s was published or last hit
@@ -975,7 +1038,7 @@ C(s)  = prefill_seconds(base=F_a, tokens=F_s−F_a) − restore_seconds(image)  
 Z(s)  = image_bytes + tail_bytes + exclusive_path_bytes(s)
         exclusive_path_bytes: host bytes of the nodes on path(s) below which s is the only
         retained snapshot
-F(s)  = 1 + hits(s)                             // hits since publication
+F(s)  = 1 + hits(s)                             // hits counted now, see Hits below
 ```
 
 - Each snapshot records its nearest snapshot above it on its path (`ancestor`) and the snapshots
@@ -992,12 +1055,77 @@ F(s)  = 1 + hits(s)                             // hits since publication
   stuck resume point, 24 subagent turns prefilled from the root beside a cached 19.8K-token
   shared prefix).
 - `C` uses the same calibrated model as §6.2, so eviction and admission agree about value.
-- Aging comes from `L`, so snapshots that are no longer hit fall behind new ones without timers.
+- **Hits.** A snapshot's hits count only while they are recent. A clock advances by one for every
+  block inserted into the tree and by `image_slabs` for every snapshot published: by the slabs of
+  new content, so the cache turns over once in about `max_nodes` (Device pages plus Host slabs)
+  units. Once a third of that has passed since a snapshot's last hit (or its publication or
+  restore, §5.5), its hits count as zero, except that a *periodic* snapshot counts half of them for
+  another third; a hit adds one to the hits still counted. A snapshot becomes periodic when a hit
+  comes at least half a window after the hit or publication before it (§5.5 saves the flag):
+  requests return to it after a pause, such as a document asked about once per round of other
+  conversations, or a conversation resumed once per round. The half step keeps such a snapshot
+  when the working set overflows the cache: conversations that missed are prefilled again and
+  republish their ladder taps, so one round can pass a whole window, and dropping every hit there
+  evicted the document for a conversation that missed anyway (issue #248: a 115,210-token
+  document asked once per round of a four-conversation rotation on an RTX 4090 with an 8 GiB Host
+  tier was recomputed three times out of eight). A snapshot hit only in one burst gets no half
+  step: a document asked about ten times in a row would hold the cache a window longer than the
+  hits that earned it, against the conversations that follow (issue #222's order). When a
+  request supersedes the snapshot it resumed from, that snapshot's counted hits pass to the
+  snapshots the request publishes next and to their claims (§9.2): a conversation is resumed once
+  per turn, but each turn publishes new snapshots, which otherwise start again at `F = 1`.
+- Aging comes from `L` and from the hit window, so snapshots that are no longer hit fall behind new
+  ones without timers. With `F` growing for good, a document hit nine times kept its rank long after
+  its questions stopped (issue #222): a four-conversation rotation that followed it on an
+  RTX 4090 (KV k8v4, 131,072-token cache, 8 GiB Host tier) reused 15 % of its 1,070,925 prompt
+  tokens instead of 83 % on a fresh engine. Replaying that workload and its neighbours through the
+  index (rotations of three to six conversations, documents of 57,741 and 115,210 tokens before or
+  after them, a document asked about in bursts between conversation turns, conversations sharing a
+  system prompt; Host tiers of 0 to 12 GiB), the window of a third, the lineage hits, the endpoint
+  rule above, the write-through rule of step 2 and `D = C + 2` cut the modelled prefill time from
+  83,443 s to 69,306 s in all 248 cases: 113 faster by more than 2 %, 3 slower. A document asked
+  about again after 24 or 32 conversation turns with a 12 GiB Host tier has lost its rank by then
+  and is recomputed once (+18 % and +14 %), and with a 1 GiB Host tier the finished conversations'
+  lineage hits keep them ahead of new conversations sharing a system prompt (+13 %). The other
+  windows tried changed the total by −0.1 % to +0.7 %: the whole capacity and a half slowed 9 and
+  7 cases (by up to 38 % and 21 %), a quarter and a sixth 3 each (by up to 12 % and 15 %).
+  Capping the hits a lineage passes on at 1, 2 or 4 did not help (+1.1 %, +0.1 %, 0 %).
+- A later replay of 266 cases (the workloads above with `D = C + 2`, and a
+  document asked about between the turns of a rotation of four to six conversations with 4 to
+  12 GiB Host tiers) measured the slot tails of §9.1, step 2's rule for image writes, the
+  write-through bound and the periodic half step together: the modelled prefill fell from
+  79,045 s to 74,855 s, 42 cases faster by more than 2 %, 8 slower. Leaving one out gives
+  78,484 s (slot tails), 77,358 s (image writes), 76,408 s (write-through bound) and 75,548 s (no
+  half step). The half step for every branch point, burst or not, gives 75,204 s and 15 slower
+  cases (up to +47 %); for periodic branch points only, 75,039 s. The slower cases: a
+  57,741-token document before five conversations of 4,400-token turns or six of 8,900 with a
+  2 GiB Host tier (+3.5 %, +12.1 %: more conversations resume than there are Device slots, so the
+  owners of the slots replace one another); a document asked about after every 24 or 32
+  4,400-token turns (+3.2 %, +4.0 %); a document asked about between the turns of four or five
+  conversations of 8,900-token turns with 4 or 8 GiB (+3.1 % to +8.7 %); and 24 conversations
+  sharing a system prompt with 1 GiB (+6.2 %). In issue #222's order (a 115,210-token document
+  asked about ten times, then four conversations of 8,900-token turns) the rotation reused
+  80.8 % of its prompt tokens with a 2 GiB Host tier, 5.8 % with 3 GiB and 17.5 % with 4 GiB
+  before these rules, and 82.4 %, 82.4 % and 79.9 % with them. Of the cases in which a larger
+  Host tier (0 to 12 GiB) was slower by more than 5 %, 6 of 17 remain, by up to 23 %.
+- On an RTX 4090 (Qwen3.8-27B IQ3_S, KV k8v4, 131,072-token cache, one request at a time), the
+  rotation in issue #222's order reused 889,765 of 1,068,544 prompt tokens with a 2 GiB Host tier
+  and 791,976 with 4 GiB without a half step, 649,379 and 444,894 with a half step for every
+  branch point, and 880,875 and 863,111 with the rules above. Against the branch-point half step,
+  with a document asked about once per round of four conversations and 8 GiB the conversations
+  reused 636,405 of 1,091,843 tokens instead of 408,919, and three cases lost: four conversations
+  alone with 1 GiB (248,981 of 1,068,538 instead of 364,617), the document asked once per round
+  of five conversations with 8 GiB (recomputed five times out of nine instead of twice, 705.3 s
+  of prefill instead of 572.8 s), and six conversations of 8,900-token turns after a 57,741-token
+  document with 2 GiB (133,511 of 1,602,812 instead of 142,322). Five conversations of
+  4,400-token turns after that document reused 65,824 of 659,092 tokens, against 114,178 without
+  a half step and 35,149 with the branch-point one.
 - Victim selection scans the snapshot table, O(snapshots); valuation walks at most one path per
   affected snapshot. Snapshot count is bounded by `host_cache_bytes / image_bytes` (about 1,300
   for a 230 GiB Host tier with 27B DFlash2 images), so the policy is independent of the tier size:
   a small tier reaches step 2 and 3 often, a large one rarely.
-- Pinned objects (`restore_pins`, `active_refs`, in-flight fills) are never evicted.
+- Pinned objects (`restore_pins`, `active_refs`, in-flight fills) are never evicted. Pinning a
+  snapshot also pins its anchor path, so the path nodes keep their copies while it is pinned.
 
 ### 9.4 Losing the last copy
 
@@ -1122,7 +1250,7 @@ Uncalibrated terms keep the index's generic defaults. No separate calibration ru
    - Without speculation: D2D of the active slot at the round boundary.
    - With speculation: a two-segment ReplaySSM Fold, `S0 → slot` over the first `j` records, then
      `slot → active` over the rest. This is bit-identical by the Fold contract. Conv and ring taps
-     are handled as in §7.3.
+     are split as in §7.2.
    - Gate: reuse gain on thinking-stripped agent traces.
 4. **KV-write elision** (not implemented) for the recomputed region (§7.5): map existing pages and send those KV
    writes to a scratch page.
@@ -1149,6 +1277,8 @@ The test design follows. §13.1 and §13.3 are implemented (`ninfer_prefix_cache
   - losing the last copy deletes exactly the subtree's snapshots.
 - **Device LRU**
   - tail-first order after release;
+  - a snapshot's tail stays on the Device while the snapshot holds a slot, and becomes evictable
+    when it gives the slot up;
   - hits move the whole path to MRU;
   - backed entries are consumed before unbacked;
   - pinned entries are never returned.
@@ -1159,6 +1289,19 @@ The test design follows. §13.1 and §13.3 are implemented (`ninfer_prefix_cache
   - `L` is monotonic.
 - **Supersession and admission**
   - a lineage's previous snapshot is superseded, and a hit retains it again;
+  - a hit on a tap that only its prompt's next tap superseded makes it a branch point, and
+    questions about one document keep resuming from the first request's ladder tap through a Host
+    tier its blocks overflow;
+  - the first question about a document whose taps pass one Device slot along keeps its newest
+    superseded tap through its block write-through and its later image writes, and the next
+    question resumes from it;
+  - a lane's block write-through displaces no retained snapshot worth more than the lane's most
+    valuable retained one, and none when the lane published none;
+  - hits count until a third of the block capacity has been published since the last hit, a
+    periodic snapshot's half of them for another third (a branch point or not, and none for one hit
+    in a burst), and a hit adds to the hits still counted;
+  - a superseded snapshot passes the hits it counted to its lineage's next snapshots and their
+    claims, and an endpoint supersedes only an endpoint;
   - a `Boundary` snapshot is superseded only while no other conversation continued below it;
   - Device slots go to superseded owners, then to the least valuable Device-only owner for a new
     snapshot worth as much, then to the least recently hit Host-backed owner;
@@ -1167,7 +1310,7 @@ The test design follows. §13.1 and §13.3 are implemented (`ninfer_prefix_cache
   - exhaustion, reuse and chunked allocation;
   - a slab never crosses chunks.
 - **TapPlanner** (property tests over random prompts and boundaries)
-  - all taps 64-aligned, in `(F_s, n−1]`, outside Vision spans;
+  - all taps 64-aligned, in `(F_s, n−1]`, outside media exclusions;
   - deduplicated against the path;
   - priority order and budget respected;
   - the ladder stays within about log2(n/G) + 1 taps;
@@ -1180,13 +1323,8 @@ The test design follows. §13.1 and §13.3 are implemented (`ninfer_prefix_cache
 
 ### 13.2 Op qualification (op-development.md contract, real 27B and 35B-A3B shapes)
 
-- **GDN tap and phase**
-  - FP64 naive-recurrence oracle at every tap, phases 0..63, T in {1, 63, 64, 65, 2048, 4096};
-  - **bitwise** equality of each tap with a truncated call on the same phase;
-  - `phase > 0` with zero taps matches the unpadded oracle within the existing GDN criterion;
-  - `phase = 0` is bit-identical to the pre-change kernel.
-- **Conv, hidden and ring taps**: exact byte comparison against a host reference gather, including
-  `p − unit_begin < 3` and ring wrap (`p > S`, `unit length > S`).
+- **In-pass taps** call the qualified convolution and GDN Ops once per piece with their state
+  slots, so they need no Op of their own; the real-artifact restores (§13.3) resume from them.
 - **`paged_kv_transfer`**
   - exact bytes for BF16, INT8, FP8, NVFP4 and K8V4, with Main+MTP and Main+DraftFull bundles,
     random page IDs, both directions;
@@ -1259,6 +1397,7 @@ enum class ContextCacheMode : std::uint8_t { Legacy, Hybrid };
 
 struct HybridPrefixCacheOptions {                           // used only when mode == Hybrid
     std::optional<std::uint32_t> device_snapshot_slots;     // --device-snapshot-slots
+    bool fit_device_snapshot_slots = false;                 // set when the count is a default
     std::optional<std::uint32_t> max_new_taps;              // --cache-taps-per-request
     std::optional<std::uint32_t> tap_ladder_tokens;         // --cache-tap-ladder (G)
     std::optional<std::uint32_t> tap_min_gap_tokens;        // --cache-tap-min-gap
@@ -1282,7 +1421,7 @@ prefill_chunk` and a Host tier present when the budget is nonzero:
 | value | default | reason |
 |---|---|---|
 | `host_cache_budget_bytes` | 8 GiB (`kDefaultHybridHostCacheBytes`); 0 disables the Host tier | the Legacy Host KV default |
-| `device_snapshot_slots` | `C + 1` with a Host tier, `C + 2` without | one resident snapshot per live conversation, plus staging; without Host the slots are the only snapshot storage |
+| `device_snapshot_slots` | `C + 2` | one resident snapshot per live conversation, one staging slot, and one for a shared prefix or another conversation, which a small Host tier cannot hold (§5.4) |
 | `max_new_taps` | 8 with a Host tier, 2 without | without Host, taps would evict other conversations' snapshots |
 | `tap_ladder_tokens` | `max(4096, 2·chunk)` | ladder taps land on chunk boundaries; a finer ladder only duplicates them |
 | `tap_min_gap_tokens` | `max(1024, chunk)` | the same |
@@ -1297,7 +1436,7 @@ Host pools (`host_state_slots`, `host_kv_capacity_bytes`) are zero in Hybrid mod
 
 | risk | mitigation |
 |---|---|
-| Exact taps cost one prefill split each | Only semantic boundaries are exact (explicit, generation opener, structural); the prompt tail and ladder are flexible and cost no split. The proximity rule leaves one split per chat request, and none after an endpoint resume. The zero-split GDN tap (§7.2–§7.3) removes the rest if measurement shows it matters. |
+| Exact taps cost one prefill split each | Only semantic boundaries are exact (explicit, generation opener, structural); the prompt tail and ladder are flexible and cost no split. The proximity rule leaves one exact tap per chat request, and none after an endpoint resume. The pass takes exact taps inside a text chunk (§7.2); vision chunks, tensor parallelism and DFlash/DFlash2 still split at them. |
 | Snapshots crowd KV out of host memory | GDSF weighs bytes against recompute seconds on the same scale for both. Dead-KV sweep runs first. |
 | Write-through competes with decode | Copy engines only, batched when a lane releases its blocks; decode rounds/s were unchanged with prefetch and write-through active. Write-through can be throttled when decode is active without changing correctness. |
 | Unbacked device eviction deletes subtrees | Only happens with no or full host cache. Backed entries are always preferred. |

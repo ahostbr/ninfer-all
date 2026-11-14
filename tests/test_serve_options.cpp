@@ -28,6 +28,95 @@ ServeOptions parse(std::vector<std::string> arguments) {
     return parse_serve_options(static_cast<int>(argv.size()), argv.data());
 }
 
+// --config files under the command line (product/option_layers.h), and the router's view of them.
+int launch_configuration_tests() {
+    int failures         = 0;
+    const auto directory = std::filesystem::temp_directory_path() / "ninfer_serve_config_test";
+    std::filesystem::remove_all(directory);
+    std::filesystem::create_directories(directory);
+    const auto write = [&](const char* name, const char* text) {
+        const auto path = directory / name;
+        std::ofstream(path) << text;
+        return path.string();
+    };
+    const std::string base = write("base.ini", "model = from-file.ninfer\n"
+                                               "host = 0.0.0.0\n"
+                                               "port = 9000\n"
+                                               "api-key = do-not-log\n"
+                                               "max-context = 32768\n"
+                                               "spec = mtp\n"
+                                               "draft-tokens = 4\n"
+                                               "adaptive-mtp = true\n"
+                                               "device-profile = off\n"
+                                               "models-max = 2\n");
+    const auto layered =
+        parse({"ninfer-serve", "--config", base, "--port", "9100", "--spec", "none"});
+    failures += check(layered.artifact_path == "from-file.ninfer" && layered.host == "0.0.0.0" &&
+                          layered.port == 9100 && layered.max_context == 32768 &&
+                          layered.api_key == "do-not-log" && layered.device_profile == "off",
+                      "a configuration file's options and artifact did not reach the server");
+    failures += check(layered.speculative.backend == ninfer::SpeculativeBackend::None &&
+                          layered.speculative.draft_tokens == 0 &&
+                          layered.speculative.mtp_policy == ninfer::MtpDraftPolicy::Fixed,
+                      "--spec none must take the file's draft settings away");
+    bool secret_logged = false;
+    bool redacted      = false;
+    for (const std::string& argument : layered.effective_arguments) {
+        secret_logged = secret_logged || argument == "do-not-log";
+        redacted      = redacted || argument == "<redacted>";
+    }
+    failures += check(!secret_logged && redacted,
+                      "the merged arguments must carry the API key redacted");
+    failures += check(layered.model_layers.size() == 2 &&
+                          layered.model_layers[0].source == base &&
+                          layered.model_layers[1].source == "command line",
+                      "each layer must reach a router's models");
+    bool router_option_kept = false;
+    for (const auto& layer : layered.model_layers) {
+        for (const std::string& argument : layer.arguments) {
+            router_option_kept = router_option_kept || argument == "--models-max";
+        }
+    }
+    failures += check(!router_option_kept, "a router option reached the models' layers");
+
+    // The router parses each model's catalog layers the same way.
+    const auto model = parse_serve_options(ninfer::product::CommandLine{
+        .program   = "ninfer-serve",
+        .artifact  = "small.ninfer",
+        .layers    = {{.source = "preset [*]", .arguments = {"--max-context", "4096"}},
+                      {.source = "preset [small]", .arguments = {"--no-cuda-graph"}},
+                      {.source = "command line", .arguments = {"--max-context", "8192"}}}});
+    failures += check(model.artifact_path == "small.ninfer" && model.max_context == 8192 &&
+                          !model.use_cuda_graph,
+                      "a router model's layers were not merged in order");
+
+    const std::string contradictory = write("contradictory.ini", "spec = none\ndraft-tokens = 4\n");
+    bool contradiction_rejected     = false;
+    try {
+        (void)parse({"ninfer-serve", "m.ninfer", "--config", contradictory});
+    } catch (const std::invalid_argument&) { contradiction_rejected = true; }
+    failures += check(contradiction_rejected, "one file's contradictory options were accepted");
+    std::filesystem::remove_all(directory);
+
+    // Every launch configuration the repository ships parses as ninfer-serve options.
+    std::size_t shipped = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(
+             std::filesystem::path(NINFER_SOURCE_DIR) / "configs")) {
+        if (entry.path().extension() != ".ini") { continue; }
+        ++shipped;
+        try {
+            const auto options = parse({"ninfer-serve", "--config", entry.path().string()});
+            failures += check(!options.artifact_path.empty(),
+                              "a shipped configuration names no model");
+        } catch (const std::exception& error) {
+            std::cerr << entry.path().string() << ": " << error.what() << '\n';
+            ++failures;
+        }
+    }
+    failures += check(shipped > 0, "no shipped launch configurations found");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -41,11 +130,13 @@ int main() {
                               automatic.speculative.draft_min_p == std::stof(floor),
                           "server did not keep draft confidence for automatic speculation");
     }
-    for (const auto* floor : {"0", "0.3", "1"}) {
-        failures += check(parse({"ninfer-serve", "model.ninfer", "--spec", "mtp",
-                                "--draft-tokens", "4", "--draft-min-p", floor})
-                              .speculative.draft_min_p == std::stof(floor),
-                          "server did not preserve draft confidence");
+    for (const auto* backend : {"mtp", "dflash2"}) {
+        for (const auto* floor : {"0", "0.3", "1"}) {
+            failures += check(parse({"ninfer-serve", "model.ninfer", "--spec", backend,
+                                    "--draft-tokens", "4", "--draft-min-p", floor})
+                                  .speculative.draft_min_p == std::stof(floor),
+                              "server did not preserve draft confidence");
+        }
     }
     for (const auto& args : std::vector<std::vector<std::string>>{
              {"--spec", "mtp", "--draft-tokens", "4", "--draft-min-p", "-0.1"},
@@ -54,7 +145,6 @@ int main() {
              {"--spec", "mtp", "--draft-tokens", "4", "--draft-min-p", "inf"},
              {"--spec", "mtp", "--draft-tokens", "4", "--draft-min-p", "0.3x"},
              {"--spec", "dflash", "--draft-tokens", "4", "--draft-min-p", "0.3"},
-             {"--spec", "dflash2", "--draft-tokens", "4", "--draft-min-p", "0.3"},
              {"--spec", "none", "--draft-min-p", "0.3"}}) {
         std::vector<std::string> full{"ninfer-serve", "model.ninfer"};
         full.insert(full.end(), args.begin(), args.end());
@@ -74,6 +164,23 @@ int main() {
         } catch (const std::invalid_argument&) { rejected = true; }
         failures += check(rejected, "an invalid --prefill-stall-budget-ms was accepted");
     }
+    // The drafter's kept experts: the Engine's default unless set, DSpark only.
+    failures += check(!parse({"ninfer-serve", "model.ninfer"}).speculative.draft_experts,
+                      "--draft-experts must default");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--spec", "dspark", "--draft-experts",
+                             "32"}).speculative.draft_experts == 32U,
+                      "server did not preserve --draft-experts");
+    for (const auto& args : std::vector<std::vector<std::string>>{
+             {"--spec", "mtp", "--draft-tokens", "4", "--draft-experts", "64"},
+             {"--draft-experts", "64"}}) {
+        std::vector<std::string> full{"ninfer-serve", "model.ninfer"};
+        full.insert(full.end(), args.begin(), args.end());
+        bool rejected = false;
+        try {
+            (void)parse(full);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "an invalid --draft-experts was accepted");
+    }
     // DSpark's confidence floor: the drafter's default unless set, 0..1, DSpark only.
     failures += check(!parse({"ninfer-serve", "model.ninfer"}).speculative.draft_confidence,
                       "DSpark's floor must default");
@@ -89,6 +196,41 @@ int main() {
         bool rejected = false;
         try { (void)parse(full); } catch (const std::invalid_argument&) { rejected = true; }
         failures += check(rejected, "server accepted an invalid --draft-confidence");
+    }
+    {
+        // A DSpine drafter: the artifact --draft-model names beside --spec dspine, nowhere else.
+        const auto spine = parse({"ninfer-serve", "model.ninfer", "--spec", "dspine",
+                                  "--draft-model", "drafter.ninfer", "--draft-tokens", "7",
+                                  "--draft-min-p", "0.3"}).speculative;
+        failures += check(spine.backend == ninfer::SpeculativeBackend::DSpine &&
+                              spine.draft_model == "drafter.ninfer" && spine.draft_tokens == 7 &&
+                              spine.draft_min_p == 0.3F && spine.ngram_draft_tokens == 0,
+                          "server did not preserve --spec dspine");
+        for (const auto& args : std::vector<std::vector<std::string>>{
+                 {"--spec", "dspine", "--draft-tokens", "7"},
+                 {"--spec", "dspine", "--draft-model", "d.ninfer"},
+                 {"--spec", "dspine", "--draft-model", "d.ninfer", "--draft-tokens", "16"},
+                 {"--spec", "mtp", "--draft-tokens", "4", "--draft-model", "d.ninfer"},
+                 {"--draft-model", "d.ninfer"}}) {
+            std::vector<std::string> full{"ninfer-serve", "model.ninfer"};
+            full.insert(full.end(), args.begin(), args.end());
+            bool rejected = false;
+            try { (void)parse(full); } catch (const std::invalid_argument&) { rejected = true; }
+            failures += check(rejected, "server accepted --draft-model or --spec dspine out of "
+                                        "their contract");
+        }
+    }
+    {
+        // Without --spec, --draft-tokens sizes a context lookup (Flint, DeepSeek-V4.1).
+        const auto lookup = parse({"ninfer-serve", "model.ninfer", "--lookup-ngram", "4",
+                                   "--draft-tokens", "5"}).speculative;
+        failures += check(lookup.backend == ninfer::SpeculativeBackend::None &&
+                              lookup.lookup_ngram == 4 && lookup.draft_tokens == 5,
+                          "server refused or lost a context lookup's --draft-tokens");
+        bool rejected = false;
+        try { (void)parse({"ninfer-serve", "model.ninfer", "--draft-tokens", "5"}); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "server accepted --draft-tokens without --spec or --lookup-ngram");
     }
     failures += check(parse({"ninfer-serve", "model.ninfer"}).embedding_residency ==
                               ninfer::EmbeddingResidency::Device &&
@@ -375,9 +517,35 @@ int main() {
                       "--lookup-ngram did not reach the Engine options next to --spec");
     failures += check(route_engine.prefill_cublas && !route_engine.prefill_cublas_projections,
                       "the cuBLAS prefill controls did not reach the Engine options");
+    failures += check(!default_engine.gumbel_sampling &&
+                          make_engine_options(parse({"ninfer-serve", "model.ninfer",
+                                                     "--gumbel-sampling"}))
+                              .gumbel_sampling,
+                      "--gumbel-sampling did not reach the Engine options");
     for (const char* flag : {"--prefill-cublas", "--no-prefill-cublas-projections", "--lookup-ngram"}) {
         failures += check(kv_help.find(flag) != std::string::npos,
                           "serve help omits an accepted prefill or drafting control");
+    }
+    // The prompt routes and the n-gram reads: lossless ones on by default, each reaching the Engine.
+    failures += check(default_engine.prefill_tail == ninfer::PrefillTail::Exact &&
+                          default_engine.prefill_tail_rows == 0 &&
+                          default_engine.iq1m_expert_matrix && default_engine.ngram_table.dedupe &&
+                          default_engine.ngram_table.read_ahead,
+                      "the exact prefill tail, IQ1_M matrix route or n-gram read savings are off "
+                      "by default in serving");
+    const ninfer::EngineOptions plain = make_engine_options(
+        parse({"ninfer-serve", "model.ninfer", "--prefill-tail", "full", "--iq1m-experts", "vector",
+               "--ngram-dedupe", "off", "--ngram-read-ahead", "off"}));
+    failures += check(plain.prefill_tail == ninfer::PrefillTail::Full && !plain.iq1m_expert_matrix &&
+                          !plain.ngram_table.dedupe && !plain.ngram_table.read_ahead,
+                      "the prompt-route or n-gram read flags did not reach the Engine options");
+    const ninfer::EngineOptions rows =
+        make_engine_options(parse({"ninfer-serve", "model.ninfer", "--prefill-tail", "512"}));
+    failures += check(rows.prefill_tail == ninfer::PrefillTail::Rows && rows.prefill_tail_rows == 512,
+                      "--prefill-tail N did not reach the Engine options");
+    for (const char* flag : {"--prefill-tail", "--iq1m-experts", "--ngram-dedupe", "--ngram-read-ahead"}) {
+        failures += check(kv_help.find(flag) != std::string::npos,
+                          "serve help omits a prompt-route or n-gram read flag");
     }
 
     // rk8v4 still parses to its storage value; the engine rejects it in
@@ -1000,13 +1168,13 @@ int main() {
                      "--use-alt-prefix-caching"});
     } catch (const std::invalid_argument&) { both_caches_rejected = true; }
     failures += check(both_caches_rejected, "both prefix caching systems were accepted together");
-    bool hybrid_pipeline_rejected = false;
-    try {
-        (void)parse(
-            {"ninfer-serve", "model.ninfer", "--use-alt-prefix-caching", "--devices", "0,1"});
-    } catch (const std::invalid_argument&) { hybrid_pipeline_rejected = true; }
-    failures +=
-        check(hybrid_pipeline_rejected, "hybrid prefix cache was accepted across pipeline stages");
+    failures += check(
+        parse({"ninfer-serve", "model.ninfer", "--use-alt-prefix-caching", "--devices", "0,1"})
+                .context_cache.mode == ninfer::ContextCacheMode::Hybrid,
+        "--use-alt-prefix-caching did not keep the hybrid cache over two devices");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--devices", "0,1"})
+                              .context_cache.mode == ninfer::ContextCacheMode::Legacy,
+                      "two devices did not select the checkpoint catalog by default");
 
     const ServeOptions response_store =
         parse({"ninfer-serve", "model.ninfer", "--response-store-max-records", "42",
@@ -1220,6 +1388,11 @@ int main() {
                               .tensor_parallel_prompt_partials ==
                           ninfer::TensorParallelPartials::Bf16,
                       "--tensor-parallel-prompt-partials did not reach serving options");
+    failures +=
+        check(parse({"ninfer-serve", "model.ninfer", "--devices", "0,1", "--tensor-parallel",
+                     "--tensor-parallel-prompt-partials", "int8"})
+                      .tensor_parallel_prompt_partials == ninfer::TensorParallelPartials::Int8,
+              "--tensor-parallel-prompt-partials int8 did not reach serving options");
     {
         bool rejected = false;
         try {
@@ -1280,6 +1453,7 @@ int main() {
                                         "--gpu-clock-floor",
                                         "--graft",
                                         "--greedy",
+                                        "--gumbel-sampling",
                                         "--host",
                                         "--host-cache-mib",
                                         "--host-kv-mib",
@@ -1479,12 +1653,16 @@ int main() {
                                  "5", "--adaptive-mtp"})
                                   .speculative.mtp_policy == ninfer::MtpDraftPolicy::Adaptive,
                       "--adaptive-mtp did not default off or was not preserved");
-    bool adaptive_without_mtp_rejected = false;
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--spec", "dspine", "--draft-model",
+                             "drafter.ninfer", "--draft-tokens", "15", "--adaptive-mtp"})
+                              .speculative.mtp_policy == ninfer::MtpDraftPolicy::Adaptive,
+                      "--adaptive-mtp was refused with a masked drafter");
+    bool adaptive_without_drafter_rejected = false;
     try {
-        (void)parse({"ninfer-serve", "model.ninfer", "--spec", "dflash2", "--draft-tokens", "7",
-                     "--adaptive-mtp"});
-    } catch (const std::invalid_argument&) { adaptive_without_mtp_rejected = true; }
-    failures += check(adaptive_without_mtp_rejected, "--adaptive-mtp was accepted without MTP");
+        (void)parse({"ninfer-serve", "model.ninfer", "--adaptive-mtp"});
+    } catch (const std::invalid_argument&) { adaptive_without_drafter_rejected = true; }
+    failures += check(adaptive_without_drafter_rejected,
+                      "--adaptive-mtp was accepted without a drafter");
     failures += check(parse({"ninfer-serve", "model.ninfer", "--fast-prefill-kernel"})
                           .fast_prefill_kernel,
                       "--fast-prefill-kernel was not preserved");
@@ -1965,6 +2143,7 @@ int main() {
         failures += check(resolve_prompt_semantics(request, defaults).lora->empty(),
                           "an empty lora list was refused on a server without adapters");
     }
+    failures += launch_configuration_tests();
 
     return failures == 0 ? 0 : 1;
 }

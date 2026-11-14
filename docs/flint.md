@@ -36,6 +36,10 @@ the Qwen3.5 frontend for tokenization, chat templates, output parsing and the se
   (`<tool_call>NAME<arg_key>KEY</arg_key><arg_value>VALUE</arg_value>...</tool_call>`) returned as
   OpenAI tool calls, each value read by its declared parameter type. A forced `tool_choice` ends
   the generation prompt with `<tool_call>NAME`, so the model continues with the arguments.
+- **Prompt chunks without logits.** A chunk before the prompt's last, or before a scoring call's
+  first scored position, runs its last block only up to the key/value store: that block's attention
+  output and experts feed only the head. The stored rows are those of the whole block, so caches and
+  logits keep their bits.
 - **Reasoning.** The release's chat template has no thinking switch: the model opens `<think>`
   itself when it decides to reason, and the reasoning arrives as `reasoning_content`.
   `enable_thinking: false` (or `reasoning_effort: "none"`) closes an empty reasoning block after
@@ -48,8 +52,11 @@ the Qwen3.5 frontend for tokenization, chat templates, output parsing and the se
 - **Sampling defaults.** The release's: temperature 1.0, top-p 0.95, top-k 20.
 - **Speculative decoding by context lookup.** Recursive publishes no draft model. `--lookup-ngram
   N` proposes what followed the last N tokens' earlier occurrence in the sequence (up to
-  `--draft-tokens`, 3 by default, at most 7), and the target verifies the proposal in one pass of
-  decode rows; the output is the one plain decoding gives.
+  `--draft-tokens`, 3 by default, at most 7): the occurrence the sequence was already copying while
+  it still matches, else the newest, and the target verifies the proposal in one pass of
+  decode rows; the output is the one plain decoding gives. A [DSpine](maintainer/dspine.md)
+  drafter trained for Flint drafts with `--spec dspine --draft-model PATH --draft-tokens N` (1 to
+  7); none is published yet.
 - **Expert residency.** The routed experts stay on the GPU, in pinned host memory or in the
   artifact's files, with a device cache and a CPU share of decode misses
   ([below](#expert-residency)).
@@ -61,6 +68,10 @@ tools (Flint's tool markup has no grammar here), images and video (Flint reads t
 stages, and of the context cache the shared paged KV pool, the disk tier and session slots. Several
 GPUs divide the routed experts instead (`--devices 0,1 --tensor-parallel`, experts on the devices;
 [expert parallelism](maintainer/pipeline-stages.md#expert-parallelism-of-the-other-moe-families)).
+
+The Q4_K async prompt tiles (`gguf_moe_matrix/q4_k`) apply to the Q4_K gate/up experts that the
+UD-Q4_K_XL release stores in 3 of its 47 MoE blocks, on the device or brought to it from host
+memory or disk (16-byte aligned expert tables, `MoeTable::aligned16`).
 
 ## Converting
 
@@ -127,9 +138,21 @@ keeps instead of prefilling those tokens again:
   time than computing its tokens again (about 50 tokens on). A disposable request (a decision read)
   leaves no image of its end.
 
-A sliding-window state cannot be cut back: the rings at a position hold the window before it, and
-each block's window reaches further back through the blocks below. A prompt therefore resumes only
-where a state was kept, not at an arbitrary common prefix.
+A sliding-window state cannot be cut back at will: the rings at a position hold the window before
+it, and each block's window reaches further back through the blocks below. A prompt therefore
+resumes only where a state was kept, not at an arbitrary common prefix.
+
+A turn that a stop string ends is the exception. Its state has read the tokens the cut removed, so
+the sequence goes back to where the stop string's match began, the state its visible text
+continues. The rings hold 768 positions for a window of 513, so that position's window is still in
+them while the sequence has written at most 255 positions past it, less a round's drafts; the
+full-attention rows are kept by position, and no state is copied. The next prompt resumes there
+when it repeats the reply's tokens, as a client that sends token ids does: on an RTX 4090 with host
+experts, after a reply of 184 tokens that a stop string cut at its 179th, the next request reused
+199 of its 207 tokens, as after a reply that its output limit ended there, with and without
+`--lookup-ngram`. A chat request renders the reply anew: with thinking off the generation prompt
+ends in an empty reasoning block that the history does not carry, so the next prompt resumes from
+the checkpoint at the last user turn whatever ended the reply.
 
 ## Measurements
 
@@ -167,6 +190,12 @@ repetitions, the first having spread ±22%.
   of a six-function Python module with type hints and docstrings (1,024 tokens, reasoning first):
   335.0 → 377.7 tok/s (1.13x), 164 of 255 proposed tokens accepted. The output equals plain
   decoding's.
+- **A lookup keeps its copy.** RTX PRO 6000 Blackwell Server, ninfer-serve, `--lookup-ngram 4`,
+  greedy, 400 tokens, two server starts each, November 10, 2026: six prompts that show a source
+  file as two versions (three identifiers renamed, small numbers changed) and ask for the first
+  again decoded at 573.5-657.4 tok/s when the newest occurrence was always proposed and at
+  648.5-701.2 tok/s keeping the occurrence being copied (1.055-1.156x); a code and a prose request
+  decoded within 0.1%. The answers were the same bytes.
 - **Typed decisions.** On an NVIDIA A40 (48 GB, `sm_86`, 300 W), `scripts/pods/decision_bench.py`
   (four sequences): about a 340-token state, 1, 4 and 16 questions answer in 118, 135 and 236 ms
   cold and 59, 95 and 203 ms once the state is kept; about an 11,660-token state in 2.20, 2.22 and
@@ -243,8 +272,9 @@ scales such rows by a power of two before quantizing them:
 ## Expert residency
 
 `--expert-residency device` keeps the routed GGUF banks on the GPU. `host` keeps them in pinned host
-memory and `disk` in the artifact's files, read through the OS page cache. Both run all expert
-arithmetic on the GPU with the resident kernels, through the transport Gemma 4 uses
+memory and `disk` in the artifact's files, read through the OS page cache. Both run the experts
+with the resident kernels on the GPU, except the share of decode and verification misses that CPU
+threads compute, through the transport Gemma 4 uses
 ([Gemma 4's expert residency](gemma4.md#expert-residency) describes the layer banks, the cache, its
 rounds and the growing KV):
 
@@ -261,7 +291,13 @@ rounds and the growing KV):
   `--expert-cpu-threads`). The CPU computes SwiGLU over the [gate; up] rows, the BF16 middle
   quantized as q8_1 and the down rows as the GPU's vector kernels do, into the same 2^-32
   fixed-point sums, so outputs do not depend on the split. Calls of more than eight tokens always
-  use the GPU.
+  use the GPU. Flash-Next's CPU share also covers the missing experts with at most eight pairs in
+  calls of 9 to 64 tokens ([the CPU share](qwen3-8-flash-next.md#the-cpu-share)); Flint does not
+  have that route yet: its expert kernels take one route per call, and the shared expert delivery
+  serves only narrow calls.
+- **Disk reads.** `--expert-mirror` spreads disk experts' reads over a second drive and
+  `--expert-direct` lets the drive write them into device memory
+  ([disk expert reads](expert-disk-reads.md)).
 
 On the RTX 3090 of the measurements above, with the cache NInfer sizes itself (`ninfer_bench`, one
 sequence, three repetitions; three CPU threads take a share of the decode misses). Disk experts read

@@ -1,10 +1,13 @@
 #include "options.h"
 
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -27,6 +30,121 @@ int check(bool condition, const char* message) {
     if (condition) { return 0; }
     std::cerr << message << '\n';
     return 1;
+}
+
+
+// --config files: layers of options below the command line (product/option_layers.h).
+int launch_configuration_tests() {
+    int failures         = 0;
+    const auto directory = std::filesystem::temp_directory_path() / "ninfer_cli_config_test";
+    std::filesystem::remove_all(directory);
+    std::filesystem::create_directories(directory);
+    const auto write = [&](const char* name, const char* text) {
+        const auto path = directory / name;
+        std::ofstream(path) << text;
+        return path.string();
+    };
+    const std::string base = write("base.ini", "; a launch profile\n"
+                                               "model = from-file.ninfer\n"
+                                               "prompt = \"from file\"\n"
+                                               "max-context = 4096\n"
+                                               "spec = mtp\n"
+                                               "draft-tokens = 4\n"
+                                               "devices = 0,1\n"
+                                               "stop = alpha\n"
+                                               "thinking-budget = 512\n"
+                                               "cuda-graph = false\n"
+                                               "vision = true\n"
+                                               "vision-residency = overlay\n");
+    const auto from_file = parse({"ninfer", "--config", base});
+    failures += check(from_file.artifact_path == "from-file.ninfer" &&
+                          from_file.prompt == "from file" && from_file.max_context == 4096 &&
+                          from_file.speculative.backend == ninfer::SpeculativeBackend::Mtp &&
+                          from_file.speculative.draft_tokens == 4 &&
+                          from_file.devices == std::vector<int>({0, 1}) &&
+                          from_file.stop_strings.size() == 1 && from_file.thinking_budget == 512U &&
+                          !from_file.use_cuda_graph && from_file.enable_vision &&
+                          from_file.vision_residency == ninfer::VisionResidency::Overlay,
+                      "a configuration file's options, artifact and false switch were not applied");
+
+    const auto overridden =
+        parse({"ninfer", "cli.ninfer", "--config", base, "--max-context", "8192", "--device", "1",
+               "--stop", "beta", "--stop", "gamma", "--cuda-graph", "--spec", "none",
+               "--no-thinking", "--no-vision", "--prompt", "from cli"});
+    failures += check(overridden.artifact_path == "cli.ninfer" && overridden.prompt == "from cli" &&
+                          overridden.max_context == 8192,
+                      "the command line's artifact and values must replace the file's");
+    failures += check(overridden.device == 1 && overridden.devices.empty(),
+                      "--device must replace a file's --devices");
+    failures += check(overridden.stop_strings.size() == 2 &&
+                          overridden.stop_strings[0].text == "beta",
+                      "a repeatable option on the command line must replace the file's list");
+    failures += check(overridden.use_cuda_graph, "--cuda-graph must undo a file's false switch");
+    failures += check(overridden.speculative.backend == ninfer::SpeculativeBackend::None &&
+                          overridden.speculative.draft_tokens == 0,
+                      "--spec none must also take the file's draft settings away");
+    failures += check(overridden.enable_thinking == false && !overridden.thinking_budget,
+                      "--no-thinking must take the file's thinking budget away");
+    failures += check(!overridden.enable_vision &&
+                          overridden.vision_residency == ninfer::VisionResidency::Resident,
+                      "--no-vision must take the file's vision residency away");
+
+    const std::string later = write("later.ini", "max-context = 16384\nspec = dflash2\n");
+    const auto two_files    = parse({"ninfer", "--config", base, "--config", later});
+    failures += check(two_files.max_context == 16384 &&
+                          two_files.speculative.backend == ninfer::SpeculativeBackend::DFlash2 &&
+                          two_files.speculative.draft_tokens == 4,
+                      "a later file must override an earlier one and keep its other options");
+
+    // A DSpine file's drafter: another backend on the command line takes it away.
+    const std::string spine = write("spine.ini", "spec = dspine\ndraft-model = drafter.ninfer\n"
+                                                 "draft-tokens = 7\n");
+    const auto from_spine   = parse({"ninfer", "m.ninfer", "--prompt", "x", "--config", spine});
+    failures += check(from_spine.speculative.backend == ninfer::SpeculativeBackend::DSpine &&
+                          from_spine.speculative.draft_model == "drafter.ninfer" &&
+                          from_spine.speculative.draft_tokens == 7,
+                      "a DSpine file's drafter was not applied");
+    const auto spine_to_mtp =
+        parse({"ninfer", "m.ninfer", "--prompt", "x", "--config", spine, "--spec", "mtp"});
+    failures += check(spine_to_mtp.speculative.backend == ninfer::SpeculativeBackend::Mtp &&
+                          spine_to_mtp.speculative.draft_model.empty() &&
+                          spine_to_mtp.speculative.draft_tokens == 7,
+                      "--spec mtp must take a file's DSpine drafter away and keep its drafts");
+    const auto spine_off =
+        parse({"ninfer", "m.ninfer", "--prompt", "x", "--config", spine, "--spec", "none"});
+    failures += check(spine_off.speculative.backend == ninfer::SpeculativeBackend::None &&
+                          spine_off.speculative.draft_model.empty() &&
+                          spine_off.speculative.draft_tokens == 0,
+                      "--spec none must take a file's DSpine drafter and drafts away");
+
+    // A combination one layer gives is the user's error, not an override.
+    const std::string contradictory = write("contradictory.ini", "spec = none\ndraft-tokens = 4\n");
+    failures += check(rejects([&] {
+                          (void)parse({"ninfer", "m.ninfer", "--prompt", "x", "--config",
+                                       contradictory});
+                      }),
+                      "one file's contradictory options were accepted");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer", "m.ninfer", "--prompt", "x", "--spec", "none",
+                                       "--draft-tokens", "4"});
+                      }),
+                      "the command line's contradictory options were accepted");
+    const std::string sections = write("sections.ini", "[model]\nmax-context = 1\n");
+    const std::string dashed   = write("dashed.ini", "--max-context = 1\n");
+    const std::string nested   = write("nested.ini", "config = other.ini\n");
+    for (const std::string& file : {sections, dashed, nested, (directory / "missing.ini").string()}) {
+        failures += check(rejects([&] {
+                              (void)parse({"ninfer", "m.ninfer", "--prompt", "x", "--config", file});
+                          }),
+                          "a malformed, missing or nesting configuration file was accepted");
+    }
+    failures += check(rejects([] { (void)parse({"ninfer", "m.ninfer", "--config"}); }),
+                      "--config without a file was accepted");
+    failures += check(parse({"ninfer", "--config", (directory / "missing.ini").string(), "--help"})
+                          .help_requested,
+                      "--help must not read the configuration files");
+    std::filesystem::remove_all(directory);
+    return failures;
 }
 
 } // namespace
@@ -59,12 +177,15 @@ int run_tests() {
                          "--draft-tokens", "4", "--draft-min-p", floor});
         }), "CLI accepted invalid draft confidence");
     }
-    for (const auto* backend : {"dflash", "dflash2"}) {
-        failures += check(rejects([&] {
-            (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec", backend,
-                         "--draft-tokens", "4", "--draft-min-p", "0.3"});
-        }), "CLI accepted draft confidence outside MTP");
-    }
+    failures += check(rejects([&] {
+        (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec", "dflash",
+                     "--draft-tokens", "4", "--draft-min-p", "0.3"});
+    }), "CLI accepted draft confidence outside MTP and DFlash2");
+    // Qwen3.8-Flash-Next's DFlash2 drafter verifies through its first draft at or below the floor.
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec", "dflash2",
+                             "--draft-tokens", "4", "--draft-min-p", "0.3"})
+                              .speculative.draft_min_p == 0.3f,
+                      "CLI did not preserve the DFlash2 confidence floor");
     // Without --spec the floor is kept for the MTP the Engine chooses, zero included.
     for (const auto* floor : {"0", "0.3"}) {
         const auto automatic =
@@ -96,6 +217,22 @@ int run_tests() {
             failures += check(rejects([&] { (void)parse(args); }),
                               ("CLI accepted " + tail.front() + " beside --spec dspark").c_str());
         }
+        // The drafter's kept experts: the Engine's default unless set, DSpark only.
+        failures += check(!block.speculative.draft_experts, "--draft-experts must default");
+        for (const auto* kept : {"0", "64"}) {
+            const auto set = parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec",
+                                    "dspark", "--draft-experts", kept});
+            failures += check(set.speculative.draft_experts == std::stoul(kept),
+                              "CLI did not preserve --draft-experts");
+        }
+        for (const std::vector<std::string> tail :
+             {std::vector<std::string>{"--spec", "mtp", "--draft-tokens", "4", "--draft-experts", "64"},
+              {"--draft-experts", "64"}, {"--spec", "dspark", "--draft-experts", "-1"}}) {
+            std::vector<std::string> args{"ninfer-cli", "model.ninfer", "--prompt", "x"};
+            args.insert(args.end(), tail.begin(), tail.end());
+            failures += check(rejects([&] { (void)parse(args); }),
+                              "CLI accepted an invalid --draft-experts");
+        }
         // The confidence floor: the drafter's default unless set, 0..1, DSpark only.
         failures += check(!block.speculative.draft_confidence, "DSpark's floor must default");
         for (const auto* floor : {"0", "0.65", "1"}) {
@@ -113,6 +250,36 @@ int run_tests() {
             args.insert(args.end(), tail.begin(), tail.end());
             failures += check(rejects([&] { (void)parse(args); }),
                               "CLI accepted an invalid --draft-confidence");
+        }
+    }
+    {
+        // A DSpine drafter: the artifact --draft-model names, 1..15 drafts, either head and the
+        // confidence floor; no copy drafts beside it unless asked.
+        const auto spine = parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec",
+                                  "dspine", "--draft-model", "drafter.ninfer", "--draft-tokens",
+                                  "15", "--draft-min-p", "0.2", "--full-draft-head"});
+        failures += check(spine.speculative.backend == ninfer::SpeculativeBackend::DSpine &&
+                              spine.speculative.draft_model == "drafter.ninfer" &&
+                              spine.speculative.draft_tokens == 15 &&
+                              spine.speculative.draft_min_p == 0.2f &&
+                              spine.speculative.proposal_head == ninfer::ProposalHead::Full &&
+                              spine.speculative.ngram_draft_tokens == 0,
+                          "CLI did not preserve --spec dspine");
+        const auto listed = parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec",
+                                   "dspine", "--draft-model", "drafter.ninfer", "--draft-tokens",
+                                   "7", "--lm-head-draft"});
+        failures += check(listed.speculative.proposal_head == ninfer::ProposalHead::Optimized,
+                          "CLI did not let --spec dspine draft with the proposal head");
+        for (const std::vector<std::string> tail :
+             {std::vector<std::string>{"--spec", "dspine", "--draft-tokens", "7"},
+              {"--spec", "dspine", "--draft-model", "d.ninfer"},
+              {"--spec", "dspine", "--draft-model", "d.ninfer", "--draft-tokens", "16"},
+              {"--spec", "mtp", "--draft-tokens", "4", "--draft-model", "d.ninfer"},
+              {"--draft-model", "d.ninfer"}}) {
+            std::vector<std::string> args{"ninfer-cli", "model.ninfer", "--prompt", "x"};
+            args.insert(args.end(), tail.begin(), tail.end());
+            failures += check(rejects([&] { (void)parse(args); }),
+                              "CLI accepted --draft-model or --spec dspine out of their contract");
         }
     }
     {
@@ -223,6 +390,39 @@ int run_tests() {
         failures += check(rejects([&] {
             (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--ngram-ram-mib", budget});
         }), "CLI accepted an invalid row-cache budget");
+    }
+    {
+        const auto defaults = parse({"ninfer-cli", "model.ninfer", "--prompt", "x"});
+        failures += check(defaults.ngram_table.dedupe && defaults.ngram_table.read_ahead &&
+                              defaults.prompt_routes.prefill_tail == ninfer::PrefillTail::Exact &&
+                              defaults.prompt_routes.iq1m_expert_matrix,
+                          "CLI did not default to deduplicated, read-ahead Engram rows, the exact "
+                          "prefill tail and IQ1_M experts on the matrix kernel");
+        const auto off = parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--ngram-dedupe",
+                                "off", "--ngram-read-ahead", "off", "--prefill-tail", "full",
+                                "--iq1m-experts", "vector"});
+        failures += check(!off.ngram_table.dedupe && !off.ngram_table.read_ahead &&
+                              off.prompt_routes.prefill_tail == ninfer::PrefillTail::Full &&
+                              !off.prompt_routes.iq1m_expert_matrix,
+                          "CLI did not preserve the n-gram read and prompt route switches");
+        const auto rows = parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--prefill-tail",
+                                 "512"});
+        failures += check(rows.prompt_routes.prefill_tail == ninfer::PrefillTail::Rows &&
+                              rows.prompt_routes.prefill_tail_rows == 512,
+                          "CLI did not preserve a prefill tail row count");
+    }
+    for (const auto* tail : {"127", "0", "exactly", "-5", "2414x"}) {
+        failures += check(rejects([&] {
+            (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--prefill-tail", tail});
+        }), "CLI accepted an invalid prefill tail");
+    }
+    for (const auto& option : {std::pair{"--iq1m-experts", "mmq"},
+                               std::pair{"--ngram-dedupe", "yes"},
+                               std::pair{"--ngram-read-ahead", "1"}}) {
+        failures += check(rejects([&] {
+            (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", option.first,
+                         option.second});
+        }), "CLI accepted an invalid on/off or kernel value");
     }
     for (const auto* backend : {"mtp", "dflash", "dflash2"}) {
         for (unsigned width = 0; width <= 63; ++width) {
@@ -406,6 +606,7 @@ int run_tests() {
                                         "--gdn-state-fp16",
                                         "--gpu-clock-floor",
                                         "--greedy",
+                                        "--gumbel-sampling",
                                         "--json",
                                         "--json-schema",
                                         "--kv-capacity",
@@ -484,6 +685,18 @@ int run_tests() {
                           route.speculative.backend == ninfer::SpeculativeBackend::Mtp &&
                           route.speculative.draft_tokens == 3,
                       "CLI did not parse the cuBLAS prefill and context-lookup controls");
+    // Without --spec, --draft-tokens sizes a context lookup (Flint, DeepSeek-V4.1); alone it is refused.
+    const ninfer::cli::Options lookup_only = parse(
+        {"ninfer-cli", "model.ninfer", "--prompt", "hello", "--lookup-ngram", "4", "--draft-tokens", "5"});
+    failures += check(lookup_only.speculative.backend == ninfer::SpeculativeBackend::None &&
+                          lookup_only.speculative.lookup_ngram == 4 &&
+                          lookup_only.speculative.draft_tokens == 5,
+                      "CLI refused or lost a context lookup's --draft-tokens");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--draft-tokens", "5"});
+                      }),
+                      "CLI accepted --draft-tokens without --spec or --lookup-ngram");
     for (const char* flag : {"--prefill-cublas", "--no-prefill-cublas-projections", "--lookup-ngram"}) {
         failures += check(help.find(flag) != std::string::npos,
                           "CLI help omits an accepted prefill or drafting control");
@@ -609,6 +822,11 @@ int run_tests() {
                               .tensor_parallel_prompt_partials ==
                           ninfer::TensorParallelPartials::Bf16,
                       "--tensor-parallel-prompt-partials did not reach the options");
+    failures +=
+        check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--devices", "0,1",
+                     "--tensor-parallel", "--tensor-parallel-prompt-partials", "int8"})
+                      .tensor_parallel_prompt_partials == ninfer::TensorParallelPartials::Int8,
+              "--tensor-parallel-prompt-partials int8 did not reach the options");
     failures += check(rejects([&] {
                           (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
                                        "--tensor-parallel-prompt-partials", "bf16"});
@@ -663,6 +881,7 @@ int run_tests() {
             (void)parse({"ninfer", "model.ninfer", "--prompt", "x", "--json", "--raw-output"});
         }),
         "raw JSON output should be rejected");
+    failures += launch_configuration_tests();
     return failures == 0 ? 0 : 1;
 }
 

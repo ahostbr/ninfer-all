@@ -20,10 +20,12 @@ struct SlidingWindowAttentionPlan {
     std::int32_t split_capacity;
     std::int32_t max_context;
     std::int32_t window;
+    bool causal;
 };
 
 [[nodiscard]] SlidingWindowAttentionPlan
-sliding_window_attention_resolve_plan(std::uint32_t window, std::int32_t tokens, std::int32_t batch,
+sliding_window_attention_resolve_plan(std::uint32_t window, SlidingWindowMask mask,
+                                      std::int32_t tokens, std::int32_t batch,
                                       SlidingWindowAttentionExecutionEnvelope envelope);
 [[nodiscard]] const char* sliding_window_attention_route_name(SlidingWindowAttentionRoute route);
 
@@ -33,6 +35,6 @@ void sliding_window_attention_launch(const Tensor& q, const Tensor& query_k, con
                                      const CyclicKVCacheLayerView& context,
                                      const SlidingWindowAttentionPlan& plan, Tensor& partial_acc,
                                      Tensor& partial_m, Tensor& partial_l, Tensor& out,
-                                     cudaStream_t stream, bool causal_block = false);
+                                     cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

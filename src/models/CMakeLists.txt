@@ -11,7 +11,7 @@ ninfer_internal_includes(ninfer_model_runtime)
 target_link_libraries(ninfer_model_runtime
   PUBLIC ninfer_model_loading ninfer_ops ninfer_runtime_support
   PRIVATE ninfer_media_decode ninfer_jinja)
-target_sources(ninfer_model_runtime PRIVATE expert_profile.cpp)
+target_sources(ninfer_model_runtime PRIVATE expert_profile.cpp divided_head.cpp)
 
 include(qwen3_5/loading_sources.cmake)
 include(qwen3_5/frontend_sources.cmake)
@@ -21,3 +21,4 @@ include(qwen4_exp/loading_sources.cmake)
 include(gemma4/sources.cmake)
 include(flint/sources.cmake)
 include(deepseek_v41/sources.cmake)
+include(dspine/sources.cmake)

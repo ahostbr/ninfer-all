@@ -1,5 +1,7 @@
 #include "ninfer_bench_support.h"
 #include "product/hybrid_expert_options.h"
+#include "product/launch_config/launch_config.h"
+#include "product/option_layers.h"
 #include "product/rope_yarn_options.h"
 #include "product/speculative_options.h"
 
@@ -61,8 +63,9 @@ KvCacheStorage parse_kv_cache(std::string_view text) {
     if (text == "rk2v4-e8") { return KvCacheStorage::RotatedE8RootKeyInt4Value; }
     if (text == "nvfp4") { return KvCacheStorage::Nvfp4Group16; }
     if (text == "k8v4") { return KvCacheStorage::Fp8KeyNvfp4Value; }
+    if (text == "bf16p") { return KvCacheStorage::Bf16Packed; }
     throw std::invalid_argument(
-        "--kv-dtype must be bf16, int8, fp8, rk8v4, rk4v4, rk4v4-e8, rk2v4-e8, nvfp4, or k8v4");
+        "--kv-dtype must be bf16, int8, fp8, rk8v4, rk4v4, rk4v4-e8, rk2v4-e8, nvfp4, k8v4, or bf16p");
 }
 
 std::vector<int> parse_int_list(std::string_view value, const char* label) {
@@ -321,10 +324,11 @@ std::string usage_text(std::string_view program) {
         << "  --expert-dma-share <F|auto> host or disk experts: the GPU's share of a decode call's\n"
            "                              cache misses, the CPU computing the rest (default: auto)\n"
         << "  --expert-cpu-threads <N>    host or disk experts: CPU workers (default: automatic)\n"
-        << "  --kv-dtype <bf16|int8|fp8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8|nvfp4|k8v4>  KV cache storage "
+        << "  --kv-dtype <bf16|int8|fp8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8|nvfp4|k8v4|bf16p>  KV cache storage "
            "(default: bf16)\n"
-        << "  --fast-prefill-kernel       fast INT8-KV prompt kernel, wave-aligned chunks\n"
-        << "  --spec <mtp|dflash|dflash2> speculative backend (default: none)\n"
+        << "  --fast-prefill-kernel       fast INT8/FP8-KV prompt kernel, wave-aligned chunks\n"
+        << "  --spec <mtp|dflash|dflash2|dspine> speculative backend (default: none)\n"
+           "  --draft-model PATH          dspine: the DSpine drafter artifact\n"
         << "  --draft-tokens <n>         MTP, DFlash and DFlash2 1..15\n"
         << "  --adaptive-mtp              verify an adaptive 3..K drafts per MTP round\n"
         << "  --ngram-draft-tokens <n>   copy proposals 1..63; 0 disables (default: 15 with "
@@ -343,23 +347,39 @@ std::string usage_text(std::string_view program) {
         << "  --profile-measured          bracket one measured repetition with CUDA profiler API\n"
         << "  -o, --output <table|json|csv>  output format (default: table)\n"
         << "  --output-file <path>        write report to a file\n"
+        << "  --config <file>             options from a launch configuration file (docs/cli.md);\n"
+           "                              repeatable, later files and the command line override\n"
+           "                              earlier ones; every switch also takes a --no- form\n"
         << "  -h, --help                  show this help\n\n"
         << "With no -p/-n/-pg, the matrix is pp" << kDefaultNPrompt << " and tg" << kDefaultNGen
         << ".\n";
     return out.str();
 }
 
-BenchOptions parse_args(int argc, char** argv) {
+namespace {
+
+// Spellings of one setting: a later layer's option replaces an earlier layer's other spelling.
+constexpr product::SettingAlias kSettingAliases[] = {
+    {"p", "n-prompt"},  {"n", "n-gen"},  {"pg", "prompt-gen"},
+    {"r", "repetitions"}, {"o", "output"}, {"full-draft-head", "lm-head-draft"},
+};
+
+// The options as one list. With `spans` it only splits them into options
+// (product::parse_layered); without, it also validates them together.
+BenchOptions parse_arguments(const std::vector<std::string>& arguments,
+                             std::vector<product::OptionSpan>* spans) {
     BenchOptions options;
     bool saw_artifact         = false;
     bool ngram_width_explicit = false;
-    for (int i = 1; i < argc; ++i) {
-        const std::string_view arg(argv[i]);
+    product::OptionSpanRecorder recorder(spans);
+    for (std::size_t i = 0; i < arguments.size(); ++i) {
+        recorder.begin(i);
+        const std::string_view arg(arguments[i]);
         auto value = [&](const char* flag) -> std::string {
-            if (i + 1 >= argc) {
+            if (i + 1 >= arguments.size()) {
                 throw std::invalid_argument(std::string(flag) + " requires value");
             }
-            return argv[++i];
+            return arguments[++i];
         };
         if (arg == "-h" || arg == "--help") {
             options.help_requested = true;
@@ -421,23 +441,23 @@ BenchOptions parse_args(int argc, char** argv) {
             }
         } else if ((arg == "--expert-dma-share" || arg == "--expert-cpu-threads") &&
                    product::parse_hybrid_expert_option(arg, options.hybrid_experts,
-                                                       [&] { return value(argv[i]); })) {
-        } else if (arg == "--fast-prefill-kernel") {
-            options.fast_prefill_kernel = true;
+                                                       [&] { return value(arguments[i].c_str()); })) {
+        } else if (product::switch_option(arg, "fast-prefill-kernel", [&](bool on) { options.fast_prefill_kernel = on; })) {
         } else if (arg == "--spec") {
             options.speculative.backend = product::parse_speculative_backend(value("--spec"));
+        } else if (arg == "--draft-model") {
+            options.speculative.draft_model = value("--draft-model");
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = parse_u32(value("--draft-tokens"), "draft-tokens");
-        } else if (arg == "--no-prefill-a8") {
-            options.prefill_a8 = false;
+        } else if (product::switch_option(arg, "prefill-a8", [&](bool on) { options.prefill_a8 = on; })) {
         } else if (arg == "--lookup-ngram") {
             options.speculative.lookup_ngram = parse_u32(value("--lookup-ngram"), "lookup-ngram");
-        } else if (arg == "--prefill-cublas") {
-            options.prefill_cublas = true;
-        } else if (arg == "--no-prefill-cublas-projections") {
-            options.prefill_cublas_projections = false;
-        } else if (arg == "--adaptive-mtp") {
-            options.speculative.mtp_policy = MtpDraftPolicy::Adaptive;
+        } else if (product::switch_option(arg, "prefill-cublas", [&](bool on) { options.prefill_cublas = on; })) {
+        } else if (product::switch_option(arg, "prefill-cublas-projections", [&](bool on) { options.prefill_cublas_projections = on; })) {
+        } else if (product::switch_option(arg, "adaptive-mtp", [&](bool on) {
+                       options.speculative.mtp_policy =
+                           on ? MtpDraftPolicy::Adaptive : MtpDraftPolicy::Fixed;
+                   })) {
         } else if (arg == "--ngram-draft-tokens") {
             options.speculative.ngram_draft_tokens =
                 parse_u32(value("--ngram-draft-tokens"), "ngram-draft-tokens", true);
@@ -445,16 +465,17 @@ BenchOptions parse_args(int argc, char** argv) {
         } else if (arg == "--ngram-min-match") {
             options.speculative.ngram_min_match =
                 parse_u32(value("--ngram-min-match"), "ngram-min-match");
-        } else if (arg == "--lm-head-draft") {
-            options.speculative.proposal_head = ProposalHead::Optimized;
-        } else if (arg == "--full-draft-head") {
-            options.speculative.proposal_head = ProposalHead::Full;
+        } else if (product::switch_option(arg, "lm-head-draft", [&](bool on) {
+                       options.speculative.proposal_head =
+                           on ? ProposalHead::Optimized : ProposalHead::Auto;
+                   })) {
+        } else if (product::switch_option(arg, "full-draft-head", [&](bool on) {
+                       options.speculative.proposal_head = on ? ProposalHead::Full : ProposalHead::Auto;
+                   })) {
         } else if (arg == "--device") {
             options.device = parse_nonnegative(value("--device"), "device");
-        } else if (arg == "--no-cuda-graph") {
-            options.use_cuda_graph = false;
-        } else if (arg == "--profile-measured") {
-            options.profile_measured = true;
+        } else if (product::switch_option(arg, "cuda-graph", [&](bool on) { options.use_cuda_graph = on; })) {
+        } else if (product::switch_option(arg, "profile-measured", [&](bool on) { options.profile_measured = on; })) {
         } else if (arg == "-o" || arg == "--output") {
             const std::string selected = value("--output");
             if (selected == "table") {
@@ -472,6 +493,8 @@ BenchOptions parse_args(int argc, char** argv) {
             throw std::invalid_argument("unknown argument: " + std::string(arg));
         }
     }
+    recorder.finish(arguments.size());
+    if (recorder.splitting()) { return options; }
     if (!saw_artifact) { throw std::invalid_argument("--weights is required"); }
     if (options.prefill_chunk % kPrefillChunkAlignment != 0) {
         throw std::invalid_argument("--prefill-chunk must be a multiple of 128");
@@ -479,6 +502,19 @@ BenchOptions parse_args(int argc, char** argv) {
     product::apply_default_ngram_draft_tokens(options.speculative, ngram_width_explicit);
     product::validate_speculative_cli_options(options.speculative);
     return options;
+}
+
+} // namespace
+
+BenchOptions parse_args(int argc, char** argv) {
+    const product::CommandLine command_line =
+        product::read_command_line(argc, argv, product::PositionalArtifact::None);
+    if (command_line.help) {
+        BenchOptions options;
+        options.help_requested = true;
+        return options;
+    }
+    return product::parse_layered(command_line.layer_arguments(), kSettingAliases, parse_arguments);
 }
 
 std::vector<BenchTest> expand_tests(const BenchOptions& options) {
@@ -1030,6 +1066,8 @@ std::string kv_cache_name(KvCacheStorage storage) {
         return "nvfp4";
     case KvCacheStorage::Fp8KeyNvfp4Value:
         return "k8v4";
+    case KvCacheStorage::Bf16Packed:
+        return "bf16p";
     }
     return "unknown";
 }

@@ -1,7 +1,7 @@
 #pragma once
 
-#include "core/arena.h"
 #include "core/device.h"
+#include "core/device_buffer.h"
 #include "core/stage_link.h"
 
 #include <cuda_runtime.h>
@@ -50,6 +50,9 @@ public:
     // Rank 0: queues the receipt of every reply; out[r - 1] is rank r's part, device memory of
     // rank 0.
     [[nodiscard]] std::vector<void*> collect(std::size_t bytes, std::size_t slot,
+                                             cudaStream_t stream);
+    // The same with a size per peer: bytes[r - 1] from rank r.
+    [[nodiscard]] std::vector<void*> collect(std::span<const std::size_t> bytes, std::size_t slot,
                                              cudaStream_t stream);
 
     // Device bytes the exchange holds on `rank`.

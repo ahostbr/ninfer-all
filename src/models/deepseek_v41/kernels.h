@@ -76,10 +76,22 @@ void hc_post(float* h, const float* y, const float* post, const float* comb, int
 void rms_rows(const float* x, std::int64_t x_stride, int n, int tokens, const float* w, float eps,
               __nv_bfloat16* out, float* out_f32, cudaStream_t stream);
 
+// The caches keep the release's roundings packed, each value exactly the BF16 value its rounding
+// gives (its code's value times its group's scale):
+// - a window row: 512 E4M3 codes, then the 16 E8M0 scales of its groups of 32 values;
+// - a compressed latent row: 256 bytes of E2M1 codes (value 2i in byte i's low nibble), then the 32
+//   E4M3 scales of its groups of 16 values;
+// - an indexer key: 64 bytes of E2M1 codes in one plane and the 4 E8M0 scales of its groups of 32
+//   values in another.
+inline constexpr int kWindowRowBytes = 528;
+inline constexpr int kLatentRowBytes = 288;
+inline constexpr int kKeyRowBytes    = 64;
+inline constexpr int kKeyScaleBytes  = 4;
+
 // The window key/value latent of each row: bf16(rms(bf16(kv)) * norm), its last 64 values turned
 // at the row's position (adjacent pairs, angle position * freq[i]), rounded to BF16 and fp8, into
-// slot `slot % ring` of the row's sequence's cache ([ring][512] BF16 per sequence), slot the row's
-// position unless `slots` names another.
+// slot `slot % ring` of the row's sequence's cache ([ring] window rows per sequence, seq_stride
+// bytes apart), slot the row's position unless `slots` names another.
 struct KvPostArgs {
     const float* kv = nullptr; // [T] rows `kv_stride` apart
     std::int64_t kv_stride = 512;
@@ -89,8 +101,8 @@ struct KvPostArgs {
     const std::int32_t* positions = nullptr;
     const std::int32_t* slots     = nullptr;
     const float* freq = nullptr; // [32]
-    __nv_bfloat16* cache = nullptr;
-    std::int64_t seq_stride = 0;
+    std::uint8_t* cache = nullptr;
+    std::int64_t seq_stride = 0; // bytes
     const std::int32_t* sequences = nullptr;
     int sequence = 0, ring = 0;
 };
@@ -133,8 +145,8 @@ void compress_tail(const CompressArgs& args, cudaStream_t stream);
 
 // The caches of a row that completes group j = (p + 1) / ratio - 1 (its first position
 // g = j * ratio): the indexer key bf16(rms(bf16(key[t])) * key_norm), turned at g and fp4-rounded
-// (E8M0, 32) into index_cache[j] ([N][128] per sequence); the latent turned at g, rounded to BF16
-// and fp4-rounded (E4M3, 16) into kv_cache[j] ([N][512] per sequence).
+// (E8M0, 32) into key j of index_cache and index_scales; the latent turned at g, rounded to BF16
+// and fp4-rounded (E4M3, 16) into compressed row j of kv_cache. Strides in bytes.
 struct LatentArgs {
     const float* latent = nullptr; // [T][512]
     const float* key    = nullptr; // [T][128], the indexer key projection of the latent
@@ -145,9 +157,11 @@ struct LatentArgs {
     const float* key_norm = nullptr;
     float eps = 0;
     const float* freq = nullptr;
-    __nv_bfloat16* index_cache = nullptr;
+    std::uint8_t* index_cache = nullptr; // [N][kKeyRowBytes] per sequence
     std::int64_t index_seq_stride = 0;
-    __nv_bfloat16* kv_cache = nullptr;
+    std::uint8_t* index_scales = nullptr; // [N][kKeyScaleBytes] per sequence
+    std::int64_t index_scale_seq_stride = 0;
+    std::uint8_t* kv_cache = nullptr; // [N][kLatentRowBytes] per sequence
     std::int64_t kv_seq_stride = 0;
 };
 void latent_post(const LatentArgs& args, cudaStream_t stream);
@@ -158,6 +172,9 @@ void latent_post(const LatentArgs& args, cudaStream_t stream);
 // positions, `candidate_words` words per row). Columns past a row's visible ones stay unwritten;
 // `width` is the row stride of out and bounds every row's visible count. `group` consecutive rows
 // of one sequence share a pass over the keys (1 or 4).
+// With `list` (and `candidates`), a row holds only its group's listed blocks (candidate_lists):
+// column s is position list[g][s / block] * block + s % block of group g, -inf where the row does
+// not keep that block, and `width`, at least capacity * block, bounds the listed columns instead.
 struct ScoreArgs {
     const __nv_bfloat16* q = nullptr; // [T][heads][128]
     const float* weights   = nullptr; // [T][heads]
@@ -166,30 +183,53 @@ struct ScoreArgs {
     const std::int32_t* positions = nullptr;
     const std::int32_t* sequences = nullptr;
     int sequence = 0;
-    const __nv_bfloat16* keys = nullptr; // [N][128] per sequence
+    const std::uint8_t* keys = nullptr; // [N][kKeyRowBytes] per sequence, strides in bytes
     std::int64_t key_seq_stride = 0;
+    const std::uint8_t* key_scales = nullptr; // [N][kKeyScaleBytes] per sequence
+    std::int64_t key_scale_seq_stride = 0;
     const std::uint32_t* candidates = nullptr;
     int candidate_words = 0, block = 8;
+    const std::int32_t* list   = nullptr; // [groups][capacity]
+    const std::int32_t* counts = nullptr; // [groups]
+    int capacity               = 0;
     float* out = nullptr; // [T][width]
 };
 void index_scores(const ScoreArgs& args, cudaStream_t stream);
 
+// The blocks that any row of each group of `group` consecutive rows keeps in mask [T][words] (a
+// bit per block), in ascending order: list [groups][capacity] and their count, counts [groups].
+// `capacity` bounds a group's count (every row keeps at most capacity / group blocks).
+void candidate_lists(const std::uint32_t* mask, int words, int tokens, int group, int capacity,
+                     std::int32_t* list, std::int32_t* counts, cudaStream_t stream);
+
 // The candidate blocks of each row (scores [T][width] of its visible positions): the `keep` blocks
 // of `block` positions with the highest maximum score, the block of its last visible position
 // always among them, blocks without a finite score never (lower block first among equal maxima);
-// a bit per block in mask [T][words]. `scratch` holds [T][words * 32] floats.
+// a bit per block in mask [T][words]. `scratch` holds [T][stride] floats, a row's block maxima;
+// `stride` is at least the blocks of `width` positions.
 void select_candidates(const float* scores, int width, int tokens, const std::int32_t* positions,
                        int ratio, int block, int keep, std::uint32_t* mask, int words,
-                       float* scratch, cudaStream_t stream);
+                       float* scratch, int stride, cudaStream_t stream);
 
 // The k highest finite scores of each row's visible positions (lower position first among equal
 // scores), as positions in ascending order, -1 past the row's count: out [T][k].
 void select_topk(const float* scores, int width, int tokens, const std::int32_t* positions,
                  int ratio, int k, std::int32_t* out, cudaStream_t stream);
 
-// Sparse attention of each row's heads over its window (positions p - window_size + 1 .. p, from
-// slot position % ring of the window cache, window_size at most the ring and, beside k selected
-// latents, 1152 - k) and its selected compressed latents
+// select_topk over rows of listed blocks (index_scores with `list`): row t's columns stand for the
+// listed positions of its group t / group, of which it takes those below its visible count.
+struct ListedRows {
+    const std::int32_t* list   = nullptr; // [groups][capacity]
+    const std::int32_t* counts = nullptr; // [groups]
+    int capacity = 0, group = 1, block = 8;
+};
+void select_topk(const float* scores, int width, int tokens, const std::int32_t* positions,
+                 int ratio, int k, const ListedRows& listed, std::int32_t* out,
+                 cudaStream_t stream);
+
+// Sparse attention of each row's heads over its window (positions p - window_size + 1 .. p, none
+// below window_floor, from slot position % ring of the window cache, window_size at most the ring
+// and, beside k selected latents, 1152 - k) and its selected compressed latents
 // (compressed[topk[t][i]] for the leading entries that are not negative), every latent its own key
 // and value; each head's sink logit joins the softmax denominator:
 //   out = sum_j e^(s_j - m) v_j / (sum_j e^(s_j - m) + e^(sink - m)),  s_j = scale q . k_j.
@@ -200,11 +240,12 @@ struct AttentionArgs {
     const std::int32_t* positions = nullptr;
     const std::int32_t* sequences = nullptr;
     int sequence = 0;
-    const __nv_bfloat16* window = nullptr;
-    std::int64_t window_seq_stride = 0;
+    const std::uint8_t* window = nullptr; // [ring][kWindowRowBytes] per sequence
+    std::int64_t window_seq_stride = 0;   // bytes
     int ring = 0, window_size = 0;
-    const __nv_bfloat16* compressed = nullptr; // [N][512] per sequence, or null
-    std::int64_t compressed_seq_stride = 0;
+    int window_floor = 0; // the lowest window position a row reads (a prefill tail's first row)
+    const std::uint8_t* compressed = nullptr; // [N][kLatentRowBytes] per sequence, or null
+    std::int64_t compressed_seq_stride = 0;  // bytes
     const std::int32_t* topk = nullptr; // [T][k]
     int k = 0;
     const float* sinks = nullptr;
@@ -285,9 +326,9 @@ void unscale_columns(float* out, std::int64_t out_stride, int out_rows, int colu
 void unscale_columns(__nv_bfloat16* out, std::int64_t out_stride, int out_rows, int columns,
                      const float* scale, cudaStream_t stream);
 
-// Positions [begin, end) of one sequence's 512-value cache rows from a ring of src_ring slots to
+// Positions [begin, end) of one sequence's window rows (kWindowRowBytes) from a ring of src_ring slots to
 // one of dst_ring (position p in slot p % ring of each).
-void ring_copy(const __nv_bfloat16* src, int src_ring, __nv_bfloat16* dst, int dst_ring, int begin,
+void ring_copy(const std::uint8_t* src, int src_ring, std::uint8_t* dst, int dst_ring, int begin,
                int end, cudaStream_t stream);
 
 void f32_to_bf16(const float* in, __nv_bfloat16* out, std::int64_t n, cudaStream_t stream);

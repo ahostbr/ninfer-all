@@ -25,14 +25,17 @@ frontend for tokenization, chat templates, output parsing and the serving protoc
   key norm's gamma, rotated: the cache keeps V (10 KiB per token for the five blocks) and the
   attention derives each key from it as it reads it, with the same rotations the keys were stored
   with.
-- **Every KV-cache format of the engine.** `--kv-dtype` keeps the caches in F16 (`bf16`, the
+- **Every quantized KV-cache format of the engine.** `--kv-dtype` keeps the caches in F16 (`bf16`, the
   default) or in int8, fp8, rk8v4, nvfp4, k8v4, rk4v4, rk4v4-e8 or rk2v4-e8, the engine's own
-  codecs; see [below](#kv-cache-formats).
+  codecs; see [below](#kv-cache-formats). `bf16p` packs BF16 rows, so Gemma, whose plain cache
+  is F16, refuses it.
 - **Speculative decoding with the release's assistant.** The multi-token-prediction drafter Google
   publishes beside the model (`Gemma4AssistantForCausalLM`, four blocks of width 1024 that read the
   target's own KV cache) drafts up to seven tokens a round (`--spec mtp --draft-tokens N`); the
   target verifies them in one pass and every token it keeps is its own sample, so the output is
-  what plain decoding produces. See [below](#speculative-decoding-with-the-assistant).
+  what plain decoding produces. See [below](#speculative-decoding-with-the-assistant). With
+  `--gumbel-sampling` a sampled request drafts the assistant's own draws
+  ([coupled draws](cli.md#speculative-decoding)).
 - **Images and video.** The release's vision tower (27 blocks of width 1152) turns each picture or
   video frame into soft tokens in the prompt, on the GPU, streamed from pinned host memory, or on
   CPU threads (`--vision-residency`); see [below](#images-and-video).
@@ -45,6 +48,10 @@ frontend for tokenization, chat templates, output parsing and the serving protoc
   the model continues with the arguments; see [forced selection](serving.md#function-tools)),
   streaming, reasoning in its own channel when thinking is on, and causal scoring
   (`ninfer-perplexity`).
+- **Prompt chunks without logits.** A chunk before the prompt's last, or before a scoring call's
+  first scored position, runs its last block only up to the key/value store: that block's attention
+  output, MLP and experts feed only the head. The stored rows are those of the whole block, so
+  caches and logits keep their bits.
 - **Thinking.** Off unless asked for, as the release's chat template has it: a request turns it on
   with `chat_template_kwargs: {"enable_thinking": true}`, and the reasoning arrives as
   `reasoning_content`. Gemma has no early-close control, so thinking budgets do not apply and the
@@ -57,6 +64,11 @@ Not built for this family: DFlash and ngram copy drafts, pipeline stages over se
 the context cache the shared paged KV pool, the disk tier and session slots. Several GPUs divide
 the routed experts of the MoE model instead (`--devices 0,1 --tensor-parallel`, experts on the
 devices; [expert parallelism](maintainer/pipeline-stages.md#expert-parallelism-of-the-other-moe-families)).
+
+The Q4_K async prompt tiles (`gguf_moe_matrix/q4_k`) apply to the Q4_K gate/up experts of a
+release such as HauhauCS's whose expert tables are 16-byte aligned (`MoeTable::aligned16`): device
+banks, and the delivery's banks and slots that bring host or disk experts to the device. The QAT
+Q4_0 release has no Q4_K experts.
 
 ## Converting
 
@@ -300,10 +312,24 @@ keeps instead of prefilling those tokens again:
   they arrive together, since a prompt that has not started prefilling looks for images again at
   its first chunk. A disposable request (a decision read) leaves no image of its end.
 
-A sliding-window state cannot be cut back: the rings at a position hold the window before it, and
-each block's window reaches further back through the blocks below. A prompt therefore resumes only
-where a state was kept (a sequence's end, its checkpoint, a stored image), not at an arbitrary
-common prefix.
+A sliding-window state cannot be cut back at will: the rings at a position hold the window before
+it, and each block's window reaches further back through the blocks below. A prompt therefore
+resumes only where a state was kept (a sequence's end, its checkpoint, a stored image), not at an
+arbitrary common prefix.
+
+A turn that a stop string ends is the exception. Its state has read the tokens the cut removed, so
+the sequence goes back to where the stop string's match began, the state its visible text
+continues. With the assistant the rings hold 1,280 positions for a window of 1,024, so that
+position's window is still in them while the sequence has written at most 256 positions past it,
+less a round's drafts. Without the assistant the rings are as wide as the window: from the token
+that begins a match, each decode step first keeps the rows it overwrites (up to 32 steps, 6 MiB a
+sequence in F16), and the turn puts them back when the stop string ends it. The full-attention
+rows are kept by position. The next prompt resumes there when it repeats the reply's tokens, as a
+client that sends token ids does: on an RTX 4090, after a reply of 184 tokens that a stop string
+cut at its 179th, the next request reused 209 of its 217 tokens, as after a reply that its output
+limit ended there, with and without the assistant. A chat request with thinking off, the default,
+renders the reply anew after a generation prompt whose last tokens the history does not carry, so
+the next prompt resumes from the checkpoint at the last user turn whatever ended the reply.
 
 ## Measurements
 
@@ -352,6 +378,11 @@ after the last draft, is the target's own draw. The output is therefore the one 
 gives. `--adaptive-mtp` lets the round width follow each request's draft survival, and
 `--lookup-ngram N` proposes what followed the last N tokens' earlier occurrence instead of the
 assistant's guess when there is one.
+
+A [DSpine](maintainer/dspine.md) drafter trained for this model can take the assistant's place:
+`--spec dspine --draft-model PATH --draft-tokens N` (1 to 7) loads it, and the assistant stays
+unloaded. Its rounds verify the same way, and `--draft-min-p P` verifies through the first draft
+whose confidence is at or below P. No DSpine drafter for Gemma 4 is published yet.
 
 Ten chat requests one at a time to `ninfer-serve` (code in Python and C++, an explanation, a
 summary of a 1,000-token source excerpt, a factual question, a translation, a math word problem, a
@@ -527,15 +558,19 @@ dominate a small one. A follow-up turn over the same picture reuses it without e
 ## Expert residency
 
 `--expert-residency device` keeps the routed GGUF banks on the GPU. `host` keeps them in pinned host
-memory and `disk` in the artifact's files, read through the OS page cache. Both run all expert
-arithmetic on the GPU with the resident kernels and outputs: top-8 GeGLU, the 704-wide middle, the
-dense branch and the sandwich norms. A 12 GB card runs the model this way; the GPU holds 1.7 GiB of
-other weights instead of 13.7 GiB.
+memory and `disk` in the artifact's files, read through the OS page cache. Both run the experts
+with the resident kernels and outputs (top-8 GeGLU, the 704-wide middle, the dense branch and the
+sandwich norms) on the GPU, except the share of decode and verification misses that CPU threads
+compute (the CPU share below). A 12 GB card runs the model this way; the GPU holds 1.7 GiB of other
+weights instead of 13.7 GiB.
 
 ```sh
 ninfer /models/gemma4.ninfer --expert-residency host
 ninfer /models/gemma4.ninfer --expert-residency disk --expert-cache-mib 0
 ```
+
+With disk experts, `--expert-mirror` spreads the reads over a second drive and `--expert-direct`
+lets the drive write the experts into device memory ([disk expert reads](expert-disk-reads.md)).
 
 Experts reach the GPU through the shared transport (`core/expert_delivery`):
 
@@ -572,9 +607,17 @@ Experts reach the GPU through the shared transport (`core/expert_delivery`):
   IQ4_NL, IQ1_S, IQ1_M, IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS blocks have CPU products; other
   layers copy every miss.
   An expert the CPU computed takes no slot; the cache's rounds decide whether it enters.
-- **Calls.** Vector decode and verification run the cached pairs while the rest arrive, then the
-  rest; both add to one fixed-point sum, so outputs equal resident execution bit for bit. Prompt
-  chunks wait for their experts and run the existing matrix path.
+  Flash-Next's CPU share also covers the missing experts with at most eight pairs in calls of 9 to
+  64 tokens ([the CPU share](qwen3-8-flash-next.md#the-cpu-share)); Gemma 4 does not have that route
+  yet: its expert kernels take one route per call, and the shared expert delivery serves only narrow
+  calls.
+- **Calls.** Vector decode and verification run the cached pairs, then the block's dense MLP
+  while the rest arrive, then the rest; both expert stages add to one fixed-point sum, so outputs
+  equal resident execution bit for bit. A prompt chunk runs the dense MLP while its experts
+  arrive, then the existing matrix path. On one RTX 3090 with a 4 GiB cache, running the dense MLP
+  in that gap instead of before the routing raised decode from 70.5-71.1 to 72.6-72.9 tok/s after
+  a 1,032-token prompt and from 71.9-72.3 to 73.8-74.2 after a 6,906-token one, with the same
+  text (2026-11-04).
 - **Growing KV.** With an automatic cache, the full-attention blocks' value planes and a prompt
   chunk's derived keys, F16 values and mask are backed only as far as their sequences reach (in
   256-position tiles, on devices with CUDA virtual memory management), and the cache takes the rest

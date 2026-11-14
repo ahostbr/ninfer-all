@@ -77,7 +77,8 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(PROJECT_SOURCE_DIR "{ROOT.as_posix()}")
 set(CMAKE_CUDA_COMPILER_VERSION 13.4)
-set(CMAKE_CUDA_ARCHITECTURES "75;80;86;89;120a")
+set(CMAKE_CUDA_ARCHITECTURES "75-real;80-real;86-real;89;120a-real")
+set(NINFER_ARCHITECTURES "75;80;86;89;120a")
 function(ninfer_stamp_build_id target)
   file(MAKE_DIRECTORY "${{CMAKE_BINARY_DIR}}/generated")
   file(WRITE "${{CMAKE_BINARY_DIR}}/generated/ninfer_build_id.h" "#define NINFER_BUILD_ID \\\"fixture\\\"\\n#define NINFER_VERSION \\\"test\\\"\\n")
@@ -85,6 +86,10 @@ function(ninfer_stamp_build_id target)
 endfunction()
 include("{ROOT.as_posix()}/cmake/NinferTargets.cmake")
 include("{ROOT.as_posix()}/cmake/NinferRuntime.cmake")
+# The launcher reads --config files before it loads a backend.
+add_library(ninfer_product_launch_config STATIC
+  "{ROOT.as_posix()}/src/product/launch_config/launch_config.cpp")
+ninfer_internal_includes(ninfer_product_launch_config)
 ninfer_runtime_program(fixture fixture_app SOURCES "${{CMAKE_CURRENT_SOURCE_DIR}}/app.cpp")
 target_include_directories(fixture_app PRIVATE "{ROOT.as_posix()}/src")
 target_include_directories(fixture PRIVATE "{ROOT.as_posix()}/src")
@@ -144,6 +149,18 @@ set_target_properties(driver PROPERTIES PREFIX "" SUFFIX "" OUTPUT_NAME "libcuda
             self.assertIn('saved command help', result.stdout)
             self.assertIn('--cuda-backend', result.stdout)
             (help_dir / 'fixture.txt').unlink()
+        finally:
+            (self.folder / 'hidden').rename(path)
+
+    def test_missing_backends_are_named(self):
+        path = self.folder / 'backends'
+        path.rename(self.folder / 'hidden')
+        try:
+            result = self.launch('model.ninfer', '--device', '0')
+            self.assertEqual(result.returncode, 1)
+            self.assertIn('No CUDA backend beside the launcher', result.stderr)
+            self.assertIn(str(Path('backends') / 'cuda13'), result.stderr)
+            self.assertEqual(result.stdout, '')
         finally:
             (self.folder / 'hidden').rename(path)
 

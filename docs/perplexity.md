@@ -18,16 +18,20 @@ English reference text, English long-form text, Chinese reference text, and NInf
   --kv-dtype int8
 ```
 
+A [launch configuration file](cli.md#launch-configuration-files) can hold the options and the
+artifact (`--config FILE`); the command line overrides it.
+
 The default evaluation uses a 4,096-token context and a 2,048-token stride. Use `--context` and
 `--stride` to change that protocol, or score one UTF-8 file with `--text FILE`. The available Main
-KV representations are the server's nine: `bf16`, `int8`, `fp8`, `rk8v4`, `rk4v4`, `rk4v4-e8`,
-`rk2v4-e8`, `nvfp4`, and `k8v4`. Flint keeps its cache in F16 and DeepSeek-V4.1 in BF16; both are
+KV representations are the server's ten: `bf16`, `int8`, `fp8`, `rk8v4`, `rk4v4`, `rk4v4-e8`,
+`rk2v4-e8`, `nvfp4`, `k8v4`, and `bf16p`, which scores as `bf16` does. Flint keeps its cache in F16 and DeepSeek-V4.1 in BF16; both are
 scored with `--kv-dtype bf16`. DeepSeek-V4.1 reads every window from `<｜begin▁of▁sentence｜>`, which
 it puts in front of a window that lacks it; the scored tokens stay the window's own.
 
 Seven of them were measured on this corpus with Qwen3.8-27B on an RTX 3090; the results, alongside
 each format's size and decode speed, are in [`docs/config-calculator.html`](config-calculator.html).
-`--fast-prefill-kernel` scores an `int8` or `rk*` cache with the fast prompt-attention kernel (as
+`--fast-prefill-kernel` scores an `int8` or `rk*` cache with the fast prompt-attention kernel and
+an `fp8` cache with its in-register dequant kernel (as
 `ninfer-serve --fast-prefill-kernel` prefills); `report.json` records it as `fast_prefill_kernel`.
 The evaluator also takes the server's `--devices` (one pipeline stage per GPU, or with
 `--tensor-parallel`, `--tensor-split`, `--tensor-attention`, `--tensor-parallel-transport` and
@@ -36,10 +40,10 @@ The evaluator also takes the server's `--devices` (one pipeline stage per GPU, o
 MoE residency options (`--expert-residency`, `--expert-cache-mib`) for native Qwen, Gemma 4, Flint,
 DeepSeek-V4.1 and Qwen3.8-Flash-Next, its Qwen3.8-Flash-Next n-gram options (`--ngram-table`,
 `--ngram-residency`, `--ngram-io`, `--ngram-io-depth`, `--ngram-hot-profile`, `--ngram-ram-mib`,
-`--ngram-lock`, `--no-ngram-table`; DeepSeek-V4.1's Engram table takes all but `ram-hot` and
-`--ngram-hot-profile`) and `--kv-resident` (streamed sparse-attention KV), and its
+`--ngram-lock`, `--ngram-dedupe`, `--no-ngram-table`; DeepSeek-V4.1's Engram table takes them
+too) and `--kv-resident` (streamed sparse-attention KV), and its
 precision options (`--prefill-cublas`, `--lm-head-q4/q6`, `--embedding-q4/q6`, `--gdn-state-fp16`,
-`--mlp-a8-decode`, `--no-prefill-a8`), and the
+`--mlp-a8-decode`, `--no-prefill-a8`, `--iq1m-experts`), and the
 [adapter and control vector options](serving.md#lora-adapters-and-control-vectors) of a Qwen3.5-core
 model (`--lora`, `--lora-scaled`, `--lora-init-without-apply`, `--control-vector`,
 `--control-vector-scaled`, `--control-vector-layer-range`), scoring with every adapter at its startup
@@ -140,6 +144,13 @@ Flash-Next with `--expert-residency host`:
 | Qwen3.8-27B IQ3_S | 524,287 | 6.5626 | 6.5750 (+0.2%) | 6.5724 (+0.1%) | 592 / 593 |
 | Qwen3.8-Flash-Next IQ3_S | 524,287 | 5.2979 | 5.3079 (+0.2%) | 5.3325 (+0.7%) | 183 / 223 |
 | Gemma 4 26B-A4B QAT Q4_0 | 1,048,574 | 270.51 | 296.72 (+9.7%) | 230.79 (−14.7%) | 744 / 777 |
+
+Flash-Next's rates predate two changes to its host experts: perplexity, which loads no MTP block,
+now fills the expert cache from the routing profile's text layers, and a prompt chunk's slot pool
+puts uncached experts into free cache slots. On an RTX A6000 (Q2_0 release, 4,096-token windows
+advancing by 2,048 over the first 40 KB of the WikiText sample, `int8` KV) the two raised host
+experts from 84-85 to 919-927 tokens per second (device experts: 949), the pool's admission alone to
+656-661.
 
 Only whole windows are scored: the Qwen tokenizer makes the text 1.04 million tokens, one long
 window, and Gemma's 1.09 million, two. A long window gives its later tokens up to twice the

@@ -5,6 +5,7 @@
 
 #include "ninfer/engine_options.h"
 #include "ninfer/model_enums.h"
+#include "product/option_layers.h"
 
 #include <charconv>
 #include <cstdint>
@@ -20,13 +21,13 @@ namespace ninfer::product {
 inline constexpr const char* kNgramTableHelp =
     "  --ngram-table PATH            Qwen3.8-Flash-Next's n-gram table or DeepSeek-V4.1's\n"
     "                                Engram table artifact, for a model published\n"
-    "                                without its table\n"
+    "                                without its table; for Flash-Next any table of\n"
+    "                                the model's shape, in any row format\n"
     "  --ngram-residency disk|ram|ram-hot\n"
     "                                where the table's rows come from: its file, 16\n"
     "                                rows per token (default; DeepSeek-V4.1: 48); all\n"
-    "                                of it in RAM; or (Flash-Next) the rows a hot-row\n"
-    "                                profile ranks first in RAM and the rest from the\n"
-    "                                file\n"
+    "                                of it in RAM; or the rows a hot-row profile\n"
+    "                                ranks first in RAM and the rest from the file\n"
     "  --ngram-io buffered|direct|mmap  how rows are read from the file: through the\n"
     "                                page cache (default), past it, or mapped\n"
     "  --ngram-io-depth N            row reads in flight, 1..1024 (default 64)\n"
@@ -35,6 +36,10 @@ inline constexpr const char* kNgramTableHelp =
     "  --ngram-ram-mib N             disk, ram-hot: RAM for rows and their index\n"
     "                                (disk default 0/off; ram-hot default 4096)\n"
     "  --ngram-lock                  ram, ram-hot: lock the rows in physical memory\n"
+    "  --ngram-dedupe on|off         read a row a pass addresses several times from\n"
+    "                                the file once (default on)\n"
+    "  --ngram-read-ahead on|off     DeepSeek-V4.1: read a prompt call's Engram rows\n"
+    "                                while the call before it computes (default on)\n"
     "  --no-ngram-table              run Qwen3.8-Flash-Next without its n-gram table,\n"
     "                                DeepSeek-V4.1 without its Engram table.\n"
     "                                Non-standard experimental mode: the model was\n"
@@ -62,7 +67,8 @@ inline std::uint64_t parse_ngram_count(std::string_view text, std::string_view o
 template <class Value>
 bool parse_ngram_table_option(std::string_view option, NgramTableOptions& out, Value&& value) {
     if (option == "--ngram-table") {
-        out.path = std::string(value());
+        out.path     = std::string(value());
+        out.disabled = false;
     } else if (option == "--no-ngram-table") {
         out.disabled = true;
     } else if (option == "--ngram-residency") {
@@ -96,8 +102,13 @@ bool parse_ngram_table_option(std::string_view option, NgramTableOptions& out, V
         out.ram_budget_bytes =
             detail::parse_ngram_count(std::string(value()), option, 0, std::uint64_t{1} << 30U)
             << 20U;
-    } else if (option == "--ngram-lock") {
-        out.lock = true;
+    } else if (switch_option(option, "ngram-lock", [&](bool on) { out.lock = on; })) {
+    } else if (option == "--ngram-dedupe" || option == "--ngram-read-ahead") {
+        const std::string state(value());
+        if (state != "on" && state != "off") {
+            throw std::invalid_argument(std::string(option) + " must be on or off");
+        }
+        (option == "--ngram-dedupe" ? out.dedupe : out.read_ahead) = state == "on";
     } else {
         return false;
     }

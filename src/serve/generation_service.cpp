@@ -85,6 +85,12 @@ ApiError request_error_to_api_error(const ninfer::RequestError& exception) {
         error.type   = "server_error";
         error.code   = "service_unavailable";
         break;
+    case ninfer::RequestErrorKind::NumericalFailure:
+        error.param.clear();
+        error.status = 500;
+        error.type   = "server_error";
+        error.code   = "numerical_failure";
+        break;
     }
     return error;
 }
@@ -280,6 +286,7 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.enable_vision            = options.enable_vision;
     engine_options.grafts                   = options.grafts;
     options.steering.apply(engine_options);
+    options.prompt_routes.apply(engine_options);
     engine_options.vision_residency         = options.vision_residency;
     engine_options.vision_max_merged_tokens = options.vision_max_merged_tokens;
     engine_options.use_cuda_graph           = options.use_cuda_graph;
@@ -310,6 +317,7 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.prefill_cublas           = options.prefill_cublas;
     engine_options.prefill_cublas_projections = options.prefill_cublas_projections;
     engine_options.speculative              = options.speculative;
+    engine_options.gumbel_sampling          = options.gumbel_sampling;
     engine_options.context_cache            = options.context_cache;
     engine_options.slot_auto_save.enabled   = options.auto_save_evicted;
     engine_options.devices                  = options.devices;

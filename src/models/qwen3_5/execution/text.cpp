@@ -1126,27 +1126,53 @@ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& 
     require_logits_window(logits, dimension(config_.vocab_size), T, "proposal logits");
     nvtx::ScopedRange proposal_range(nvtx::Name::MtpProposal, nvtx::Category::Mtp,
                                      static_cast<std::uint64_t>(T));
+    const auto vocabulary = dimension(parameters_.model.resources().public_token_count);
+    // A sampled proposal draws from the drafter's distribution at its position's target key
+    // (set_proposal_sampling, set_proposal_key); a greedy row's draw is the argmax.
+    const auto pick = [&](const Tensor& rows, std::int32_t domain) {
+        if (proposal_configs_ == nullptr) {
+            ops::argmax(rows, proposal_tokens, domain, ctx_.stream);
+            return;
+        }
+        require_tensor_shape(proposal_key_positions_, DType::I32, {T}, "proposal key positions");
+        ops::sample(rows, proposal_tokens, domain, proposal_configs_, proposal_key_positions_,
+                    ops::kSamplePurposeDecode, work_, ctx_.stream, proposal_key_offset_);
+    };
     if (proposal_head_ != nullptr) {
         Tensor proposal_logits =
             work_.alloc(fp32_proposal_logits(*proposal_head_) ? DType::FP32 : DType::BF16,
                         {proposal_head_n_, T});
         project_head(hidden, *proposal_head_, proposal_head_shares_, proposal_logits);
-        ops::argmax(proposal_logits, proposal_tokens,
-                    proposal_head_ids_
-                        ? proposal_head_n_
-                        : dimension(parameters_.model.resources().public_token_count),
-                    ctx_.stream);
-        if (proposal_head_ids_ != nullptr) {
+        if (proposal_head_ids_ == nullptr) {
+            pick(proposal_logits, vocabulary);
+        } else if (proposal_configs_ == nullptr) {
+            ops::argmax(proposal_logits, proposal_tokens, proposal_head_n_, ctx_.stream);
             ops::proposal_remap_token_ids(proposal_tokens, proposal_head_ids_, proposal_head_n_,
                                           ctx_.stream);
+        } else {
+            // A greedy row keeps the subset's argmax, whose equal maxima select the lowest subset
+            // row as without --gumbel-sampling (the vocabulary's would select the lowest id). A
+            // sampled row's draw runs over the vocabulary, so each token's noise is the noise the
+            // target's draw gives that token.
+            ops::argmax(proposal_logits, proposal_tokens, proposal_head_n_, ctx_.stream);
+            ops::proposal_remap_token_ids(proposal_tokens, proposal_head_ids_, proposal_head_n_,
+                                          ctx_.stream);
+            Tensor expanded = work_.alloc(DType::FP32, {vocabulary, T});
+            ops::proposal_expand_logits(proposal_logits, proposal_head_ids_, proposal_head_n_,
+                                        expanded, ctx_.stream);
+            Tensor sampled = work_.alloc(DType::I32, {T});
+            require_tensor_shape(proposal_key_positions_, DType::I32, {T},
+                                 "proposal key positions");
+            ops::sample(expanded, sampled, vocabulary, proposal_configs_, proposal_key_positions_,
+                        ops::kSamplePurposeDecode, work_, ctx_.stream, proposal_key_offset_);
+            ops::proposal_select_sampled(proposal_tokens, sampled, proposal_configs_, ctx_.stream);
         }
     } else {
         Tensor output_logits = fp32_proposal_logits(mtp_->output_head)
                                    ? work_.alloc(DType::FP32, {dimension(config_.vocab_size), T})
                                    : bf16_window(logits, T);
         project_head(hidden, mtp_->output_head, &mtp_->output_head_shares, output_logits);
-        ops::argmax(output_logits, proposal_tokens,
-                    dimension(parameters_.model.resources().public_token_count), ctx_.stream);
+        pick(output_logits, vocabulary);
     }
 }
 
@@ -1467,7 +1493,7 @@ void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor
     proposal_argmax(hidden, logits, draft_tokens);
 }
 
-void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase ph) {
+void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase ph, bool kv_only) {
     const auto& p  = std::get<AttentionParameters>(w.mixer);
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
@@ -1566,6 +1592,24 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     const bool rotated_output = rotated(p.output.hadamard_signs);
     const Tensor& kv_table_rows =
         active_kv_table_rows_ != nullptr ? *active_kv_table_rows_ : io_.text_kv_table_row;
+    if (kv_only) {
+        // The rows the attention call would append, through the same launch on its prompt route;
+        // a call on a small-T route appends inside its kernels, so it runs whole below and its
+        // output goes unused.
+        if (active_sequence_batch_ != 0 || !active_segments_.empty()) {
+            throw std::logic_error("a K/V-only layer runs one prompt chunk");
+        }
+        const ops::AttentionHeadGeometry geometry{dimension(config.attention->head_dim),
+                                                  dimension(config.attention->num_attention_heads),
+                                                  dimension(config.attention->num_key_value_heads)};
+        const PagedKVBatchLayerView view = batch_text_kv_->batch_layer_view(fidx, kv_rank);
+        if (ops::causal_softmax_attention_route_family(geometry, view.storage, envelope, 1, T) ==
+            2) {
+            ops::causal_softmax_attention_append(kn, v, cache_positions, Tensor{}, kv_table_rows,
+                                                 geometry, view, envelope, s);
+            return;
+        }
+    }
     if (active_sequence_batch_ != 0) {
         const std::int32_t width = active_sequence_width_;
         if (width <= 0 || width * active_sequence_batch_ != T) {
@@ -1633,6 +1677,7 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
             batch_text_kv_->batch_layer_view(fidx, kv_rank), envelope, work_, a, s,
             rotated_output || positions ? nullptr : &gate, positions ? &partial : nullptr);
     }
+    if (kv_only) { return; }
     if (positions) {
         // The rank's query heads' gates, contiguous for the merge.
         const TensorShare& share = stage_runtime_->tensor_parallel->shares[tensor_rank_];
@@ -1797,6 +1842,26 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
                                               p.convolution, conv_state_in, conv_state_out,
                                               q_segment, k_segment, v_segment, s);
             }
+        } else if (gdn_live_taps_ != 0) {
+            // In-pass taps: the columns before each leave their window in its image, from which
+            // the next columns continue.
+            std::int32_t begin = 0;
+            for (std::size_t tap = 0; tap <= gdn_live_taps_; ++tap) {
+                const bool last = tap == gdn_live_taps_;
+                const std::int32_t end = last ? T : gdn_tap_columns_[tap];
+                const std::int32_t in_slot =
+                    tap == 0 ? linear_state_source_slot_ : gdn_taps_[tap - 1].state_slot;
+                const std::int32_t out_slot =
+                    last ? linear_state_destination_slot_ : gdn_taps_[tap].state_slot;
+                Tensor conv_in  = gdn_pool.pool->conv_slot(gdn_pool.local, in_slot);
+                Tensor conv_out = gdn_pool.pool->conv_slot(gdn_pool.local, out_slot);
+                Tensor q_part   = qc.slice(1, begin, end - begin);
+                Tensor k_part   = kc.slice(1, begin, end - begin);
+                Tensor v_part   = vc.slice(1, begin, end - begin);
+                ops::causal_conv1d_silu_split(qkv.slice(1, begin, end - begin), p.convolution,
+                                              conv_in, conv_out, q_part, k_part, v_part, s);
+                begin = end;
+            }
         } else {
             Tensor conv_state_in =
                 gdn_pool.pool->conv_slot(gdn_pool.local, linear_state_source_slot_);
@@ -1880,6 +1945,29 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
                     1.0 / std::sqrt(static_cast<double>(config.gdn->linear_key_head_dim))),
                 /*normalize_qk=*/true, work_, recurrent_state_in, recurrent_state_out, o_segment,
                 s);
+        }
+    } else if (gdn_live_taps_ != 0) {
+        const GdnStateRef recurrent_pool = gdn_state(static_cast<std::uint32_t>(gidx));
+        const float scale                = static_cast<float>(
+            1.0 / std::sqrt(static_cast<double>(config.gdn->linear_key_head_dim)));
+        std::int32_t begin = 0;
+        for (std::size_t tap = 0; tap <= gdn_live_taps_; ++tap) {
+            const bool last        = tap == gdn_live_taps_;
+            const std::int32_t end = last ? T : gdn_tap_columns_[tap];
+            const std::int32_t n   = end - begin;
+            const std::int32_t in_slot =
+                tap == 0 ? linear_state_source_slot_ : gdn_taps_[tap - 1].state_slot;
+            const std::int32_t out_slot =
+                last ? linear_state_destination_slot_ : gdn_taps_[tap].state_slot;
+            auto scope       = work_.scope();
+            Tensor state_in  = recurrent_pool.pool->recurrent_slot(recurrent_pool.local, in_slot);
+            Tensor state_out = recurrent_pool.pool->recurrent_slot(recurrent_pool.local, out_slot);
+            Tensor o_part    = o.slice(2, begin, n);
+            ops::gated_delta_net(q_recurrent.slice(2, begin, n), k_recurrent.slice(2, begin, n),
+                                 vv.slice(2, begin, n), g.slice(1, begin, n),
+                                 beta.slice(1, begin, n), scale, /*normalize_qk=*/true, work_,
+                                 state_in, state_out, o_part, s);
+            begin = end;
         }
     } else {
         const GdnStateRef recurrent_pool = gdn_state(static_cast<std::uint32_t>(gidx));
@@ -2037,6 +2125,8 @@ void TextContext::run_stage_layers(std::size_t stage, Tensor& x, Phase ph, Tap& 
             if (layer < layer_ready_.size()) {
                 CUDA_CHECK(cudaStreamWaitEvent(ctx_.stream, layer_ready_[layer], 0));
             }
+            // A K/V-only pass ends at the model's last layer once its rows are in the cache.
+            const bool kv_only = kv_only_pass_ && layer + 1 == parameters_.text.layers.size();
             {
                 nvtx::ScopedRange mixer_range(
                     full ? (prefill ? nvtx::Name::PrefillAttention : nvtx::Name::VerifyAttention)
@@ -2044,11 +2134,12 @@ void TextContext::run_stage_layers(std::size_t stage, Tensor& x, Phase ph, Tap& 
                     full ? nvtx::Category::Attention : nvtx::Category::Gdn, layer);
                 auto scope = work_.scope();
                 if (full) {
-                    attn_mix(block, x, compact, ph);
+                    attn_mix(block, x, compact, ph, kv_only);
                 } else {
                     gdn_mix(block, x, compact, ph);
                 }
             }
+            if (kv_only) { continue; }
             steer(ops::SteerResidualStep::Write, mixer_steering_site(layer), -1, x);
             {
                 nvtx::ScopedRange range(prefill ? nvtx::Name::PrefillPostMixer
@@ -2605,6 +2696,61 @@ void TextContext::run_tensor_parallel(Tensor& x, Phase ph, Tap& tap) {
         ++attention_ranks;
     }
     const auto layers = static_cast<std::uint32_t>(parameters_.text.layers.size());
+    // A K/V-only pass: the ranks that hold the last layer's KV rows append them, piece by piece
+    // where the pass runs in pieces (the projections' shapes stay those of the whole layer), and
+    // nothing is exchanged. A position-split rank appends on the prompt route only, so a chunk
+    // whose attention leaves it runs that layer whole.
+    bool kv_only_last = kv_only_pass_;
+    if (kv_only_last && positions) {
+        const auto last_compact = dimension(config_.compact_layer_indices[layers - 1]);
+        ops::CausalAttentionExecutionEnvelope envelope = *active_causal_attention_envelope_;
+        envelope.invariant_segment_keys                = batch_text_kv_->attention_segment_keys();
+        const ops::AttentionHeadGeometry geometry{
+            dimension(config_.attention->head_dim),
+            dimension(config_.attention->num_attention_heads),
+            dimension(config_.attention->num_key_value_heads)};
+        kv_only_last = ops::causal_softmax_attention_route_family(
+                           geometry, batch_text_kv_->batch_layer_view(last_compact, 0).storage,
+                           envelope, 1, x.ne[1]) == 2;
+    }
+    ScopedValue<bool> kv_only_guard(kv_only_pass_, kv_only_last);
+    const auto kv_only_layer = [&](const auto& share) {
+        const std::size_t holders = positions ? ranks : attention_ranks;
+        if (pieces.empty()) {
+            for (std::size_t rank = 0; rank < holders; ++rank) {
+                on_rank(rank, [&](Tensor& replica) { share(rank, replica); });
+            }
+            return;
+        }
+        for (std::size_t index = 0; index < pieces.size(); ++index) {
+            const Piece& piece = pieces[index];
+            for (std::size_t rank = 0; rank < holders; ++rank) {
+                std::optional<ScopedDeviceRank> device_guard;
+                std::optional<ScopedArenaRank> arena_guard;
+                if (rank != 0) {
+                    device_guard.emplace(ctx_, rank);
+                    arena_guard.emplace(work_, rank);
+                }
+                ScopedControl control_guard(current, piece.control[rank], slots);
+                ScopedValue<const ops::CausalAttentionExecutionEnvelope*> envelope_guard(
+                    active_causal_attention_envelope_, &piece.envelope);
+                if (!first_piece_step) {
+                    CUDA_CHECK(
+                        cudaStreamWaitEvent(ctx_.stream, exchange.piece_done(rank, index), 0));
+                }
+                Tensor sub   = replicas[rank].x.slice(1, piece.column, piece.columns);
+                tensor_rank_ = rank;
+                try {
+                    auto scope = work_.scope();
+                    share(rank, sub);
+                } catch (...) {
+                    tensor_rank_ = 0;
+                    throw;
+                }
+                tensor_rank_ = 0;
+            }
+        }
+    };
     for (std::uint32_t layer = 0; layer < layers; ++layer) {
         const auto block = [&](std::size_t rank) -> const BlockParameters& {
             return rank == 0 ? parameters_.text.layers[layer]
@@ -2615,6 +2761,12 @@ void TextContext::run_tensor_parallel(Tensor& x, Phase ph, Tap& tap) {
         try {
             if (layer < layer_ready_.size()) {
                 CUDA_CHECK(cudaStreamWaitEvent(entry_stream, layer_ready_[layer], 0));
+            }
+            if (kv_only_last && layer + 1 == layers) {
+                kv_only_layer([&](std::size_t rank, Tensor& replica) {
+                    attn_mix(block(rank), replica, compact, ph, true);
+                });
+                continue;
             }
             if (full && positions) {
                 // Every rank attends over its own pages into a slot of the exchange and publishes
@@ -2770,6 +2922,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
     }
     int t0          = 0;
     bool token_left = false;
+    bool tapped     = false;
     for (; t0 < T;) {
         int len = std::min(chunk, T - t0);
         if (split_rel > 0 && t0 < split_rel && t0 + len > split_rel) { len = split_rel - t0; }
@@ -2786,6 +2939,43 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             len = vision_chunk.length;
         }
         const bool is_last = finalize_at_end && (t0 + len == T);
+        // In-pass taps: a text chunk on one device whose columns hold every frontier, in order.
+        gdn_live_taps_ = 0;
+        if (gdn_tap_count_ != 0 && multimodal == nullptr &&
+            !(stage_runtime_ != nullptr && stage_runtime_->tensor_parallel)) {
+            std::int64_t previous = 0;
+            bool inside           = true;
+            for (std::size_t index = 0; index < gdn_tap_count_; ++index) {
+                const std::int64_t column =
+                    static_cast<std::int64_t>(gdn_taps_[index].frontier) - base64 - t0;
+                inside = inside && column > previous && column < len;
+                gdn_tap_columns_[index] = inside ? static_cast<std::int32_t>(column) : 0;
+                previous              = column;
+            }
+            gdn_live_taps_ = inside ? gdn_tap_count_ : 0;
+        }
+        tapped = gdn_live_taps_ != 0;
+        // The last layer as K/V only (set_last_layer_kv_only): nothing reads the chunk's final
+        // hidden state.
+        const std::size_t prompt_tokens = multimodal != nullptr ? multimodal->token_ids.size()
+                                          : text_prefill != nullptr
+                                              ? text_prefill->token_ids.size()
+                                              : static_cast<std::size_t>(base) + ids.size();
+        bool kv_only =
+            last_layer_kv_only_allowed_ && !is_last && !prepare_mtp_prompt &&
+            static_cast<std::size_t>(prompt_t0) + static_cast<std::size_t>(len) < prompt_tokens &&
+            config_.layer_types.back() == MixerKind::FullAttention &&
+            !(split_rel > 0 && t0 + len == split_rel &&
+              rewrite_checkpoint_hidden_output_ != nullptr);
+        for (std::size_t index = 0; index < gdn_live_taps_; ++index) {
+            kv_only = kv_only && gdn_taps_[index].hidden == nullptr;
+        }
+        if constexpr (Tap::enabled) {
+            const auto last = static_cast<std::uint32_t>(parameters_.text.layers.size() - 1);
+            kv_only = kv_only &&
+                      std::find(tap.layers.begin(), tap.layers.end(), last) == tap.layers.end();
+        }
+        ScopedValue<bool> kv_only_guard(kv_only_pass_, kv_only);
         nvtx::ScopedRange chunk_range(nvtx::Name::PrefillChunk, nvtx::Category::Prefill,
                                       static_cast<std::uint64_t>(len));
 
@@ -2884,7 +3074,16 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             Tensor xf = prefill_hidden_.data != nullptr
                             ? matrix_window(prefill_hidden_, len)
                             : work_.alloc(DType::BF16, {dimension(config_.hidden_size), len});
-            ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, xf, s);
+            if (!kv_only) { ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, xf, s); }
+            for (std::size_t index = 0; index < gdn_live_taps_; ++index) {
+                Tensor* hidden = gdn_taps_[index].hidden;
+                if (hidden == nullptr) { continue; }
+                require_tensor_shape(*hidden, DType::BF16, {dimension(config_.hidden_size), 1},
+                                     "in-pass tap hidden");
+                const Tensor column = xf.slice(1, gdn_tap_columns_[index] - 1, 1);
+                CUDA_CHECK(cudaMemcpyAsync(hidden->data, column.data, column.bytes(),
+                                           cudaMemcpyDeviceToDevice, s));
+            }
 
             if (is_last) {
                 Tensor last_xf = xf.slice(1, len - 1, 1);
@@ -2984,12 +3183,17 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 if (is_last && mtp_proposal_extent_ != 0) {
                     Tensor logits = matrix_window(io_.logits, 1);
                     Tensor draft0 = io_.mtp->draft_tokens.slice(0, 0, 1);
+                    // The anchor (the token just sampled) fills position base_i + T: proposal i
+                    // takes the target's key for position base_i + T + i + 1.
+                    Tensor ar_position = io_.mtp->position.slice(0, 0, 1);
+                    ops::set_i32_scalar(ar_position, base_i + T, s);
+                    set_proposal_key(ar_position, 1);
                     mtp_prefill_chunk(mtp_ids, xf, mtp_input_embeddings_ptr, positions,
                                       rope_positions, chunk_envelope, true, &io_.mtp->ar_hidden,
                                       &logits, &draft0);
 
-                    Tensor ar_position = io_.mtp->position.slice(0, 0, 1);
-                    ops::set_i32_scalar(ar_position, base_i + T, s);
+                    // The step that proposes draft i runs at ar_position base_i + T + i - 1.
+                    set_proposal_key(ar_position, 2);
                     for (int i = 1; i < static_cast<int>(mtp_proposal_extent_); ++i) {
                         Tensor prev_token = io_.mtp->draft_tokens.slice(0, i - 1, 1);
                         Tensor next_token = io_.mtp->draft_tokens.slice(0, i, 1);
@@ -3034,6 +3238,8 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
     }
 
     prefill_split_frontier_ = -1;
+    gdn_tap_count_          = 0;
+    gdn_live_taps_          = 0;
 
     // A token that has left is waited for by the caller; the drafter's work behind it is not.
     if (!token_left) {
@@ -3044,6 +3250,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
     work_.reset();
     return PrefillChunkResult{.processed_tokens = static_cast<std::uint32_t>(t0),
                               .finalized        = finalize_at_end && t0 == T,
+                              .tapped           = tapped,
                               .timing           = timing.finish()};
 }
 

@@ -1,6 +1,8 @@
 #include "models/qwen3_5/execution/vision_overlay.h"
 
+#include "core/device_wait.h"
 #include "core/kv_loan.h"
+#include "core/pinned_memory.h"
 #include "models/qwen3_5/execution/vision.h"
 
 #include <cuda_runtime.h>
@@ -395,8 +397,8 @@ VisionOverlaySession::~VisionOverlaySession() {
     // The encode still owns the borrowed memory and the staging events; wait it out before the
     // weight stream and the window are destroyed. Failures here are not recoverable and must not
     // escape a destructor.
-    (void)cudaStreamSynchronize(encode_stream_);
-    (void)cudaStreamSynchronize(device_.transfer_stream);
+    (void)ninfer::wait_for_stream(encode_stream_);
+    (void)ninfer::wait_for_stream(device_.transfer_stream);
     pending_ = false;
     weights_.reset();
     window_.close();
@@ -458,8 +460,8 @@ bool VisionOverlaySession::submit_item(std::span<const std::uint16_t> patches,
     try {
         begin(std::move(*borrowed), patches, control, plan);
     } catch (...) {
-        if (encode_stream_ != nullptr) { (void)cudaStreamSynchronize(encode_stream_); }
-        (void)cudaStreamSynchronize(device_.transfer_stream);
+        if (encode_stream_ != nullptr) { (void)ninfer::wait_for_stream(encode_stream_); }
+        (void)ninfer::wait_for_stream(device_.transfer_stream);
         pending_ = false;
         weights_.reset();
         window_.close();
@@ -484,7 +486,7 @@ void VisionOverlaySession::close_window() {
     // std::optional's, so it destroys idle events rather than re-entering the member reset() that
     // issues the first two layer copies.
     completion_.synchronize();
-    CUDA_CHECK(cudaStreamSynchronize(device_.transfer_stream));
+    CUDA_CHECK(ninfer::wait_for_stream(device_.transfer_stream));
     stats_.staged_bytes += weights_->uploaded_bytes();
     weights_.reset();
     window_parameters_.reset();
@@ -515,8 +517,8 @@ VisionOverlaySession::encode_item(std::span<const std::uint16_t> patches,
     try {
         begin(std::move(window), patches, control, plan);
     } catch (...) {
-        if (encode_stream_ != nullptr) { (void)cudaStreamSynchronize(encode_stream_); }
-        (void)cudaStreamSynchronize(device_.transfer_stream);
+        if (encode_stream_ != nullptr) { (void)ninfer::wait_for_stream(encode_stream_); }
+        (void)ninfer::wait_for_stream(device_.transfer_stream);
         pending_ = false;
         weights_.reset();
         window_.close();

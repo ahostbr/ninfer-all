@@ -11,18 +11,19 @@
 // until the next round start an even share of its swaps each, copied on a side stream beside the
 // draft and the next pass, so a round never holds the bus for longer than a pass's share; a
 // candidate's table entries move to its slot once its copy has landed. The expert misses may also
-// place a miss they copy anyway into a slot at once, by the same rule (admit). A recorded routing
+// place a miss they copy anyway into a slot at once, by the same rule (admit), and a wide prompt
+// call an expert it copies anyway into a free slot (admit_free). A recorded routing
 // profile fills the slots at startup and, through the ranking of its counts over every layer, sizes
 // each layer's share of them.
 //
-// Between prompts the cache also holds the device buffers a wide call copies its layer's uncached
-// experts into (lend): a wide pass takes them back (reclaim), keeping the most routed of the
-// experts they held in colder slots of the cache's own, and the next decode pass returns them
-// empty (give_back), to fill as decode routes.
+// Between prompts the cache also holds the device buffers that only wide calls write, those they
+// copy a layer's uncached experts into and a prompt span's stack (lend): a wide pass takes them
+// back (reclaim), keeping the most routed of the experts they held in colder slots of the cache's
+// own, and the next decode pass returns them empty (give_back), to fill as decode routes.
 
-#include "core/arena.h"
 #include "core/device.h"
 #include "core/expert_tier.h"
+#include "core/pinned_memory.h"
 #include "core/weight.h"
 
 #include <array>
@@ -91,22 +92,22 @@ public:
     void seed(const std::vector<std::vector<std::uint64_t>>& counts);
     // Every route each layer's experts took since startup.
     [[nodiscard]] std::vector<std::vector<std::uint64_t>> totals() const;
-    // The device memory of `layer`'s slots: its own block, grow's and its share of up to two lent
-    // buffers (empty until then). A table entry inside any of them is a cached expert.
-    using Ranges = std::array<std::pair<std::uintptr_t, std::uintptr_t>, 4>;
+    // The device memory of `layer`'s slots: its own block, grow's and its share of up to three
+    // lent buffers (empty until then). A table entry inside any of them is a cached expert.
+    using Ranges = std::array<std::pair<std::uintptr_t, std::uintptr_t>, 5>;
     [[nodiscard]] Ranges storage(std::size_t layer) const;
     // Once startup's allocations are done: more slots for every layer that is not full, from
     // `bytes_by_rank`, as free slots, shared as at construction (a profile's ranking continues
     // where construction stopped). Returns the bytes each rank gave. At most once.
     std::vector<std::uint64_t> grow(std::span<const std::uint64_t> bytes_by_rank);
 
-    // Device buffers of a rank that wide calls write between decode passes.
+    // Device buffers of a rank that only wide calls write, between decode passes.
     struct Loan {
         std::size_t rank = 0;
         void* base       = nullptr;
         std::uint64_t bytes = 0;
     };
-    // After grow, at most once: up to two buffers per rank become free slots of that rank's layers
+    // After grow, at most once: up to three buffers per rank become free slots of that rank's layers
     // that are not full, shared as grow shares; the cache holds them until a reclaim. Returns the
     // bytes of each rank's slots.
     std::vector<std::uint64_t> lend(std::span<const Loan> loans);
@@ -135,6 +136,10 @@ public:
     // counts as a miss until the next observe.
     bool admit(std::size_t layer, std::int32_t expert, int pairs,
                std::span<const unsigned char> in_use, Admitted& out);
+    // As admit, but only into a free slot: no expert leaves the cache. A wide prompt call's slot
+    // pool copies the uncached experts it routes this way first, while a handed-over layer's slots
+    // are not all taken.
+    bool admit_free(std::size_t layer, std::int32_t expert, Admitted& out);
     // The device tables (gate, up, down) of `layer`.
     [[nodiscard]] std::array<void*, 3> tables(std::size_t layer) const;
 
@@ -143,6 +148,11 @@ private:
     void upload(Layer& layer, cudaStream_t stream);
     // Moves the candidates of landed round copies into their slots' table entries.
     void land();
+    // admit's and admit_free's bookkeeping once `slot` of `layer` takes `expert`.
+    void place(Layer& layer, std::size_t index, std::int32_t expert, std::int32_t slot,
+               Admitted& out);
+    // A spare event of `rank`, or a new one made on its device.
+    cudaEvent_t take_event(std::size_t rank);
     DeviceContext& device_;
     std::vector<Layer> layers_;
     std::unique_ptr<PinnedHostBuffer> staging_;
@@ -164,7 +174,9 @@ private:
     std::vector<ExpertTier::Swap> queued_;
     std::size_t mtp_ = ~std::size_t{0}; // the MTP block's layer, which the draft reads
     std::vector<std::vector<std::uint64_t>> profile_; // construction's, which grow continues
-    std::vector<cudaEvent_t> spare_;    // events of landed copies, reused
+    // By rank: events of landed copies, reused on that rank's side stream (CUDA records an event
+    // only on a stream of the device it was made on).
+    std::vector<std::vector<cudaEvent_t>> spare_;
     // By rank: whether the cache holds its lent buffers, and the event a reclaim's transfer
     // stream (or a give_back's compute stream) waits on.
     std::vector<unsigned char> holding_;

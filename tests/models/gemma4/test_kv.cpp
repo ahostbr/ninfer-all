@@ -8,7 +8,7 @@
 
 #include "../../ops/kv_cache_e8_root_host.h"
 #include "../../ops/kv_cache_lloyd4_oracle.h"
-#include "core/arena.h"
+#include "core/device_buffer.h"
 #include "models/gemma4/kernels.h"
 #include "models/gemma4/kv_format.h"
 
@@ -143,6 +143,7 @@ const char* storage_name(KvCacheStorage s) {
     case KvCacheStorage::RotatedLloyd4KeyInt4Value: return "rk4v4";
     case KvCacheStorage::RotatedInt4KeyInt4ValueE8: return "rk4v4-e8";
     case KvCacheStorage::RotatedE8RootKeyInt4Value: return "rk2v4-e8";
+    case KvCacheStorage::Bf16Packed: return "bf16p";
     }
     return "?";
 }

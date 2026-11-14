@@ -6,20 +6,26 @@
 // entries back on the host at once and the candidate's moved only once its copy has landed; prompt
 // routes must not steer them. A routing profile must size each layer's share of the slots and fill
 // them. An admission takes a free slot, else the coldest expert its call does not route when the
-// newcomer's count beats it, and counts the newcomer's routes in that call as misses. Lent buffers
-// are free slots until a wide pass reclaims them: their most routed experts move into colder slots
-// of the cache's own, no entry points inside them while the pass writes them, and they come back
+// newcomer's count beats it, and counts the newcomer's routes in that call as misses; a free
+// admission (a wide prompt call's) takes only a free slot. Lent buffers are free slots until a
+// wide pass reclaims them: their most routed experts move into colder slots of the cache's own,
+// no entry points inside them while the pass writes them, and they come back
 // zeroed, refilled with the most routed experts outside the cache and free for admissions past
-// those. A round's swaps start over the passes until the next round, a share of them a pass.
-#include "core/arena.h"
+// those. A round's swaps start over the passes until the next round, a share of them a pass. With
+// two devices, rounds that copy into one rank's slots, then the other's, then both, reuse each
+// copy's event on the device it was made on.
 #include "core/device.h"
+#include "core/device_buffer.h"
+#include "core/pinned_memory.h"
 #include "models/qwen4_exp/expert_cache.h"
 
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -209,10 +215,7 @@ void paced(DeviceContext& device) {
 
 // Admits `expert` into layer `l` and copies it in and patches its entries, as the expert misses
 // do; the result's slot is null when the cache refused it.
-ExpertCache::Admitted admit(ExpertCache& cache, const Model& model, std::size_t l, std::int32_t expert,
-                            int pairs, const std::vector<unsigned char>& in_use) {
-    ExpertCache::Admitted out;
-    if (!cache.admit(l, expert, pairs, in_use, out)) { return out; }
+void fill(const Model& model, std::size_t l, std::int32_t expert, const ExpertCache::Admitted& out) {
     const Bank* banks[3] = {l == 0 ? &model.g0 : &model.g1, l == 0 ? &model.u0 : &model.u1,
                             l == 0 ? &model.d0 : &model.d1};
     for (int k = 0; k < 3; ++k) {
@@ -229,7 +232,45 @@ ExpertCache::Admitted admit(ExpertCache& cache, const Model& model, std::size_t 
                     "patch a victim entry");
         }
     }
+}
+
+ExpertCache::Admitted admit(ExpertCache& cache, const Model& model, std::size_t l, std::int32_t expert,
+                            int pairs, const std::vector<unsigned char>& in_use) {
+    ExpertCache::Admitted out;
+    if (cache.admit(l, expert, pairs, in_use, out)) { fill(model, l, expert, out); }
     return out;
+}
+
+// A wide prompt call's admissions take free slots only: once a handed-over layer's slots are all
+// taken, no expert leaves for a newcomer.
+void free_admissions(DeviceContext& device) {
+    Model model;
+    ExpertCache cache(device, model.layers(device), std::vector<std::uint64_t>{2 * 102400});
+    const auto admit_free = [&](std::int32_t expert) {
+        ExpertCache::Admitted out;
+        if (cache.admit_free(1, expert, out)) { fill(model, 1, expert, out); }
+        return out;
+    };
+    require(admit_free(0).slot[0] == nullptr, "a layer not handed over admits nothing");
+    cache.hand_over(1);
+    int slots = 0;
+    for (std::int32_t e = 0; e < kExperts; ++e) {
+        const auto out = admit_free(e);
+        if (out.slot[0] == nullptr) { break; }
+        require(out.victim < 0, "a free admission evicts nothing");
+        ++slots;
+    }
+    require(slots > 0 && slots < kExperts, "free admissions fill the free slots and stop: " +
+                                               std::to_string(slots));
+    require(int(model.cached(1, "free admissions").size()) == slots,
+            "every admitted expert's entries point at its slot");
+    require(admit_free(0).slot[0] == nullptr, "a cached expert is not admitted twice");
+    const auto refused = admit_free(std::int32_t(kExperts - 1));
+    const auto cached  = model.cached(1, "full");
+    require(refused.slot[0] == nullptr && int(cached.size()) == slots && holds(cached, 0) &&
+                !holds(cached, kExperts - 1),
+            "a full layer admits nothing and keeps its experts");
+    require(cache.stats().admitted == std::uint64_t(slots), "each free admission counts once");
 }
 
 void loans(DeviceContext& device) {
@@ -303,6 +344,74 @@ void loans(DeviceContext& device) {
             "returned slots hold their experts, followed by zeros");
     cache.give_back(0, transfer);
     require(cache.stats().slots == 16, "a second return changes nothing");
+    cudaStreamDestroy(transfer);
+}
+
+// Three lent buffers of a rank (the two pool buffers and a span's stack): their slots follow one
+// another, and a reclaim and a return treat them as one.
+void three_loans(DeviceContext& device) {
+    Model model;
+    ExpertCache cache(device, model.layers(device), std::vector<std::uint64_t>{4 * 16384});
+    std::array<DeviceBuffer, 3> buffers{DeviceBuffer(2 * 16384), DeviceBuffer(2 * 16384 + 500),
+                                        DeviceBuffer(2 * 16384)};
+    cudaStream_t transfer = nullptr;
+    require(cudaStreamCreateWithFlags(&transfer, cudaStreamNonBlocking) == cudaSuccess, "a stream");
+    std::vector<ExpertCache::Loan> loans;
+    for (const auto& buffer : buffers) { loans.push_back({.rank = 0, .base = buffer.p, .bytes = buffer.bytes}); }
+    const auto lent = cache.lend(loans);
+    require(lent.size() == 1 && lent[0] == 6 * 16384 && cache.stats().slots == 20,
+            "three lent buffers give each layer two slots each: " + std::to_string(cache.stats().slots));
+    const auto which = [&](const void* at) {
+        const auto a = reinterpret_cast<std::uintptr_t>(at);
+        for (int b = 0; b < 3; ++b) {
+            const auto base = reinterpret_cast<std::uintptr_t>(buffers[std::size_t(b)].p);
+            if (a >= base && a < base + buffers[std::size_t(b)].bytes) { return b; }
+        }
+        return -1;
+    };
+    const auto ranges = cache.storage(0);
+    for (int b = 0; b < 3; ++b) {
+        const auto& range = ranges[std::size_t(2 + b)];
+        require(range.second - range.first == 2 * 10496 && which(reinterpret_cast<void*>(range.first)) == b,
+                "layer 0's lent block " + std::to_string(b) + " lies in its buffer");
+    }
+    cache.hand_over(0);
+    std::vector<unsigned char> in_use(kExperts, 0);
+    // Experts 0..3 take the cache's own slots, 4..9 the lent ones, buffer by buffer.
+    for (std::int32_t e = 0; e < 10; ++e) {
+        const auto out = admit(cache, model, 0, e, 1, in_use);
+        require(out.slot[0] != nullptr && which(out.slot[0]) == (e < 4 ? -1 : (e - 4) / 2),
+                "expert " + std::to_string(e) + " takes the next slot in order");
+    }
+    std::vector<std::int32_t> routes;
+    for (int e = 0; e < 10; ++e) { routes.insert(routes.end(), std::size_t(5 * (e + 1)), e); }
+    cache.observe(0, routes, true);
+    cache.adapt();
+    require(model.cached(0, "three lent and filled").size() == 10, "ten slots hold their experts");
+
+    // A wide pass takes the three back: the four most routed stay, in the cache's own slots.
+    cache.reclaim(0, transfer);
+    require(cudaStreamSynchronize(transfer) == cudaSuccess, "the handover");
+    require(model.cached(0, "three reclaimed") == std::vector<int>({6, 7, 8, 9}),
+            "the most routed experts stay in the cache's own slots");
+    for (const auto& buffer : buffers) {
+        require(cudaMemsetAsync(buffer.p, 0xab, buffer.bytes, transfer) == cudaSuccess, "a wide pass writes it");
+    }
+    require(cudaStreamSynchronize(transfer) == cudaSuccess, "the wide pass");
+    require(model.cached(0, "three written").size() == 4, "the buffers' writes reach no cached expert");
+
+    // The next decode pass returns them zeroed, and the six that left come back into them.
+    cache.give_back(0, transfer);
+    require(cudaDeviceSynchronize() == cudaSuccess, "the zeroing and the copies");
+    cache.adapt();
+    const auto refilled = model.cached(0, "three refilled");
+    require(refilled.size() == 10, "the returned slots are refilled: " + std::to_string(refilled.size()));
+    for (std::int32_t e = 0; e < 6; ++e) {
+        require(which(cache.cached(0, 0, e)) >= 0, "a refilled expert lies in a returned slot");
+    }
+    require(which(cache.cached(0, 0, 5)) != which(cache.cached(0, 0, 0)) ||
+                which(cache.cached(0, 0, 5)) != which(cache.cached(0, 0, 3)),
+            "the refill spans more than one buffer");
     cudaStreamDestroy(transfer);
 }
 
@@ -402,6 +511,86 @@ void profile(DeviceContext& device) {
             "growth continues a profile's ranking: " + std::to_string(halves.stats().slots));
 }
 
+// A layer on each of two devices: a round copies only into the second rank's slots, the next only
+// into the first's (with the second rank's landed event spare), the third into both.
+void two_ranks(int devices) {
+    if (devices < 2) {
+        std::cout << "two ranks skipped: one CUDA device\n";
+        return;
+    }
+    const std::array<int, 2> ids{0, 1};
+    DeviceContext pair(ids);
+    std::mt19937 random{9200u};
+    const std::int64_t sizes[6] = {4096, 4096, 2048, 1536, 3072, 1024};
+    std::vector<std::unique_ptr<Bank>> banks;
+    for (int i = 0; i < 6; ++i) {
+        RankBinding bind(pair, i < 3 ? 0 : 1);
+        banks.push_back(std::make_unique<Bank>(sizes[i], random));
+    }
+    {
+        std::vector<ExpertCacheLayer> layers;
+        for (std::size_t l = 0; l < 2; ++l) {
+            layers.push_back({.rank   = l,
+                              .stream = pair.rank(l).stream,
+                              .gate   = banks[3 * l]->view(),
+                              .up     = banks[3 * l + 1]->view(),
+                              .down   = banks[3 * l + 2]->view()});
+        }
+        // Twelve slots a layer (10,496 and 5,888 bytes a slot).
+        ExpertCache cache(pair, std::move(layers), std::vector<std::uint64_t>{12 * 10496, 12 * 5888});
+        require(cache.stats().slots == 24, "each rank's layer takes its own budget");
+        const auto cached = [&](std::size_t l, const std::string& label) {
+            RankBinding bind(pair, l);
+            const auto gate = banks[3 * l]->verify(label + " gate");
+            require(banks[3 * l + 1]->verify(label + " up") == gate &&
+                        banks[3 * l + 2]->verify(label + " down", 256) == gate,
+                    label + ": a layer's three banks cache the same experts");
+            return gate;
+        };
+        const auto hot = [](std::int32_t a, std::int32_t b) {
+            std::vector<std::int32_t> out;
+            for (std::int32_t t = 0; t < 40; ++t) {
+                out.push_back(a);
+                out.push_back(b);
+                out.push_back(t);
+            }
+            return out;
+        };
+        // Four passes end in a round; its copies land at the pass after them.
+        const auto round = [&](const std::vector<std::int32_t>& first,
+                               const std::vector<std::int32_t>& second) {
+            for (int p = 0; p < 4; ++p) {
+                cache.observe(0, first, true);
+                cache.observe(1, second, true);
+                cache.adapt();
+            }
+            for (std::size_t r = 0; r < 2; ++r) {
+                RankBinding bind(pair, r);
+                require(cudaDeviceSynchronize() == cudaSuccess, "a round's copies");
+            }
+            cache.adapt();
+        };
+        round({}, hot(9, 11));
+        const auto second = cached(1, "the second rank's round");
+        require(cached(0, "an idle first rank").empty() && holds(second, 9) && holds(second, 11),
+                "the second rank's round fills its slots");
+        round(hot(5, 7), {});
+        const auto first = cached(0, "the first rank's round");
+        require(holds(first, 5) && holds(first, 7) && cached(1, "an idle second rank") == second,
+                "the first rank's round fills its slots and leaves the second's");
+        round(hot(50, 51), hot(60, 61));
+        require(holds(cached(0, "both ranks, first"), 50) && holds(cached(1, "both ranks, second"), 60),
+                "a round over both ranks fills both");
+    }
+    for (std::size_t r = 0; r < 2; ++r) {
+        RankBinding bind(pair, r);
+        banks[3 * r].reset();
+        banks[3 * r + 1].reset();
+        banks[3 * r + 2].reset();
+    }
+    std::cout << "two ranks checked\n";
+}
+
 } // namespace
 
 int main() {
@@ -415,8 +604,11 @@ int main() {
         rounds(device);
         paced(device);
         admissions(device);
+        free_admissions(device);
         profile(device);
         loans(device);
+        three_loans(device);
+        two_ranks(devices);
         std::cout << "PASS qwen4_exp expert cache\n";
         return 0;
     } catch (const std::exception& error) {

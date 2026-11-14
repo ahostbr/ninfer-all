@@ -60,6 +60,27 @@ def test_gguf_source_reads_full_and_partial_ranges(tmp_path):
     assert names == {"matrix": (6, 4), "vector": (5,)}
 
 
+def test_gguf_source_reads_quantized_rows_from_the_file(tmp_path):
+    values = np.random.default_rng(3).standard_normal((5, 64)).astype(np.float32)
+    kind = gguf.GGMLQuantizationType.Q8_0
+    stored = gguf.quants.quantize(values, kind)
+    path = tmp_path / "q8.gguf"
+    writer = gguf.GGUFWriter(str(path), "test")
+    writer.add_tensor("q8", stored, raw_dtype=kind)
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+    expected = gguf.quants.dequantize(stored, kind).reshape(-1)
+
+    with GGUFSource(path) as source:
+        assert source.describe("q8").shape == (5, 64)
+        assert torch.equal(source.read_flat("q8"), torch.from_numpy(expected))
+        assert torch.equal(source.read_flat("q8", 70, 200), torch.from_numpy(expected[70:200]))
+    with pytest.raises(ValueError, match="closed"):
+        source.read_flat("q8", 0, 1)
+
+
 def test_gguf_source_empty_range_returns_empty_tensor(tmp_path):
     path = tmp_path / "model.gguf"
     _write_gguf(path, {"vector": np.arange(4, dtype=np.float32)})
@@ -296,33 +317,3 @@ def test_gguf_file_reads_equal_a_memory_map_byte_for_byte(tmp_path):
         with pytest.raises(ValueError):
             file.tensor_bytes("a", 0, matrix.nbytes + 1)
     del reference
-
-
-def test_gguf_block_rows_gather_scattered_rows_without_the_span(tmp_path):
-    from tools.convert.sources.gguf import GGUFFile
-
-    rng = np.random.default_rng(11)
-    rows = 300
-    data = rng.integers(0, 256, size=(rows, 18 * 2), dtype=np.uint8)  # Q8-like width is not needed
-    # Q8_0 rows: 64 columns = 2 blocks of 34 bytes
-    q8 = gguf.quants.quantize(rng.standard_normal((rows, 64)).astype(np.float32),
-                              gguf.GGMLQuantizationType.Q8_0)
-    path = tmp_path / "q8.gguf"
-    writer = gguf.GGUFWriter(str(path), "test")
-    writer.add_tensor("w", q8, raw_dtype=gguf.GGMLQuantizationType.Q8_0)
-    writer.write_header_to_file()
-    writer.write_kv_data_to_file()
-    writer.write_tensors_to_file()
-    writer.close()
-    del data
-
-    index = np.array([299, 0, 1, 2, 150, 151, 5, 5, 298], dtype=np.int64)
-    with GGUFFile(path) as file:
-        whole = file.read_blocks("w")
-        assert np.array_equal(file.read_block_rows("w", index), whole[index])
-        assert file.read_block_rows("w", np.arange(10, 20)).shape == (10, whole.shape[1])
-        assert file.read_block_rows("w", np.array([], dtype=np.int64)).shape == (0, whole.shape[1])
-        with pytest.raises(ValueError):
-            file.read_block_rows("w", np.array([rows]))
-        bf = None
-    del bf

@@ -14,6 +14,9 @@ benchmark-report, and external protocol behavior. Repository verification princi
 - `reference/` — bounded checkpoint range fetch, exact subset bytes and hash manifests;
 - `models/qwen3_5/` — config/binding, frontend, state/context stores, workspace, MTP alignment and
   opt-in real Engine integration;
+- `models/dspine/` — the DSpine drafter and its lane runtime over a converted drafter of random
+  weights, against an FP64 evaluation of the drafter (needs NumPy, safetensors and PyTorch, else
+  skipped);
 - `ops/` — semantic Op qualification with independent mathematical or state-transition oracles;
   Linear and fused Linear suites are separated by their supported weight/activation paths;
 - root C++ tests — core storage, runtime admission/resource policy, public API, serving protocols,
@@ -102,6 +105,10 @@ Invoke it unqualified so `PATH` resolves it:
 compute-sanitizer --tool initcheck --error-exitcode 9 \
   build/tests/ninfer_tests ninfer_softmax_attention_test
 ```
+
+A wait that the sanitizer stretches past 120 s ends the test with the device stall message; set
+`NINFER_DEVICE_STALL_SECONDS=0` ([Device stall watch](../docs/cli.md#device-stall-watch)) for long
+runs.
 
 **Use the compute-sanitizer of the toolkit that built the binary.** With several toolkits installed,
 an older copy (2024.1.0, from CUDA 12.4) was seen to print its banner and `ERROR SUMMARY: 0 errors`,
@@ -208,7 +215,11 @@ decode exactly as each did alone. With the MTP block it also decodes by speculat
 sequence and two at once, the two also with each row verifying its own number of drafts (none to
 all), as the Engine packs a batch, and in turn, rounds alternating between them; after plain
 steps of two sequences at once, which advance the MTP block without drafts, the rounds' drafts
-must survive at least half as often as after a prompt.
+must survive at least half as often as after a prompt. With host or disk experts on one device, a
+prompt span that keeps the state at a cut inside it (as the Engine passes a shared prefix) must
+give the logits of two calls split there bit for bit, plain, with MTP and with DFlash2, a state
+equal byte for byte to the snapshot between the calls, and continue from that state and from its
+image as the two calls did.
 `NINFER_QWEN4_EXP_EXPERTS` picks `device`, `host` or `disk`, `NINFER_QWEN4_EXP_DEVICES` the pipeline
 devices, and `NINFER_QWEN4_EXP_EXPERT_CACHE_MIB` the device expert cache of host or disk experts
 (a 24 GB card's on a larger one); a model stored without its n-gram table takes the table artifact
@@ -238,6 +249,18 @@ NINFER_FLASH_NEXT_DEVICES=0,1 \
 ```
 
 `NINFER_FLASH_NEXT_CACHE_ONLY=1` runs the image spill/restore/isolation regression alone.
+`NINFER_FLASH_NEXT_MEDIA_ONLY=1` runs the media prompt cache regression alone (needs an artifact
+with Vision): a follow-up turn resumes past its image without encoding it again, a new image is
+encoded alone after the reused prefix, a changed image is not reused, a restarted Engine restores
+the media prefix from disk and continues as the live one did, and media requests draft with MTP;
+`NINFER_FLASH_NEXT_EXPERTS=host|disk` places the experts. On two 24 GB GPUs the Vision tower does
+not fit beside every expert at the test's options; place the experts on the host there.
+`NINFER_FLASH_NEXT_SHARED_ONLY=1` runs the shared-prefix regression alone (the full run ends with
+it): a second conversation with the first one's 1,100-token system message resumes from the state
+kept at its end and decodes as on a fresh Engine, and with host or disk experts on one device
+(`NINFER_FLASH_NEXT_EXPERTS`, `NINFER_FLASH_NEXT_DEVICES=0`) the first prompt's step passes the
+system message's end instead of ending there, its question being wider than a narrow chunk; with
+host experts the second conversation's short question, on a fresh Engine, is a step of its own.
 `NINFER_FLASH_NEXT_CONFIDENCE_ONLY=1` runs the draft-confidence checks alone, one request at a time
 on GPU 0 with host experts; `NINFER_FLASH_NEXT_CONFIDENCE_BATCHED=1` adds three concurrent requests
 whose rows verify at their own widths (with logprobs, at the round's width), with host experts when
@@ -289,13 +312,43 @@ requests decoded as one batch and a JSON grammar's mask all reach the records, t
 array, string or integer root constrain the answer from its first token, and that a request
 without them gathers none. `NINFER_LOGPROBS_ARTIFACT` names the artifact, and the test is skipped
 without it; `NINFER_LOGPROBS_NGRAM_TABLE` names a Qwen3.8-Flash-Next table artifact,
-`NINFER_LOGPROBS_SPECULATIVE=mtp` or `dflash2` verifies the tokens in speculative rounds, and
+`NINFER_LOGPROBS_SPECULATIVE=mtp`, `dflash2` or `dspine` verifies the tokens in speculative rounds
+(`NINFER_LOGPROBS_DRAFT_MODEL` names the DSpine drafter), and
 `NINFER_LOGPROBS_CONTEXT_CACHE=hybrid` admits every request through the hybrid prefix cache.
 `NINFER_LOGPROBS_DEVICES=0,1` selects a two-GPU layer pipeline:
 
 ```bash
 NINFER_LOGPROBS_ARTIFACT=$PWD/out/qwen3_8_27b.ninfer NINFER_LOGPROBS_SPECULATIVE=dflash2 \
   ctest --test-dir build -R ninfer_engine_logprobs_real_test --output-on-failure
+```
+
+`ninfer_engine_stop_string_real_test` checks, for any model family, that a stop string changes no
+token of the turn it ends, that the next turn resumes from the state where the stop string's match
+began, and that this state is the one a turn limited to the reply's tokens before the match leaves
+(without drafts the next turn's tokens are equal). The stop string is a piece of the reply that
+begins at a space after a word where the reply has one, so the next prompt tokenizes the visible
+text before it as the turn did. The test measures how far the next prompt repeats the turn's tokens:
+where a template renders the reply anew (Flint and Gemma 4 with thinking off), no state of the
+reply continues it and the test only reports the reuse. `NINFER_STOP_ARTIFACT` names
+the artifact, and the test is skipped without it; `NINFER_STOP_NGRAM_TABLE` names a table artifact,
+`NINFER_STOP_SPECULATIVE=mtp`, `dflash`, `dflash2`, `dspark`, `dspine` or `lookup` decodes the
+reply in speculative rounds (`NINFER_STOP_DRAFTS` tokens; `NINFER_STOP_DRAFT_MODEL` names the
+DSpine drafter), `NINFER_STOP_EXPERTS=host` or `disk` places the
+routed experts, `NINFER_STOP_CONTEXT_CACHE=hybrid` selects the hybrid prefix cache,
+`NINFER_STOP_KV=int8` an int8 KV cache, `NINFER_STOP_DEVICES=0,1` the devices (pipeline stages, or
+tensor parallelism with `NINFER_STOP_TENSOR_PARALLEL=1`),
+`NINFER_STOP_THINKING=1` leaves thinking as the template has it and `on` turns it on, `NINFER_STOP_CONTINUE=1` continues
+the stopped reply as the final assistant message in place of a new user turn,
+`NINFER_STOP_PROMPT` replaces the first user message, `NINFER_STOP_TOKENS` sets the turn's output
+limit (240), `NINFER_STOP_REASONING=1` puts the reply's reasoning in the next request's history,
+`NINFER_STOP_RAW=1` sends the next request as raw tokens (the prompt's, the reply's before the match
+and a few new ones, which repeats the reply under any template) and
+`NINFER_STOP_BYTES` sets the stop string's length (14 bytes; 48 spans several rounds of drafts):
+
+```bash
+NINFER_STOP_ARTIFACT=$PWD/out/qwen3_8_27b.ninfer NINFER_STOP_CONTEXT_CACHE=hybrid \
+  NINFER_STOP_SPECULATIVE=mtp ctest --test-dir build -R ninfer_engine_stop_string_real_test \
+  --output-on-failure
 ```
 
 Without `NINFER_TEST_ARTIFACT`, CTest marks these real Engine tests as skipped. Run GPU integration

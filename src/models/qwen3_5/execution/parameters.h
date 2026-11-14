@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/qtype.h"
 #include "models/qwen3_5/model.h"
 #include "ninfer/ops/weight_input.h"
 
@@ -203,20 +204,11 @@ struct SelectorParameters {
     Tensor predecessor_codebook, successor_codebook;
 };
 
-// DSpine code bridge (all BF16), shapes as bound in load/dflash.cpp (the HF row-major order):
-// codebook [V, C]; read_weight [C, H]; early_read_weights [L-1, C, H]; feature_write_weights
-// [L, H, R]; gate/predecessor_gate/prev weights [R, C]; gate_bias [R].
-struct DSpineBridgeParameters {
-    Tensor codebook, read_weight, early_read_weights, feature_write_weights;
-    Tensor gate_weight, gate_bias, predecessor_gate_weight, prev_weight;
-};
-
 struct DraftParameters {
     LinearParameters feature_projection;
     Tensor context_norm, final_norm;
     std::vector<DraftBlockParameters> layers;
     std::optional<SelectorParameters> selector;
-    std::optional<DSpineBridgeParameters> bridge;
     LinearParameters output_head;
 };
 
@@ -245,6 +237,8 @@ public:
     std::optional<VisionParameters> vision;
     std::optional<DraftParameters> draft;
     std::optional<ProposalParameters> proposal;
+    // --spec dspine: the standalone drafter's operands (Model::dspine()); null otherwise.
+    const dspine::Model* dspine = nullptr;
 };
 
 } // namespace ninfer::models::qwen3_5::execution

@@ -4,6 +4,7 @@
 
 #include "core/device.h"
 #include "core/device_snapshot.h"
+#include "core/device_wait.h"
 #include "core/nvtx.h"
 #include "ninfer/base.h"
 #include "ninfer/engine_options.h"
@@ -181,7 +182,9 @@ public:
         std::promise<void> startup;
         std::future<void> started = startup.get_future();
         worker_                   = std::thread([this, startup = std::move(startup)]() mutable {
+            std::optional<DeviceWaitWatch> watched;
             try {
+                watched.emplace(device_, "Engine worker");
                 device_.bind_to_current_thread();
                 startup.set_value();
             } catch (...) {
@@ -468,6 +471,7 @@ public:
     ResidencyStatus suspend(std::optional<bool> auto_resume) {
         require_suspend_enabled();
         std::scoped_lock lock(execution_mutex_);
+        const DeviceWaitWatch watched(device_, "Engine caller");
         device_.bind_to_current_thread();
         if (suspended_.load(std::memory_order_acquire)) {
             auto_resume_.store(auto_resume.value_or(suspend_options_.auto_resume),
@@ -510,6 +514,7 @@ public:
     ResidencyStatus resume() {
         require_suspend_enabled();
         std::scoped_lock lock(execution_mutex_);
+        const DeviceWaitWatch watched(device_, "Engine caller");
         device_.bind_to_current_thread();
         resume_locked();
         return residency();
@@ -533,6 +538,7 @@ public:
               std::string_view expected_digest, std::string_view session_path,
               const std::function<void()>& claim) {
         std::scoped_lock lock(execution_mutex_);
+        const DeviceWaitWatch watched(device_, "Engine caller");
         device_.bind_to_current_thread();
         ensure_resident_locked();
         require_settled_slot(slot);
@@ -552,6 +558,7 @@ public:
                  std::string_view model_binding, std::string_view session_path,
                  const std::function<void()>& claim) {
         std::scoped_lock lock(execution_mutex_);
+        const DeviceWaitWatch watched(device_, "Engine caller");
         device_.bind_to_current_thread();
         ensure_resident_locked();
         if (!context_cache_enabled_) {
@@ -602,6 +609,7 @@ public:
     std::uint32_t erase_slot(std::uint32_t slot, std::string_view expected_digest,
                              const std::function<void(const std::string&)>& claim) {
         std::scoped_lock lock(execution_mutex_);
+        const DeviceWaitWatch watched(device_, "Engine caller");
         ensure_resident_locked();
         require_settled_slot(slot);
         const auto view = resources_.catalog_slot(slot);
@@ -1787,6 +1795,9 @@ private:
 
         std::array<LaneId, kMaximumConcurrency> lanes{};
         std::array<CommitDecision, kMaximumConcurrency> decisions{};
+        // The tokens each row's output took; its sequence keeps fewer when the turn ends at a
+        // stop string whose match began inside the round.
+        std::array<std::uint32_t, kMaximumConcurrency> output_tokens{};
         std::array<FinishReason, kMaximumConcurrency> finish_reasons{};
         std::array<ContinuationAction, kMaximumConcurrency> continuations{};
         std::array<std::size_t, kMaximumConcurrency> generated_sizes{};
@@ -1841,6 +1852,37 @@ private:
                     finish_reasons[row] = FinishReason::Cancelled;
                     continue;
                 }
+                if (pending.numerical_fault(row) ||
+                    (decode_round && row == 0 &&
+                     consume_armed_numerical_fault(armed_decode_numerical_faults))) {
+                    // The row's logits were not finite. What the sequence published before this
+                    // round came from finite logits, so only this request ends: with the error,
+                    // its sequence released as a cancelled one's, and every other row commits. A
+                    // release waits for a global context transaction, so during one the failure
+                    // takes the recovery a prompt's does.
+                    if (instance_.program->has_context_transaction()) {
+                        throw runtime::NumericalFault(
+                            "the model produced non-finite logits during a context transaction");
+                    }
+                    publish_diagnostic(diagnostics_, DiagnosticLevel::Error,
+                                       "lane %u request %llu: non-finite logits or a token outside "
+                                       "the vocabulary after %zu generated tokens - ending the "
+                                       "request",
+                                       lane, static_cast<unsigned long long>(request->id),
+                                       request->generated.size());
+                    row_errors[row] = std::make_exception_ptr(RequestError(
+                        RequestErrorKind::NumericalFailure,
+                        "the model produced non-finite logits while generating"));
+                    (void)request->output.preview_terminal(FinishReason::Cancelled);
+                    cancelled[row] = true;
+                    decisions[row] = CommitDecision{
+                        .accepted_tokens = 0,
+                        .terminal        = true,
+                        .cancelled       = true,
+                    };
+                    finish_reasons[row] = FinishReason::Cancelled;
+                    continue;
+                }
                 // A round carries records for every row once one of its requests asks; only a
                 // request that asked takes its row's.
                 std::span<const runtime::RawTokenLogprob> row_logprobs{};
@@ -1878,21 +1920,40 @@ private:
                     (decision.finished() && decision.continuation != ContinuationAction::Decode) ||
                     (decision.prefix_execution_split_after &&
                      (*decision.prefix_execution_split_after == 0 ||
-                      *decision.prefix_execution_split_after > decision.accepted_tokens))) {
+                      *decision.prefix_execution_split_after > decision.accepted_tokens)) ||
+                    (decision.stop_hold_after &&
+                     *decision.stop_hold_after >= decision.accepted_tokens)) {
                     throw std::logic_error("output policy returned an invalid licensed prefix");
                 }
-                decisions[row] = CommitDecision{
-                    .accepted_tokens              = decision.accepted_tokens,
-                    .terminal                     = decision.finished(),
-                    .cancelled                    = false,
-                    .prefix_execution_split_after = decision.prefix_execution_split_after,
+                // A turn that ends at a stop string which leaves the output continues, in a later
+                // prompt, from the state before the token that begins the match. When that token
+                // is in this round the sequence keeps the round's tokens before it and ends
+                // there. When it was in an earlier round the Program has kept that state
+                // (stop_cut). A turn that ends otherwise publishes everything it held.
+                const bool stop_cut = decision.finished() && decision.stop_cut;
+                const bool cut_here = stop_cut && decision.stop_hold_after.has_value();
+                const std::uint32_t kept =
+                    cut_here ? *decision.stop_hold_after + 1U : decision.accepted_tokens;
+                output_tokens[row] = decision.accepted_tokens;
+                decisions[row]     = CommitDecision{
+                        .accepted_tokens = kept,
+                        .terminal        = decision.finished(),
+                        .cancelled       = false,
+                        .prefix_execution_split_after =
+                        decision.prefix_execution_split_after &&
+                                *decision.prefix_execution_split_after <= kept
+                            ? decision.prefix_execution_split_after
+                            : std::nullopt,
+                        .stop_hold_after =
+                        decision.finished() ? std::nullopt : decision.stop_hold_after,
+                        .stop_cut = stop_cut && !cut_here,
                 };
                 finish_reasons[row] = decision.finish_reason;
                 continuations[row]  = decision.continuation;
             }
             generated_staged = true;
             for (std::size_t row = 0; row < row_count; ++row) {
-                const std::uint32_t accepted = decisions[row].accepted_tokens;
+                const std::uint32_t accepted = output_tokens[row];
                 if (accepted == 0) { continue; }
                 const auto& request = slots_[lane_indices[row]];
                 if (request->generated.size() > request->generated.capacity() ||
@@ -1975,7 +2036,7 @@ private:
             cumulative_stats_.decode_row_rounds += row_count;
             for (std::size_t row = 0; row < row_count; ++row) {
                 if (!cancelled[row]) {
-                    cumulative_stats_.committed_decode_tokens += decisions[row].accepted_tokens;
+                    cumulative_stats_.committed_decode_tokens += output_tokens[row];
                 }
             }
         }
@@ -1984,7 +2045,7 @@ private:
             for (std::size_t row = 0; row < row_count; ++row) {
                 const std::uint32_t lane     = lane_indices[row];
                 const auto& request          = slots_[lane];
-                const std::uint32_t accepted = decisions[row].accepted_tokens;
+                const std::uint32_t accepted = output_tokens[row];
                 if (!cancelled[row]) {
                     request->budget->commit(accepted);
                     if (decode_round) { Scheduling::consume_service_work(*request, accepted); }
@@ -2351,6 +2412,9 @@ private:
                 planned - progress.processed_prompt_tokens;
         }
         consume_armed_worker_failure();
+        if (progress.complete && consume_armed_numerical_fault(armed_prefill_numerical_faults)) {
+            throw runtime::NumericalFault("injected numerical fault at the end of a prompt");
+        }
         resolve_prefill_progress(request, std::move(progress), cancelled_at_unit_start, paced);
         // A completed prefill already re-arms admission (owner cleared above). Re-arm again when
         // the request keeps prefilling: each prefill boundary is an admission point, so a waiting
@@ -3541,6 +3605,33 @@ private:
                 // Scheduler state was cleared by recover_from_oom_locked; treat the next
                 // iteration as a fresh scheduling boundary (no decode continuity).
                 decode_run = 0;
+                continue;
+            } catch (const runtime::NumericalFault& fault) {
+                // A prompt ended in non-finite logits. Nothing vouches for what its pass wrote
+                // (KV pages, recurrent state, snapshots the prefix cache took on the way), so the
+                // recovery of an allocation failure runs: active requests end with the error, the
+                // Program drops its state and caches, queued requests stay.
+                publish_diagnostic(diagnostics_, DiagnosticLevel::Error,
+                                   "worker numerical failure: %s - recovering", fault.what());
+                const std::exception_ptr numerical_error = std::make_exception_ptr(RequestError(
+                    RequestErrorKind::NumericalFailure,
+                    "the model produced non-finite logits; the engine reset its state"));
+                if (!recovery_streak_.record_failure(Clock::now())) {
+                    publish_diagnostic(diagnostics_, DiagnosticLevel::Error,
+                                       "worker: %u consecutive recoveries - failing all pending",
+                                       recovery_streak_.count() - 1);
+                    fail_all_locked(numerical_error);
+                    return;
+                }
+                HostPhaseMeasurement cleanup = begin_host_phase();
+                if (!recover_from_oom_locked(numerical_error)) {
+                    fail_all_locked(numerical_error);
+                    finish_engine_phase(cleanup, EngineHostPhase::Maintenance);
+                    return;
+                }
+                finish_engine_phase(cleanup, EngineHostPhase::Maintenance);
+                oom_backoff_ = kOomBackoffIterations;
+                decode_run   = 0;
                 continue;
             } catch (const std::logic_error& invariant) {
                 if (!recover_invariant_failures_) {

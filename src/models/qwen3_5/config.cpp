@@ -1,6 +1,7 @@
 #include "models/qwen3_5/config.h"
 
 #include "artifact/schema.h"
+#include "models/qwen3_5/draft_config.h"
 
 #include <algorithm>
 #include <cmath>
@@ -208,7 +209,7 @@ VisionConfig vision(const Json& value) {
     return out;
 }
 
-DraftConfig draft(const Json& value, const TextConfig& target, bool dflash2) {
+DraftConfig draft(const Json& value, const DraftTarget& target, bool dflash2) {
     require_members(value,
                     {"architectures", "model_type", "intermediate_size", "num_attention_heads",
                      "num_key_value_heads", "head_dim", "num_hidden_layers",
@@ -253,7 +254,7 @@ DraftConfig draft(const Json& value, const TextConfig& target, bool dflash2) {
                          "selector_rank", "selector_top_k"},
                         {}, "DFlash2 config");
     } else {
-        require_members(config, {"target_layer_ids", "mask_token_id"}, {"dspine"}, "DFlash config");
+        require_members(config, {"target_layer_ids", "mask_token_id"}, {}, "DFlash config");
     }
     const auto& taps = config.at("target_layer_ids");
     if (!taps.is_array() || taps.empty()) {
@@ -280,22 +281,33 @@ DraftConfig draft(const Json& value, const TextConfig& target, bool dflash2) {
         }
         out.dflash2 = extra;
     }
-    if (!dflash2 && config.contains("dspine")) {
-        const auto& d = config.at("dspine");
-        require_members(d, {"block_size", "code_size", "rank", "bridge_eps", "head_topk"}, {},
-                        "DSpine config");
-        DSpineConfig extra{dimension(d, "block_size"), dimension(d, "code_size"),
-                           dimension(d, "rank"), positive_float(d, "bridge_eps"),
-                           dimension(d, "head_topk")};
-        if (extra.head_topk > target.vocab_size) {
-            throw ArtifactError("DSpine head_topk exceeds the target vocabulary");
-        }
-        out.dspine = extra;
-    }
+    return out;
+}
+
+// A DSpine drafter's config as the masked-draft machinery reads a DFlash2 one: every layer
+// sliding at the trained window, the same taps and mask token.
+DraftConfig draft(const dspine::Config& value) {
+    DraftConfig out;
+    out.attention               = {value.num_attention_heads, value.num_key_value_heads,
+                                   value.head_dim};
+    out.intermediate_size       = value.intermediate_size;
+    out.num_hidden_layers       = value.num_hidden_layers;
+    out.max_position_embeddings = value.max_position_embeddings;
+    out.rms_norm_eps            = value.rms_norm_eps;
+    out.rope_theta              = value.rope_theta;
+    out.layer_types.assign(value.num_hidden_layers, DraftAttentionKind::SlidingAttention);
+    out.sliding_window   = value.sliding_window;
+    out.target_layer_ids = value.target_layer_ids;
+    out.mask_token_id    = value.mask_token_id;
+    out.dspine           = value;
     return out;
 }
 
 } // namespace
+
+DraftConfig parse_draft_config(const Json& value, const DraftTarget& target, bool dflash2) {
+    return draft(value, target, dflash2);
+}
 
 VisionConfig parse_vision_config(const artifact::Directory& directory) {
     return vision(directory.component("vision").config);
@@ -397,7 +409,16 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
         if (options.speculative == SpeculativeBackend::DFlash ||
             options.speculative == SpeculativeBackend::DFlash2) {
             out.draft = draft(companion(directory, options.speculative_component()).config,
-                              out.text, options.speculative == SpeculativeBackend::DFlash2);
+                              {out.text.hidden_size, out.text.vocab_size,
+                               out.text.num_hidden_layers},
+                              options.speculative == SpeculativeBackend::DFlash2);
+        }
+        if (options.speculative == SpeculativeBackend::DSpine) {
+            const auto drafter = dspine::read_config(options.draft_model);
+            dspine::check_target(drafter, out.text.hidden_size, out.text.vocab_size,
+                                 out.text.num_hidden_layers,
+                                 architecture_name(out.text.architecture));
+            out.draft = draft(drafter);
         }
         return out;
     } catch (const std::exception& error) {

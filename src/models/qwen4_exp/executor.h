@@ -18,10 +18,11 @@
 // draft whenever it decodes. A catch-up runs the block's attention and router but not its
 // experts, whose output only a draft reads.
 
-#include "core/arena.h"
 #include "core/device.h"
+#include "core/device_buffer.h"
 #include "core/tensor.h"
 #include "ninfer/ops/rope.h"
+#include "ninfer/ops/sampling.h"
 #include "ninfer/engine_options.h"
 #include "ninfer/kv_cache_storage.h"
 #include "ninfer/observability/resources.h"
@@ -50,6 +51,10 @@ struct ExecutorOptions {
     // skipped, which is what an all-zero table would give.
     std::optional<NgramTableSource> ngram;
     NgramReadOptions ngram_read;
+    // GGUF IQ1_M routed experts of a wide call over device banks: the integer matrix kernel once
+    // the call routes enough rows to each expert (gguf::iq1m_moe_matrix_pays), or (false) the
+    // vector products.
+    bool iq1m_matrix = true;
     // Host- or disk-resident experts: device memory lent to the expert cache, split evenly over
     // the ranks; kAutoExpertCache starts at half of what each device has free less a margin,
     // which grow_expert_cache completes once startup has allocated the rest; 0 none (host
@@ -61,8 +66,9 @@ struct ExecutorOptions {
     // sequence of device- and host-resident experts replay CUDA Graphs, a graph per segment of
     // consecutive layers on one device, which the sequences share.
     bool cuda_graphs = true;
-    // A model loaded with its Vision tower: the most merged tokens the media of one prompt may
-    // hold, which sizes the encoder's workspace and the embeddings a prefill reads.
+    // A model loaded with its Vision tower: the most merged tokens of the media one prompt encodes
+    // (those past the prefix it resumes from), which sizes the encoder's workspace and the
+    // embeddings a prefill reads.
     std::uint32_t vision_max_merged_tokens = 16384;
     // How the sparse-attention layers store their paged KV: any storage kv_cache_append writes
     // for two heads of 256.
@@ -73,22 +79,50 @@ struct ExecutorOptions {
     // what one decode or verification call reads), the ones the indexer selected most recently.
     // A prompt chunk reads one layer's KV from a staging copy on the device.
     std::uint32_t kv_resident = 0;
-    // MTP drafts per speculative round (1..15), for a model loaded with its MTP block; 0 runs
-    // without speculation.
+    // Drafts per speculative round (1..15), for a model loaded with its MTP block (or with
+    // `dflash2`, its DFlash2 drafter); 0 runs without speculation.
     std::uint32_t draft_tokens = 0;
+    // The drafts come from the DFlash2 drafter the model was loaded with (one masked block over
+    // a context ring of the target's features) instead of the MTP block.
+    bool dflash2 = false;
+    // The drafts come from the standalone DSpine drafter the model was loaded with
+    // (LoadOptions::dspine): DFlash2's ring, taps and rounds, with DSpine's block and code bridge.
+    bool dspine = false;
     // Absolute greedy-draft probability floor; zero disables confidence computation.
     float draft_min_p = 0;
+    // --gumbel-sampling: draft() may take samplers, whose rows' MTP block then draws its drafts.
+    bool sampled_drafts = false;
     // YaRN past the model's native window (a factor above one), for the sparse-attention layers'
     // RoPE, their indexer's and the MTP block's alike; inactive keeps the unscaled rotation.
     ops::RopeYarn rope_yarn;
-    // With tensor parallelism, how the ranks' exchanges travel (TensorParallelExchange).
+    // With tensor parallelism, how the ranks' exchanges travel (TensorParallelExchange), and
+    // whether a prompt chunk's partials cross rounded to BF16 (Rounded partials there).
     TensorParallelTransport tensor_parallel_transport = TensorParallelTransport::Auto;
+    TensorParallelPartials tensor_parallel_prompt_partials = TensorParallelPartials::Fp32;
 };
 
 // One media item of a prompt for the Vision tower: its patches and the frontend's control.
 struct MediaItem {
     std::span<const std::uint16_t> patches;
     const qwen3_5::VisionItemControl* control = nullptr;
+};
+
+// One sequence's prompt tokens in a packed prompt span (Executor::forward_pieces).
+struct PromptPiece {
+    std::uint32_t sequence = 0;
+    std::span<const std::int32_t> tokens;
+    // Whether the piece leaves its last token's logits; a piece that does not end its prompt
+    // need not (Executor::forward_pieces).
+    bool logits = true;
+};
+
+struct SequenceSnapshot;
+
+// A place inside a prompt step where Executor::forward keeps the sequence's state: after the
+// first `tokens` of the step, into `state`.
+struct PromptCut {
+    std::uint32_t tokens    = 0;
+    SequenceSnapshot* state = nullptr;
 };
 
 struct ExecutorMemory {
@@ -122,7 +156,9 @@ struct SequenceSnapshot {
     std::vector<Layer> layers;
     // The MTP block: its indexer tail and the stack its next cell starts from.
     std::vector<DeviceBuffer> mtp;
-    bool mtp_follows       = false;
+    // The DFlash2 drafter: the sequence's context ring lane (every layer's K, then its V).
+    DeviceBuffer ring;
+    bool drafter_follows   = false;
     std::uint32_t position = 0;
     NgramContext context;
 };
@@ -134,7 +170,7 @@ struct SequenceSnapshot {
 struct SequenceImage {
     std::uint32_t position = 0;
     NgramContext context;
-    bool mtp_follows = false;
+    bool drafter_follows = false;
 };
 
 class Executor {
@@ -188,11 +224,35 @@ public:
     [[nodiscard]] std::uint32_t prompt_step() const noexcept;
     // Runs `tokens` (at most prompt_step()) at the sequence's next positions and leaves the
     // logits of the last `logit_rows` of them in logits(), BF16 [vocab, logit_rows] on the head
-    // device. Work is queued on the device streams; logits() is ready on head_stream(). Once the
-    // table rows of `tokens` are read, the rows of `next` (the known tokens that follow, at most
-    // prompt_step()) are hinted, to be read while the device runs `tokens`.
+    // device. With `logit_rows` 0 the step leaves no logits, and unless an MTP block follows the
+    // prompt the last layer of the step's chunks, a sparse-attention one, runs only its KV and
+    // indexer appends, which leave the sequence as the whole layer does; in a step that leaves
+    // logits, the chunks that share no expert call of the last layer with its last chunk run that
+    // layer so as well. Work is queued on the device streams; logits() is ready on
+    // head_stream(). Once the table rows of `tokens` are read, the rows of `next` (the known
+    // tokens that follow, at most prompt_step()) are hinted, to be read while the device runs
+    // `tokens`. With a `cut` (needs packs_prompts(); 0 < cut.tokens < tokens.size()), the step's
+    // chunks restart at the cut, as two calls split there would run them, and cut.state takes
+    // the sequence's state there, as snapshot() after the first of those calls would, while the
+    // step runs on in one span.
     void forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,
-                 std::uint32_t logit_rows, std::span<const std::int32_t> next = {});
+                 std::uint32_t logit_rows, std::span<const std::int32_t> next = {},
+                 PromptCut cut = {});
+    // Whether forward_pieces() runs: prompt steps are layer-major spans.
+    [[nodiscard]] bool packs_prompts() const noexcept;
+    // The widest prompt chunk a span runs alone over the cache and the missed experts rather than
+    // from the layer's copied experts (64 tokens without the lossy tail skip, else 8); 0 without
+    // spans. A step of such chunks only copies the experts it misses.
+    [[nodiscard]] std::uint32_t narrow_prompt_tokens() const noexcept;
+    // The prompt tokens of several distinct sequences in one span (prompt_step() tokens in all,
+    // at most max_logit_rows() pieces), each piece at its sequence's next positions with the
+    // arithmetic forward() gives it, while each layer's uncached experts cross the bus once for
+    // all of them. Leaves the logits of each piece's last token in logits(), one column per piece
+    // in order, where the piece wants them (PromptPiece::logits; as forward() with 0 rows, a piece
+    // without them may run its last layer's appends alone). A media prompt's tokens run only as a
+    // single piece. `next`, as in forward(), are the known tokens after the last piece.
+    void forward_pieces(std::span<const PromptPiece> pieces,
+                        std::span<const std::int32_t> next = {});
     // Branches of a sequence in one pass, each from the state `at` (a snapshot of the sequence):
     // branch b runs `lengths[b]` of `tokens` (in branch order, at most prefill_chunk in all) at the
     // positions after `at`, its mixers from `at`'s state, while every layer's experts run over all
@@ -232,36 +292,49 @@ public:
     // Makes the sequence hold the image's state; returns once the copies are done.
     void load_image(std::uint32_t sequence, const SequenceImage& image,
                     std::span<std::byte* const> pages, std::size_t page_bytes);
-    // Vision: encodes the media of the prompt the (just reset) sequence prefills next, whose image
-    // and video tokens then take the items' merged embeddings in place of the token embedding.
-    // `rope_positions` holds the prompt's three RoPE position axes, axis-major [3, tokens]; every
-    // later position rotates at its index plus `rope_delta`. The embeddings are kept until another
-    // sequence's media replace them, so the prompt must be prefilled before that. Returns once the
-    // tower has run.
-    void set_media(std::uint32_t sequence, std::span<const MediaItem> items,
-                   std::vector<std::int32_t> rope_positions, std::int32_t rope_delta);
+    // Vision: encodes the media of the prompt the sequence prefills next from its position (a
+    // prefix of the prompt it holds, or none), whose image and video tokens then take the items'
+    // merged embeddings in place of the token embedding; items wholly inside that prefix are not
+    // encoded again, and the merged-token limit counts the others. `rope_positions` holds the
+    // prompt's three RoPE position axes, axis-major [3, tokens]; every later position rotates at
+    // its index plus `rope_delta`. The embeddings are kept until another sequence's media replace
+    // them, so the prompt must be prefilled before that. Returns the items encoded, once the tower
+    // has run.
+    std::size_t set_media(std::uint32_t sequence, std::span<const MediaItem> items,
+                          std::vector<std::int32_t> rope_positions, std::int32_t rope_delta);
     [[nodiscard]] bool vision() const noexcept;
 
-    // MTP speculative decoding; every call needs an executor with drafts.
+    // Speculative decoding with the MTP block or the DFlash2 drafter; every call needs an
+    // executor with drafts.
     [[nodiscard]] std::uint32_t draft_tokens() const noexcept;
-    // Whether the sequence's MTP state follows its tokens, which a media prompt breaks until the
-    // sequence is reset; a sequence drafts only from a position past its first.
+    // Whether the sequence's drafter follows its tokens (the MTP block's state, which a prompt
+    // that ends in media breaks until the sequence is reset, or the DFlash2 context ring); a
+    // sequence drafts only from a position past its first.
     [[nodiscard]] bool can_draft(std::uint32_t sequence) const;
-    // The sequence's MTP state stops following its tokens until a reset or a restore of a state
-    // that follows them: its passes skip the MTP block's catch-up, for a request that never drafts.
+    // The sequence's drafter stops following its tokens until a reset or a restore of a state
+    // that follows them: its passes skip the MTP block's catch-up or the ring's context, for a
+    // request that never drafts.
     void stop_drafting(std::uint32_t sequence);
     // Drafts `steps` tokens (1..draft_tokens(); 0 means draft_tokens()) for each of `sequences`
-    // (distinct) from its next position: the MTP block runs its anchor (the token it sampled last
-    // and has not fed) and then its own drafts, greedily. `out` receives them sequence-major, each
+    // (distinct) from its next position. The MTP block runs its anchor (the token it sampled last
+    // and has not fed) and then its own drafts, greedily; the DFlash2 drafter proposes all of them
+    // in one block from the anchor and the ring. `out` receives them sequence-major, each
     // sequence's row draft_tokens() long; returns once they are on the host, with the number of
     // steps run. Optional `extents` receives one length per sequence, up to the first draft at or
-    // below the probability floor. Without a floor or `extents` the whole chain of `steps` runs,
-    // captured once per step count; with both, each step runs from its own graph and the chain
-    // ends at the first step after which every sequence has drafted at or below the floor (the
-    // row's entries past the steps run are -1).
+    // below the probability floor (DFlash2: the selector's probability of its draft). Without a
+    // floor or `extents` an MTP chain of `steps` runs whole, captured once per step count; with
+    // both, each step runs from its own graph and the chain ends at the first step after which
+    // every sequence has drafted at or below the floor (the row's entries past the steps run are
+    // -1). With `configs` (one per sequence; penalties, masks and counts unused) and `lengths`,
+    // the MTP block draws draft i of sequence j from its distribution under configs[j] with the key
+    // (configs[j].seed, lengths[j] + i + 1, kSamplePurposeDecode), the key of the verification
+    // column that draws the target's token at its place; a row at temperature 0 takes the argmax.
+    // The DFlash2 drafter ignores `configs` and proposes greedily.
     std::uint32_t draft(std::span<const std::uint32_t> sequences,
                         std::span<const std::int32_t> anchors, std::span<std::int32_t> out,
-                        std::span<std::uint32_t> extents = {}, std::uint32_t steps = 0);
+                        std::span<std::uint32_t> extents = {}, std::uint32_t steps = 0,
+                        std::span<const ops::SamplingConfig> configs = {},
+                        std::span<const std::int32_t> lengths       = {});
     // Runs 1..draft_tokens() + 1 tokens of each sequence (its anchor, then its drafts) at its next
     // positions without committing them, and leaves the logits of every token in logits(), one
     // column per token, sequence after sequence. The sequences' positions and states stay where
@@ -271,7 +344,8 @@ public:
                 std::span<const std::uint32_t> widths = {});
     // Keeps the first `columns[i]` (1..its verified width) tokens of the last verify() of
     // `sequences[i]`, which lists the verified sequences in their order: each sequence's state is
-    // then what feeding those tokens would have left, and its MTP block has run their cells.
+    // then what feeding those tokens would have left, and its MTP block has run their cells (or
+    // its DFlash2 ring holds their context).
     void commit(std::span<const std::uint32_t> sequences, std::span<const std::uint32_t> columns);
 
     [[nodiscard]] Tensor logits(std::uint32_t rows) const;
@@ -280,6 +354,10 @@ public:
     [[nodiscard]] std::string expert_execution_profile() const;
     // GGUF host or disk experts with a CPU share: its threads and vector backend; else empty.
     [[nodiscard]] std::string expert_cpu_description() const;
+    // The widest verification whose missing experts CPU threads share: with a CPU share, every
+    // miss of a call of up to kNarrowMissTokens tokens, and with GGUF host experts those of few
+    // pairs up to kCpuMissTokens; 0 without a CPU share. Wider calls copy every miss to the GPU.
+    [[nodiscard]] std::uint32_t cpu_share_tokens() const noexcept;
     [[nodiscard]] bool hybrid_experts() const noexcept;
     void save_expert_profile() const;
     // Worker-thread scope only. The owner retains the flag until the eager call returns, then

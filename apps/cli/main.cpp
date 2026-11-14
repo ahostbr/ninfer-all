@@ -59,6 +59,7 @@ std::string format_sampling(const ninfer::ResolvedSamplingParameters& sampling) 
            << " top_p=" << sampling.top_p << " top_k=" << sampling.top_k
            << " min_p=" << sampling.min_p << " presence=" << sampling.presence_penalty
            << " freq=" << sampling.frequency_penalty << " seed=" << sampling.seed;
+    if (sampling.gumbel) { output << " gumbel"; }
     return output.str();
 }
 
@@ -100,6 +101,8 @@ std::string format_kv_cache(ninfer::KvCacheStorage storage) {
         return "nvfp4";
     case ninfer::KvCacheStorage::Fp8KeyNvfp4Value:
         return "k8v4";
+    case ninfer::KvCacheStorage::Bf16Packed:
+        return "bf16p";
     }
     return "unknown";
 }
@@ -333,7 +336,8 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (cli.version_requested) {
-        std::cout << "ninfer " << NINFER_VERSION << '+' << NINFER_BUILD_ID << '\n';
+        std::cout << "ninfer " << NINFER_VERSION << '+' << NINFER_BUILD_ID << " (" << NINFER_TOOLCHAIN
+                  << ")\n";
         return 0;
     }
     if (cli.help_requested) {
@@ -347,7 +351,7 @@ int main(int argc, char** argv) {
          .level        = cli.log_level,
          .presentation = ninfer::product::LogPresentation::Tool});
     const std::shared_ptr<spdlog::logger> logger = logging.logger();
-    logger->info("build {}", NINFER_BUILD_ID);
+    logger->info("build {} ({})", NINFER_BUILD_ID, NINFER_TOOLCHAIN);
     ninfer::product::StartupLogRenderer startup_log(logging);
 
     try {
@@ -392,6 +396,7 @@ int main(int argc, char** argv) {
         engine_options.prefill_chunk            = cli.prefill_chunk;
         engine_options.kv_cache                 = cli.kv_cache;
         engine_options.speculative              = cli.speculative;
+        engine_options.gumbel_sampling          = cli.gumbel_sampling;
         engine_options.enable_vision            = cli.enable_vision;
         engine_options.vision_residency         = cli.vision_residency;
         engine_options.vision_max_merged_tokens = cli.vision_max_merged_tokens;
@@ -403,6 +408,7 @@ int main(int argc, char** argv) {
         engine_options.embedding_q6             = cli.embedding_q6;
         engine_options.embedding_residency      = cli.embedding_residency;
         cli.steering.apply(engine_options);
+        cli.prompt_routes.apply(engine_options);
         engine_options.mtp_experts_q4           = cli.mtp_experts_q4;
         engine_options.gdn_state_fp16           = cli.gdn_state_fp16;
         engine_options.rope_yarn                = cli.rope_yarn;

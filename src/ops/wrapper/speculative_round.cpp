@@ -321,4 +321,38 @@ void proposal_remap_token_ids(Tensor& proposal_tokens, const std::int32_t* id_ma
     detail::proposal_remap_token_ids_launch(proposal_tokens, id_map, n, stream);
 }
 
+void proposal_expand_logits(const Tensor& subset, const std::int32_t* id_map, std::int32_t count,
+                            Tensor& expanded, cudaStream_t stream) {
+    constexpr const char* op = "proposal_expand_logits";
+    require_dtype(subset, logits_dtype(subset), op, "subset");
+    require_dtype(expanded, DType::FP32, op, "expanded");
+    if (subset.ne[2] != 1 || subset.ne[3] != 1 || expanded.ne[2] != 1 || expanded.ne[3] != 1 ||
+        subset.ne[1] <= 0 || expanded.ne[1] != subset.ne[1]) {
+        throw std::invalid_argument(
+            "proposal_expand_logits: subset [count,T] and expanded [V,T] must share T>0");
+    }
+    if (id_map == nullptr || count <= 0 || subset.ne[0] != count || expanded.ne[0] < count) {
+        throw std::invalid_argument(
+            "proposal_expand_logits: id_map must be non-null with count = subset rows <= V");
+    }
+    detail::proposal_expand_logits_launch(subset, id_map, count, expanded, stream);
+}
+
+void proposal_select_sampled(Tensor& proposal_tokens, const Tensor& sampled,
+                             const SamplingConfig* configs, cudaStream_t stream) {
+    constexpr const char* op = "proposal_select_sampled";
+    require_vector(proposal_tokens, DType::I32, proposal_tokens.ne[0], op, "proposal_tokens");
+    require_vector(sampled, DType::I32, proposal_tokens.ne[0], op, "sampled");
+    if (!proposal_tokens.is_contiguous() || !sampled.is_contiguous()) {
+        throw std::invalid_argument("proposal_select_sampled: vectors must be contiguous");
+    }
+    if (configs == nullptr) {
+        throw std::invalid_argument("proposal_select_sampled: configs must be non-null");
+    }
+    if (proposal_tokens.data == sampled.data) {
+        throw std::invalid_argument("proposal_select_sampled: sampled must be distinct");
+    }
+    detail::proposal_select_sampled_launch(proposal_tokens, sampled, configs, stream);
+}
+
 } // namespace ninfer::ops

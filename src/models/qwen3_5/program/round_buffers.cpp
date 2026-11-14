@@ -233,11 +233,11 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
             add_tensor(builder, DType::I32, {verify_columns, batch}, "DFlash proposal positions");
         decode.verify_positions = add_tensor(builder, DType::I32, {verify_columns, batch},
                                              "target verify cache positions");
-        if (layout.spec.backend == SpeculativeBackend::DFlash2) {
+        if (is_sparse_draft_backend(layout.spec.backend)) {
             decode.candidate_ids = add_tensor(builder, DType::I32, {16, verify_columns - 1, batch},
-                                              "DFlash2 candidate ids");
+                                              "sparse draft candidate ids");
             decode.proposal_q    = add_tensor(builder, DType::FP32, {16, verify_columns - 1, batch},
-                                              "DFlash2 sampled proposal q");
+                                              "sparse draft sampled proposal q");
         }
         decode.append_positions =
             add_tensor(builder, DType::I32, {verify_columns, batch}, "DFlash append positions");
@@ -280,6 +280,7 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
     static_assert(std::is_standard_layout_v<MtpDecodeIngress>);
     static_assert(std::is_standard_layout_v<MtpDecodeEgress>);
     static_assert(offsetof(MtpDecodeIngress, sampling) % alignof(ops::SamplingConfig) == 0);
+    static_assert(offsetof(MtpDecodeIngress, draft_sampling) % alignof(ops::SamplingConfig) == 0);
     const auto batch          = static_cast<std::int32_t>(batch_capacity);
     const auto drafts         = static_cast<std::int32_t>(verify_window);
     const auto width          = drafts + 1;
@@ -319,6 +320,9 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
     rope_deltas = ingress_tensor(offsetof(MtpDecodeIngress, rope_deltas), DType::I32, {batch});
     sampling    = reinterpret_cast<const ops::SamplingConfig*>(
         static_cast<const unsigned char*>(ingress.data) + offsetof(MtpDecodeIngress, sampling));
+    draft_sampling = reinterpret_cast<const ops::SamplingConfig*>(
+        static_cast<const unsigned char*>(ingress.data) +
+        offsetof(MtpDecodeIngress, draft_sampling));
 
     licensed_tokens =
         egress_tensor(offsetof(MtpDecodeEgress, licensed_tokens), DType::I32, {width, batch});

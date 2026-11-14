@@ -1,3 +1,4 @@
+#include "core/device_wait.h"
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "core/device.h"
@@ -341,7 +342,7 @@ std::uint64_t snapshot_checksum(std::span<const std::uint8_t> bytes) {
 
 void synchronize_streams(RankStreams streams) {
     for (std::size_t rank = 0; rank < streams.size(); ++rank) {
-        CUDA_CHECK(cudaStreamSynchronize(streams[rank]));
+        CUDA_CHECK(ninfer::wait_for_stream(streams[rank]));
     }
 }
 
@@ -449,7 +450,7 @@ SessionSnapshot ProgramImpl::save_continuation(const ContinuationHandle& continu
     }
     if (is_masked_draft_backend(speculative_backend)) {
         throw std::invalid_argument(
-            "session persistence does not support the DFlash/DFlash2 backends");
+            "session persistence does not support the DFlash/DFlash2/DSpine backends");
     }
     const SequenceState& sequence = continuation_states[ContractAccess::index(continuation)];
 
@@ -713,7 +714,7 @@ ContinuationHandle ProgramImpl::restore_continuation(std::span<const std::uint8_
     }
     if (is_masked_draft_backend(speculative_backend)) {
         throw std::invalid_argument(
-            "session persistence does not support the DFlash/DFlash2 backends");
+            "session persistence does not support the DFlash/DFlash2/DSpine backends");
     }
     if (hybrid_) {
         // Hybrid mode retains context in its prefix index and never holds a catalogued

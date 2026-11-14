@@ -1,7 +1,9 @@
 #pragma once
 
-#include "core/device.h"
+#include "core/expert_disk.h"
 #include "core/expert_tier.h"
+
+#include <cuda_runtime.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -13,6 +15,8 @@
 #include <vector>
 
 namespace ninfer {
+
+struct RankContext;
 
 // A blob is copied without decoding or repacking. File extents concatenate in order.
 struct ExpertExtent {
@@ -88,6 +92,8 @@ struct ExpertDeliveryOptions {
     std::optional<std::uint64_t> cache_bytes;
     std::uint64_t keep_free_bytes = 512ULL << 20;
     std::uint64_t staging_bytes = 128ULL << 20; // disk only, two pinned halves
+    // Disk only: a drive mirror and the direct path (core/expert_disk.h).
+    ExpertDiskReads disk{};
     // Whole-layer device windows that hold the experts the cache does not. Two let the next layer
     // of a wide call (a prompt chunk, a wide verification) arrive while the current one computes;
     // one halves their memory and gives that up. Two fall back to one when memory is short.
@@ -235,6 +241,11 @@ public:
     void await(cudaStream_t stream);
     // Projection-major [aliases][experts], including aliases into the same blob.
     [[nodiscard]] const void* const* tables(std::size_t layer) const;
+    // Whether every entry of alias `alias` in tables(layer) is a multiple of `bytes` (a power of
+    // two up to 256). Cache slots, lent slots and layer banks start at 256-byte boundaries, so the
+    // alias's offset and the bank stride of its blob decide.
+    [[nodiscard]] bool alias_aligned(std::size_t layer, std::size_t alias,
+                                     std::uint64_t bytes) const;
     void check() const;
     // Drain before suspend. Invalidate preserves allocations and graph addresses for restore.
     void drain();

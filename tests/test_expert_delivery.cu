@@ -1,6 +1,7 @@
-#include "core/arena.h"
 #include "core/device.h"
+#include "core/device_buffer.h"
 #include "core/expert_delivery.h"
+#include "core/pinned_memory.h"
 #include "core/vmm.h"
 
 #include <cuda_runtime.h>
@@ -20,6 +21,17 @@
 
 using namespace ninfer;
 namespace {
+
+// How the disk fixtures' experts are read (a drive mirror, direct reads into a host window); the
+// Fixture copies its files into the mirror directory.
+ExpertDiskReads disk_reads;
+
+const char* disk_label(bool disk) {
+    if (!disk) { return "host"; }
+    const bool direct = disk_reads.direct == ExpertDirect::On;
+    if (disk_reads.mirror.empty()) { return direct ? "disk direct" : "disk"; }
+    return direct ? "disk mirror direct" : "disk mirror";
+}
 constexpr int kLayers = 4, kExperts = 16, kPairs = 2048, kTail = 512;
 constexpr std::uint64_t kGu = 131072, kDown = 98304;
 
@@ -146,6 +158,14 @@ struct Fixture {
             }
             layers.push_back(std::move(layer));
         }
+        for (auto& file : output) { file.close(); }
+        if (disk && !disk_reads.mirror.empty()) {
+            std::filesystem::create_directories(disk_reads.mirror);
+            for (const auto& path : paths) {
+                std::filesystem::copy_file(path, disk_reads.mirror / path.filename(),
+                                           std::filesystem::copy_options::overwrite_existing);
+            }
+        }
     }
 };
 
@@ -153,6 +173,7 @@ int run(DeviceContext& device, bool disk, std::uint64_t cache, const std::filesy
         bool shifting = false) {
     Fixture fixture(disk, path);
     ExpertDeliveryOptions options;
+    options.disk          = disk_reads;
     options.pair_capacity = kPairs;
     options.cache_bytes = cache;
     options.staging_bytes = 4096; // exercise repeated DMA half reuse inside one blob
@@ -233,13 +254,13 @@ int run(DeviceContext& device, bool disk, std::uint64_t cache, const std::filesy
                     (!shifting || stats.evictions != 0);
     std::printf("%s%s cache=%llu bad=%llu pairs=%llu hits=%llu misses=%llu evictions=%llu "
                 "admissions=%llu bank_reuses=%llu prefetched=%llu read=%llu copied=%llu "
-                "promoted=%llu banks=%u %s\n", disk ? "disk" : "host", shifting ? " shifting" : "",
-                (unsigned long long)cache, bad, count, (unsigned long long)stats.hits,
-                (unsigned long long)stats.misses, (unsigned long long)stats.evictions,
-                (unsigned long long)stats.admissions, (unsigned long long)stats.bank_reuses,
-                (unsigned long long)stats.prefetched_layers, (unsigned long long)stats.read_bytes,
-                (unsigned long long)stats.copied_bytes, (unsigned long long)stats.promoted_bytes,
-                memory.banks, ok ? "PASS" : "FAIL");
+                "promoted=%llu banks=%u %s\n",
+                disk_label(disk), shifting ? " shifting" : "", (unsigned long long)cache, bad,
+                count, (unsigned long long)stats.hits, (unsigned long long)stats.misses,
+                (unsigned long long)stats.evictions, (unsigned long long)stats.admissions,
+                (unsigned long long)stats.bank_reuses, (unsigned long long)stats.prefetched_layers,
+                (unsigned long long)stats.read_bytes, (unsigned long long)stats.copied_bytes,
+                (unsigned long long)stats.promoted_bytes, memory.banks, ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
 
@@ -250,6 +271,7 @@ int run(DeviceContext& device, bool disk, std::uint64_t cache, const std::filesy
 int span_prefetch(DeviceContext& device, bool disk, const std::filesystem::path& path) {
     Fixture fixture(disk, path);
     ExpertDeliveryOptions options;
+    options.disk          = disk_reads;
     options.pair_capacity = kPairs;
     options.cache_bytes   = 0;
     options.staging_bytes = 4096;
@@ -295,7 +317,7 @@ int span_prefetch(DeviceContext& device, bool disk, const std::filesystem::path&
     const bool ok = !bad && count == std::uint64_t(5) * kLayers * kPairs &&
                     prefetched == kLayers - 1 && reuses == std::uint64_t(2 * kLayers - 1) * kExperts;
     std::printf("%s span prefetch bad=%llu pairs=%llu prefetched=%llu bank_reuses=%llu %s\n",
-                disk ? "disk" : "host", bad, count, (unsigned long long)prefetched,
+                disk_label(disk), bad, count, (unsigned long long)prefetched,
                 (unsigned long long)reuses, ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
@@ -370,9 +392,9 @@ int lent_landing(DeviceContext& device, bool disk, const std::filesystem::path& 
     const bool ok = !bad_steps && !bad && rounds.admissions != 0 && rounds.lent_admissions != 0 &&
                     in_cache;
     std::printf("%s lent landing slots=%d bad=%llu pairs=%llu round_admissions=%llu "
-                "lent_admissions=%llu x_cached=%d %s\n", disk ? "disk" : "host", slots, bad, count,
-                (unsigned long long)rounds.admissions, (unsigned long long)rounds.lent_admissions,
-                int(in_cache), ok ? "PASS" : "FAIL");
+                "lent_admissions=%llu x_cached=%d %s\n",
+                disk_label(disk), slots, bad, count, (unsigned long long)rounds.admissions,
+                (unsigned long long)rounds.lent_admissions, int(in_cache), ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
 
@@ -610,6 +632,7 @@ int cpu_share(DeviceContext& device, bool disk, double share, const std::filesys
     Fixture fixture(disk, path);
     PairEcho echo;
     ExpertDeliveryOptions options;
+    options.disk              = disk_reads;
     options.pair_capacity = kPairs;
     options.cache_bytes = 6ULL << 20;
     options.cpu.products = &echo;
@@ -670,12 +693,12 @@ int cpu_share(DeviceContext& device, bool disk, double share, const std::filesys
                     stats.cpu_experts != 0 && seeded_hits == 3 &&
                     (share < 1 || stats.hits > 6) &&
                     delivery.cpu_description().find("2 ") == 0;
-    std::printf("%s cpu share %.1f bad=%llu echo_bad=%llu cpu_experts=%llu cpu_pairs=%llu hits=%llu "
-                "seeded_hits=%llu %s\n",
-                disk ? "disk" : "host", share, bad, (unsigned long long)echo.bad,
-                (unsigned long long)stats.cpu_experts, computed, (unsigned long long)stats.hits,
-                (unsigned long long)seeded_hits,
-                ok ? "PASS" : "FAIL");
+    std::printf(
+        "%s cpu share %.1f bad=%llu echo_bad=%llu cpu_experts=%llu cpu_pairs=%llu hits=%llu "
+        "seeded_hits=%llu %s\n",
+        disk_label(disk), share, bad, (unsigned long long)echo.bad,
+        (unsigned long long)stats.cpu_experts, computed, (unsigned long long)stats.hits,
+        (unsigned long long)seeded_hits, ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
 
@@ -785,7 +808,7 @@ int elastic_cache(DeviceContext& device, bool disk, const std::filesystem::path&
     visited.copy_to_host(&count, 8);
     const bool ok = !bad_steps && !bad && count == std::uint64_t(replays + 1) * kLayers * kPairs;
     std::printf("%s elastic cache keep=%llu hot_hits=%llu bad=%llu pairs=%llu %s\n",
-                disk ? "disk" : "host", (unsigned long long)keep, (unsigned long long)hot.hits, bad,
+                disk_label(disk), (unsigned long long)keep, (unsigned long long)hot.hits, bad,
                 count, ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
@@ -796,6 +819,7 @@ int elastic_cache(DeviceContext& device, bool disk, const std::filesystem::path&
 int lent_banks(DeviceContext& device, bool disk, const std::filesystem::path& path) {
     Fixture fixture(disk, path);
     ExpertDeliveryOptions options;
+    options.disk          = disk_reads;
     options.pair_capacity = kPairs;
     options.cache_bytes   = 0;
     options.staging_bytes = 4096;
@@ -883,9 +907,10 @@ int lent_banks(DeviceContext& device, bool disk, const std::filesystem::path& pa
     visited.copy_to_host(&count, 8);
     const auto stats = delivery.stats();
     const bool ok = !bad_steps && !bad && count == std::uint64_t(replays + 1) * kLayers * kPairs;
-    std::printf("%s lent banks slots=%u lent_admissions=%llu lent_evictions=%llu bad=%llu pairs=%llu %s\n",
-                disk ? "disk" : "host", lent, (unsigned long long)stats.lent_admissions,
-                (unsigned long long)stats.lent_evictions, bad, count, ok ? "PASS" : "FAIL");
+    std::printf(
+        "%s lent banks slots=%u lent_admissions=%llu lent_evictions=%llu bad=%llu pairs=%llu %s\n",
+        disk_label(disk), lent, (unsigned long long)stats.lent_admissions,
+        (unsigned long long)stats.lent_evictions, bad, count, ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
 
@@ -1019,6 +1044,116 @@ int slot_pools(DeviceContext& device) {
     return failures ? 1 : 0;
 }
 
+// Entries of alias `alias` (of `experts` per alias) that are set and not a multiple of `bytes`.
+__global__ void misaligned(const void* const* table, int alias, int experts, std::uint64_t bytes,
+                           unsigned long long* count) {
+    const int e = threadIdx.x;
+    if (e >= experts) { return; }
+    const void* entry = table[alias * experts + e];
+    if (entry && reinterpret_cast<std::uintptr_t>(entry) % bytes) { atomicAdd(count, 1ull); }
+}
+
+// alias_aligned() against the entries the delivery writes, in its banks (a wide call), cache slots
+// and lent slots (narrow calls): layer 0 has equal 4,096-byte blobs; layer 1 equal 1,028-byte
+// [gate; up] blobs, a bank stride of whole 4 bytes but not of 16; layer 2 its up alias 8 bytes in;
+// layer 3 blobs of unequal sizes that are not whole 16 bytes, which the banks place at a rounded
+// stride.
+int alignment(DeviceContext& device) {
+    constexpr int layer_count = 4, experts = 8, aliases = 4;
+    const auto bytes = [](int layer, int expert, int blob) -> std::uint64_t {
+        if (layer == 1) { return blob ? 2048 : 1028; }
+        if (layer == 3) { return 1000 + 4 * std::uint64_t(expert) + 12 * std::uint64_t(blob); }
+        return 4096;
+    };
+    std::vector<std::unique_ptr<PinnedHostBuffer>> sources;
+    std::vector<ExpertDeliveryLayer> layers(layer_count);
+    for (int l = 0; l < layer_count; ++l) {
+        auto& layer   = layers[std::size_t(l)];
+        layer.aliases = {{0, 0}, {0, l == 2 ? 8u : 512u}, {0, 0}, {1, 0}};
+        for (int b = 0; b < 2; ++b) {
+            std::uint64_t total = 0;
+            for (int e = 0; e < experts; ++e) { total += bytes(l, e, b); }
+            sources.push_back(std::make_unique<PinnedHostBuffer>(std::size_t(total)));
+        }
+        auto* gate_up = static_cast<std::byte*>(sources[sources.size() - 2]->data());
+        auto* down    = static_cast<std::byte*>(sources.back()->data());
+        std::byte* at[2] = {gate_up, down};
+        for (int e = 0; e < experts; ++e) {
+            std::vector<ExpertBlob> expert;
+            for (int b = 0; b < 2; ++b) {
+                std::memset(at[b], 0, bytes(l, e, b));
+                expert.push_back(ExpertBlob{
+                    .pinned        = at[b],
+                    .pinned_region = reinterpret_cast<std::uintptr_t>(b ? down : gate_up),
+                    .bytes         = bytes(l, e, b),
+                    .zero_tail     = 256});
+                at[b] += bytes(l, e, b);
+            }
+            layer.experts.push_back(std::move(expert));
+        }
+    }
+    int failures      = 0;
+    const auto expect = [&](bool condition, const char* what) {
+        if (!condition) {
+            std::printf("alignment: %s\n", what);
+            ++failures;
+        }
+    };
+    ExpertDeliveryOptions options;
+    options.pair_capacity = 64;
+    options.cache_bytes   = 64ULL << 10; // fewer slots than experts: narrow calls also lend banks
+    ExpertDelivery delivery(device.rank(0), {}, layers, options);
+    bool predicted[layer_count][aliases];
+    for (int l = 0; l < layer_count; ++l) {
+        for (int a = 0; a < aliases; ++a) { predicted[l][a] = delivery.alias_aligned(l, a, 16); }
+    }
+    expect(predicted[0][0] && predicted[0][1] && predicted[0][2] && predicted[0][3],
+           "equal 4,096-byte blobs are aligned");
+    expect(!predicted[1][0] && !predicted[1][1] && !predicted[1][2] && predicted[1][3],
+           "a 1,028-byte stride is not, the down blob's 2,048 is");
+    expect(delivery.alias_aligned(1, 0, 4), "a 1,028-byte stride is a whole number of 4 bytes");
+    expect(predicted[2][0] && !predicted[2][1] && predicted[2][2] && predicted[2][3],
+           "an alias 8 bytes in is not");
+    expect(predicted[3][0] && predicted[3][1] && predicted[3][2] && predicted[3][3],
+           "unequal blobs sit at a rounded stride");
+    DeviceBuffer ids(64 * 4), counts(layer_count * aliases * 8);
+    counts.fill();
+    const auto call = [&](int layer, const std::vector<std::int32_t>& routed) {
+        ids.copy_from_host(routed.data(), routed.size() * 4);
+        (void)delivery.begin(std::size_t(layer), static_cast<const std::int32_t*>(ids.p),
+                             std::uint32_t(routed.size()), device.stream);
+        delivery.await(device.stream);
+        for (int a = 0; a < aliases; ++a) {
+            misaligned<<<1, experts, 0, device.stream>>>(
+                delivery.tables(std::size_t(layer)), a, experts, 16,
+                static_cast<unsigned long long*>(counts.p) + layer * aliases + a);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaStreamSynchronize(device.stream));
+        delivery.drain();
+    };
+    for (int round = 0; round < 3; ++round) {
+        for (int l = 0; l < layer_count; ++l) {
+            call(l, {0, 1, 2, 3, 4, 5, 6, 7}); // wide: the layer bank
+            call(l, {1, 2});                     // narrow: slots
+            call(l, {5, 6, 7});
+        }
+    }
+    unsigned long long count[layer_count][aliases]{};
+    counts.copy_to_host(count, sizeof(count));
+    for (int l = 0; l < layer_count; ++l) {
+        for (int a = 0; a < aliases; ++a) {
+            if (predicted[l][a]) {
+                expect(count[l][a] == 0, "an entry of an aligned alias is not");
+            }
+        }
+    }
+    expect(count[1][0] != 0 && count[2][1] != 0, "the refused aliases do hold unaligned entries");
+    std::printf("alignment unaligned entries: layer 1 gate %llu, layer 2 up %llu %s\n", count[1][0],
+                count[2][1], failures ? "FAIL" : "PASS");
+    return failures ? 1 : 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -1040,6 +1175,7 @@ int main(int argc, char** argv) {
         int failures = admission_boundaries(device);
         failures += tier_policy(device);
         failures += slot_pools(device);
+        failures += alignment(device);
         for (bool disk : {false, true}) {
             for (auto cache : {0ULL, 6ULL << 20, 64ULL << 20}) {
                 failures += run(device, disk, cache, path);
@@ -1051,6 +1187,19 @@ int main(int argc, char** argv) {
             failures += span_prefetch(device, disk, path);
             failures += lent_landing(device, disk, path);
         }
+        // Disk experts read directly (into the host window), from a drive mirror, and both.
+        const auto mirror = path / "mirror";
+        for (const auto& reads : {ExpertDiskReads{{}, ExpertDirect::On, true},
+                                  ExpertDiskReads{mirror, ExpertDirect::Off, false},
+                                  ExpertDiskReads{mirror, ExpertDirect::On, true}}) {
+            disk_reads = reads;
+            for (auto cache : {0ULL, 6ULL << 20}) { failures += run(device, true, cache, path); }
+            failures += run(device, true, 6ULL << 20, path, true);
+            failures += cpu_share(device, true, 0.5, path);
+            failures += lent_banks(device, true, path);
+            failures += span_prefetch(device, true, path);
+        }
+        disk_reads = {};
         failures += failure_control(device, path, false);
         return failures ? 1 : 0;
     } catch (const std::exception& error) {

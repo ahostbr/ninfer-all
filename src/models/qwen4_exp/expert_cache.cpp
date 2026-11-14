@@ -1,5 +1,9 @@
 #include "models/qwen4_exp/expert_cache.h"
 
+#include "core/device_buffer.h"
+#include "core/device_wait.h"
+#include "core/pinned_memory.h"
+
 #include <algorithm>
 #include <cstring>
 #include <map>
@@ -32,7 +36,7 @@ struct ExpertCache::Layer {
         std::byte* base     = nullptr;
         std::uint32_t count = 0;
     };
-    std::array<Block, 2> lent{};
+    std::array<Block, 3> lent{};
     std::vector<std::int32_t> slot_of;   // a held or pending expert's slot, else -1
     std::vector<std::int32_t> expert_of; // a slot's held or pending expert, else -1
     std::vector<std::int32_t> free_slots;
@@ -58,13 +62,16 @@ struct ExpertCache::Layer {
             return static_cast<std::byte*>(extra.p) + std::size_t(slot) * slot_bytes;
         }
         slot -= extra_slots;
-        if (slot >= std::int64_t(lent[0].count)) {
-            return lent[1].base + std::size_t(slot - lent[0].count) * slot_bytes;
-        }
-        return lent[0].base + std::size_t(slot) * slot_bytes;
+        std::size_t k = 0;
+        while (k + 1 < lent.size() && slot >= std::int64_t(lent[k].count)) { slot -= lent[k++].count; }
+        return lent[k].base + std::size_t(slot) * slot_bytes;
     }
 
-    [[nodiscard]] std::uint32_t lent_end() const { return lent_first + lent[0].count + lent[1].count; }
+    [[nodiscard]] std::uint32_t lent_end() const {
+        std::uint32_t end = lent_first;
+        for (const Block& block : lent) { end += block.count; }
+        return end;
+    }
 
     [[nodiscard]] std::uint64_t offset(int k) const {
         return k == 0   ? 0
@@ -231,6 +238,7 @@ ExpertCache::ExpertCache(DeviceContext& device, std::vector<ExpertCacheLayer> la
     uploaded_.assign(device_.size(), nullptr);
     handover_.assign(device_.size(), nullptr);
     holding_.assign(device_.size(), 0);
+    spare_.assign(device_.size(), {});
     for (const auto& [rank, members] : on_rank) {
         RankBinding bind(device_, rank);
         CUDA_CHECK(cudaStreamCreateWithFlags(&side_[rank], cudaStreamNonBlocking));
@@ -244,18 +252,36 @@ ExpertCache::~ExpertCache() {
     for (std::size_t r = 0; r < side_.size(); ++r) {
         if (side_[r] == nullptr) { continue; }
         RankBinding bind(device_, r);
-        cudaStreamSynchronize(side_[r]);
+        ninfer::wait_for_stream(side_[r]);
         cudaStreamDestroy(side_[r]);
         cudaEventDestroy(evicted_[r]);
         cudaEventDestroy(uploaded_[r]);
         cudaEventDestroy(handover_[r]);
     }
     for (const auto& copy : copies_) {
-        if (copy.done != nullptr && std::find(spare_.begin(), spare_.end(), copy.done) == spare_.end()) {
-            spare_.push_back(copy.done);
+        auto& spare = spare_[layers_[copy.layer].banks.rank];
+        if (copy.done != nullptr && std::find(spare.begin(), spare.end(), copy.done) == spare.end()) {
+            spare.push_back(copy.done);
         }
     }
-    for (auto event : spare_) { cudaEventDestroy(event); }
+    for (std::size_t r = 0; r < spare_.size(); ++r) {
+        if (spare_[r].empty()) { continue; }
+        RankBinding bind(device_, r);
+        for (auto event : spare_[r]) { cudaEventDestroy(event); }
+    }
+}
+
+cudaEvent_t ExpertCache::take_event(std::size_t rank) {
+    auto& spare = spare_[rank];
+    if (!spare.empty()) {
+        const cudaEvent_t event = spare.back();
+        spare.pop_back();
+        return event;
+    }
+    RankBinding bind(device_, rank);
+    cudaEvent_t event = nullptr;
+    CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+    return event;
 }
 
 void ExpertCache::observe(std::size_t index, std::span<const std::int32_t> ids, bool learn) {
@@ -286,7 +312,7 @@ void ExpertCache::upload(Layer& layer, cudaStream_t stream) {
 }
 
 void ExpertCache::land() {
-    std::vector<cudaEvent_t> landed;
+    std::vector<std::pair<cudaEvent_t, std::size_t>> landed; // with the rank it was made on
     for (auto it = copies_.begin(); it != copies_.end();) {
         const cudaError_t status = cudaEventQuery(it->done);
         if (status == cudaErrorNotReady) {
@@ -298,13 +324,14 @@ void ExpertCache::land() {
         layer.pending[std::size_t(it->expert)] = 0;
         layer.point_slot(it->expert, it->slot);
         tier_->set(it->layer, it->expert, ExpertTier::State::Held);
-        if (std::find(landed.begin(), landed.end(), it->done) == landed.end()) { landed.push_back(it->done); }
+        const std::pair<cudaEvent_t, std::size_t> event{it->done, layer.banks.rank};
+        if (std::find(landed.begin(), landed.end(), event) == landed.end()) { landed.push_back(event); }
         it = copies_.erase(it);
     }
-    for (const auto event : landed) {
+    for (const auto& [event, rank] : landed) {
         const bool used = std::any_of(copies_.begin(), copies_.end(),
                                       [&](const Copy& copy) { return copy.done == event; });
-        if (!used) { spare_.push_back(event); }
+        if (!used) { spare_[rank].push_back(event); }
     }
 }
 
@@ -379,16 +406,7 @@ void ExpertCache::adapt() {
             Layer& layer           = layers_[copy.layer];
             const std::size_t rank = layer.banks.rank;
             RankBinding bind(device_, rank);
-            if (round_done.count(rank) == 0) {
-                cudaEvent_t done = nullptr;
-                if (!spare_.empty()) {
-                    done = spare_.back();
-                    spare_.pop_back();
-                } else {
-                    CUDA_CHECK(cudaEventCreateWithFlags(&done, cudaEventDisableTiming));
-                }
-                round_done[rank] = done;
-            }
+            if (round_done.count(rank) == 0) { round_done[rank] = take_event(rank); }
             if (mtp && !after_draft[rank]) {
                 CUDA_CHECK(cudaEventRecord(evicted_[rank], layer.banks.stream));
                 CUDA_CHECK(cudaStreamWaitEvent(side_[rank], evicted_[rank], 0));
@@ -453,7 +471,7 @@ void ExpertCache::seed(const std::vector<std::vector<std::uint64_t>>& counts) {
             ++stats_.admitted;
         }
         if (layer.dirty) { upload(layer, layer.banks.stream); }
-        CUDA_CHECK(cudaStreamSynchronize(layer.banks.stream));
+        CUDA_CHECK(ninfer::wait_for_stream(layer.banks.stream));
         tier_->set_free(std::uint32_t(index), std::uint32_t(layer.free_slots.size()));
     }
 }
@@ -509,17 +527,37 @@ bool ExpertCache::admit(std::size_t index, std::int32_t expert, int pairs,
         layer.point_host(victim.expert);
         tier_->set(index, victim.expert, ExpertTier::State::Out);
     }
-    // The misses copy the expert and count its bytes.
+    place(layer, index, expert, slot, out);
+    return true;
+}
+
+bool ExpertCache::admit_free(std::size_t index, std::int32_t expert, Admitted& out) {
+    std::lock_guard lock(mutex_);
+    Layer& layer = layers_.at(index);
+    if (!layer.handed_over || layer.free_slots.empty() || expert < 0 ||
+        std::size_t(expert) >= layer.experts() || layer.slot_of[std::size_t(expert)] >= 0) {
+        return false;
+    }
+    out                      = Admitted{};
+    const std::int32_t slot = layer.free_slots.back();
+    layer.free_slots.pop_back();
+    tier_->set_free(std::uint32_t(index), std::uint32_t(layer.free_slots.size()));
+    place(layer, index, expert, slot, out);
+    return true;
+}
+
+void ExpertCache::place(Layer& layer, std::size_t index, std::int32_t expert, std::int32_t slot,
+                        Admitted& out) {
+    // The caller copies the expert and counts its bytes.
     for (int k = 0; k < 3; ++k) { out.slot[k] = layer.slot_base(slot) + layer.offset(k); }
     layer.point_slot(expert, slot);
-    // The misses patch the device tables themselves; the mirror only keeps them for later uploads.
+    // The caller patches the device tables itself; the mirror only keeps them for later uploads.
     layer.dirty                        = false;
     layer.slot_of[std::size_t(expert)] = slot;
     layer.expert_of[std::size_t(slot)] = expert;
     layer.fresh[std::size_t(expert)]   = 1;
     tier_->set(index, expert, ExpertTier::State::Held);
     ++stats_.admitted;
-    return true;
 }
 
 std::array<void*, 3> ExpertCache::tables(std::size_t index) const {
@@ -538,7 +576,8 @@ ExpertCache::Ranges ExpertCache::storage(std::size_t index) const {
         const auto begin = reinterpret_cast<std::uintptr_t>(lent.base);
         return std::pair<std::uintptr_t, std::uintptr_t>{begin, begin + std::uint64_t(lent.count) * layer.slot_bytes};
     };
-    return {range(layer.storage), range(layer.extra), block(layer.lent[0]), block(layer.lent[1])};
+    return {range(layer.storage), range(layer.extra), block(layer.lent[0]), block(layer.lent[1]),
+            block(layer.lent[2])};
 }
 
 std::vector<std::uint64_t> ExpertCache::grow(std::span<const std::uint64_t> bytes_by_rank) {
@@ -606,7 +645,9 @@ std::vector<std::uint64_t> ExpertCache::lend(std::span<const Loan> loans) {
             throw std::invalid_argument("expert cache: a lent buffer needs a rank and bytes");
         }
         const std::size_t k = lent_by_rank[loan.rank]++;
-        if (k >= 2) { throw std::invalid_argument("expert cache: at most two lent buffers a rank"); }
+        if (k >= std::tuple_size_v<decltype(Layer::lent)>) {
+            throw std::invalid_argument("expert cache: at most three lent buffers a rank");
+        }
         const auto it = on_rank.find(loan.rank);
         if (it == on_rank.end()) { continue; }
         // As grow shares: the same number of slots for every layer that is not full.
@@ -626,13 +667,13 @@ std::vector<std::uint64_t> ExpertCache::lend(std::span<const Loan> loans) {
                                       std::vector<const std::vector<std::uint64_t>*>(members.size(), nullptr),
                                       members.size());
         RankBinding bind(device_, loan.rank);
-        CUDA_CHECK(cudaMemset(loan.base, 0, loan.bytes));
+        CUDA_CHECK(ninfer::fill_and_wait(loan.base, 0, loan.bytes));
         auto* at = static_cast<std::byte*>(loan.base);
         for (std::size_t i = 0; i < members.size(); ++i) {
             if (more[i] == 0) { continue; }
             const std::size_t index = members[i];
             Layer& layer            = layers_[index];
-            if (layer.lent[0].count + layer.lent[1].count == 0) { layer.lent_first = layer.slots; }
+            if (layer.lent_end() == layer.lent_first) { layer.lent_first = layer.slots; }
             layer.lent[k] = {at, more[i]};
             at += std::size_t(more[i]) * layer.slot_bytes;
             // Taken after the cache's own free slots, which survive the next prompt.
@@ -656,7 +697,7 @@ void ExpertCache::reclaim(std::size_t rank, cudaStream_t transfer) {
     if (rank >= holding_.size() || !holding_[rank]) { return; }
     RankBinding bind(device_, rank);
     // A round's copies may be writing lent slots: they land first.
-    CUDA_CHECK(cudaStreamSynchronize(side_[rank]));
+    CUDA_CHECK(ninfer::wait_for_stream(side_[rank]));
     land();
     cudaStream_t compute = nullptr;
     for (std::size_t index = 0; index < layers_.size(); ++index) {
@@ -757,15 +798,7 @@ void ExpertCache::give_back(std::size_t rank, cudaStream_t transfer) {
             std::min<std::size_t>(layer.lent_end() - layer.lent_first, missing.size());
         std::partial_sort(missing.begin(), missing.begin() + std::ptrdiff_t(take), missing.end(),
                           [&](std::int32_t a, std::int32_t b) { return count(a) > count(b); });
-        cudaEvent_t done = nullptr;
-        if (take != 0) {
-            if (!spare_.empty()) {
-                done = spare_.back();
-                spare_.pop_back();
-            } else {
-                CUDA_CHECK(cudaEventCreateWithFlags(&done, cudaEventDisableTiming));
-            }
-        }
+        const cudaEvent_t done = take != 0 ? take_event(rank) : nullptr;
         auto slot = layer.lent_first;
         for (std::size_t i = 0; i < take; ++i, ++slot) {
             const std::int32_t expert           = missing[i];

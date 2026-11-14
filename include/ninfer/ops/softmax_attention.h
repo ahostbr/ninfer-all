@@ -1,9 +1,10 @@
 #pragma once
 
 #include "ninfer/ops/attention_geometry.h"
+#include "ninfer/ops/softmax_attention_envelope.h"
 
 #include "core/arena.h"
-#include "core/paged_kv_cache.h"
+#include "core/paged_kv_view.h"
 #include "core/tensor.h"
 
 #include <cuda_runtime.h>
@@ -14,42 +15,10 @@
 
 namespace ninfer::ops {
 
-inline constexpr std::uint32_t kCausalAttentionMaximumVisibleKeys = 1048576;
-
-struct CausalAttentionExecutionEnvelope {
-    std::uint32_t min_visible_keys = 0;
-    std::uint32_t max_visible_keys = 0;
-    // Select the fast INT8 prompt kernel (FP16 per-tile PV accumulation) for prompt-route
-    // launches over an INT8-G64 cache. Other routes and cache formats ignore it; it never changes
-    // the route or workspace.
-    bool fast_prompt_kernel = false;
-    // Opt into chunked single-row verification through width 64; ordinary prompts keep
-    // their existing route. Workspace planning and execution must use the same hint.
-    bool wide_verification = false;
-    // Single-row prefill: widths 17 through 64 take the chunked small-T route once the visible
-    // keys make it faster than the prompt route. The prompt route runs one CTA per query head and
-    // row block, so a few query rows over a long context leave most SMs idle; small-T splits the
-    // keys across CTAs instead. Workspace planning and execution must use the same hint.
-    bool small_prefill = false;
-    // Invariant reductions (--invariant-attention) when nonzero: every call of 1 to 16 columns
-    // per row, at any batch size, takes the small-T routes, each split covers the keys
-    // [s * N, (s + 1) * N) for this N whatever the window, width or batch, and each storage runs
-    // one key tile and one reduction order. A live column's output is then the same bytes in every
-    // such call that holds it. N comes from causal_attention_invariant_segment_keys for the
-    // engine's whole context, so every envelope of one engine carries the same value. Workspace
-    // planned with it reserves for calls of either schedule.
-    std::uint32_t invariant_segment_keys = 0;
-};
-
 // The segment of invariant reductions for an engine whose calls see at most `max_context` keys:
 // the fewest keys, a multiple of the 64-key page, that keep every window within the small-T
 // launch's split capacity.
 [[nodiscard]] std::uint32_t causal_attention_invariant_segment_keys(std::uint32_t max_context);
-
-struct ContextAttentionExecutionEnvelope {
-    std::uint32_t min_context = 0;
-    std::uint32_t max_context = 0;
-};
 
 /**
  * Shared numerical contract.
@@ -76,7 +45,9 @@ struct ContextAttentionExecutionEnvelope {
  * the INT8-G64 QK path. rk4v4-e8 stores V exactly as rk8v4 and K as packed signed 4-bit codes in
  * the same nibble order, one FP16 scale per 64-value group, expanded to INT8 codes the same way.
  * rk2v4-e8 stores V as rk8v4 and K as two E8 root code bytes per eight dimensions over the same
- * scales (kv_cache_append.h), expanded to INT8 codes as well. A causal FP8-E4M3FN V row has one stored FP16 scale for D256;
+ * scales (kv_cache_append.h), expanded to INT8 codes as well. A bf16p K and V row decodes to the
+ * appended BF16 values exactly, so its outputs equal the BF16 cache's; it takes neither the Volta
+ * routes nor position-split attention. A causal FP8-E4M3FN V row has one stored FP16 scale for D256;
  * each finite code e is decoded as FP32(e) * FP32(scale_bits). Quantized K uses the paired physical
  * representation written by kv_cache_append; its original-coordinate logical row is consumed
  * through the matching private Q/K profile. The fixed orthogonal preparation and transient Q
@@ -198,6 +169,23 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               Tensor* partial = nullptr);
 
 /**
+ * Append the K/V rows of a causal_softmax_attention call without its attention.
+ *
+ * k, v, positions, valid_columns, kv_table_rows, geometry, cache and envelope follow
+ * causal_softmax_attention, for a call that resolves to the prompt route
+ * (causal_softmax_attention_route_family returns 2). This Op writes the same bytes into every
+ * cache row that call appends, including a position-split rank's rows, and writes no other byte.
+ * A caller that needs only the cache takes it, for example the last layer of a prompt chunk that
+ * produces no logits and no final hidden state. A call that resolves to another route throws: the
+ * small-T kernels append inside the attention.
+ */
+void causal_softmax_attention_append(const Tensor& k, const Tensor& v, const Tensor& positions,
+                                     const Tensor& valid_columns, const Tensor& kv_table_rows,
+                                     AttentionHeadGeometry geometry, PagedKVBatchLayerView cache,
+                                     CausalAttentionExecutionEnvelope envelope,
+                                     cudaStream_t stream);
+
+/**
  * Position-split attention (--tensor-attention positions). Each rank of a position-split pool
  * holds some of a row's keys (PagedKVBatchLayerView::page_stride, page_residue): the stride and
  * residue select its physical pages, and causal_softmax_attention over that rank's view attends
@@ -218,7 +206,6 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
  * sigmoid_mul rounds. The partials may live in another device's memory or in mapped host memory,
  * any pointer the merging device can read; at most kCausalAttentionMaximumMergeRanks of them.
  */
-inline constexpr std::int32_t kCausalAttentionMaximumMergeRanks = 8;
 [[nodiscard]] std::size_t causal_attention_partial_elements(std::int32_t q_heads,
                                                             std::int32_t columns);
 void causal_attention_merge_partials(std::span<const float* const> partials, std::int32_t q_heads,

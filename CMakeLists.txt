@@ -90,6 +90,21 @@ if(MSVC AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 19.40)
   message(FATAL_ERROR
     "MSVC ${CMAKE_CXX_COMPILER_VERSION} miscompiles core::wide_add; use toolset 14.44 "
     "(vcvars64.bat -vcvars_ver=14.44)")
+# CUDA 13.2.0 and 13.2.1 (nvcc 13.2.51 and 13.2.78) miscompile ggml's IQ1_S, IQ2_S and IQ3_S
+# integer tensor-core products for sm_120a (src/ops/linear/gguf/ggml_mmq_iq1_s.cu, _iq2_s.cu and
+# _iq3_s.cu). The PTX their cicc emits is already wrong: 13.4.3's ptxas assembles it into the same
+# failure. On an RTX 5060 Ti ninfer_linear_gguf_test then fails the three types at every
+# integer-kernel width, and the Qwen3.8-27B GSQ-RCO IQ3_S artifact scores a WikiText excerpt at a
+# perplexity of 415,444 instead of 7.16 and answers in gibberish (issue #255, llama.cpp #21255).
+# CUDA 13.2.2 (nvcc 13.2.86) compiles them correctly, as 13.1.2, 13.3.1, 13.4.3 and 13.5.0 do. The
+# 75, 80, 86 and 89 builds of 13.2.0 pass that test on an RTX 2080 Ti, A100, RTX 3090 and RTX 4090,
+# so only 120a builds are refused.
+if(NINFER_ARCH_BLACKWELL AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.2 AND
+   CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.2.86)
+  message(FATAL_ERROR
+    "A build with 120a cannot use CUDA ${CMAKE_CUDA_COMPILER_VERSION}: CUDA 13.2.0 and 13.2.1 "
+    "miscompile the IQ1_S, IQ2_S and IQ3_S GGUF kernels for sm_120a. Use CUDA 13.1, 13.2.2 or "
+    "newer")
 endif()
 
 # NINFER_SM8X_COMPAT gates every Ampere/early-Ada compatibility path. ninfer_ops also sets it
@@ -156,6 +171,28 @@ endif()
 if(NINFER_ARCH_BLACKWELL)
   add_compile_definitions(NINFER_SM120_NVFP4=1 NINFER_SM120_FP8=1)
 endif()
+# Every listed architecture gets its machine code, and the objects carry PTX for one architecture
+# only: 89, or the newest listed below it, whose PTX the driver compiles at load time for a card
+# outside the list (a Hopper or data-center Blackwell card, say). compute_120a PTX runs only on a
+# card that already has the sm_120a code, and older PTX only on cards that newer PTX serves too, so
+# leaving it out costs no card and spares nvcc its embedding. NINFER_ARCHITECTURES keeps the listed
+# names for the build's own records; CMAKE_CUDA_ARCHITECTURES from here on is the generated set.
+set(NINFER_ARCHITECTURES ${_ninfer_architectures})
+set(_ninfer_ptx_architecture "")
+foreach(_ninfer_architecture IN ITEMS 89 86 80 75 70)
+  if(_ninfer_architecture IN_LIST _ninfer_architectures)
+    set(_ninfer_ptx_architecture ${_ninfer_architecture})
+    break()
+  endif()
+endforeach()
+set(CMAKE_CUDA_ARCHITECTURES "")
+foreach(_ninfer_architecture IN LISTS _ninfer_architectures)
+  if(_ninfer_architecture STREQUAL _ninfer_ptx_architecture)
+    list(APPEND CMAKE_CUDA_ARCHITECTURES ${_ninfer_architecture})
+  else()
+    list(APPEND CMAKE_CUDA_ARCHITECTURES ${_ninfer_architecture}-real)
+  endif()
+endforeach()
 
 # The device code of several architectures outgrows the 2 GiB that 32-bit PC-relative references
 # span when it sits between an executable's code and its writable data (cmake/large-fatbin.ld).
@@ -233,6 +270,17 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)        # clangd / IDE tooling
 if(MSVC)
+  # MSVC 19.44 (Visual Studio 2022 17.14, toolset 14.44) is the oldest qualified compiler: cl 19.38
+  # folds the overflow flag of core::wide_add wrongly at /O2 when its inputs are constants
+  # (ninfer_wide_math_test fails), and 19.39-19.43 were never qualified. A Visual Studio 2022 whose
+  # default toolset is older selects 14.44 when it is installed: vcvars64.bat -vcvars_ver=14.44.
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 19.44)
+    message(FATAL_ERROR "MSVC ${CMAKE_CXX_COMPILER_VERSION} is older than 19.44, the oldest "
+      "qualified compiler (cl 19.38 miscompiles core::wide_add at /O2). Update Visual Studio 2022 "
+      "to 17.14, or install its 14.44 build tools and configure from an environment opened with "
+      "'vcvars64.bat -vcvars_ver=14.44'; Visual Studio 2026 also qualifies where its CUDA version "
+      "accepts it.")
+  endif()
   add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
   # /Zc:__cplusplus makes MSVC report the standard it is actually compiling. Without it the macro
   # stays at 199711L even under /std:c++20, and CUDA's <vector_types.h> then hides the constexpr
@@ -329,12 +377,17 @@ include(cmake/NinferTargets.cmake)
 # so it reflects the tree actually being compiled rather than the last configure. Every product
 # binary records it in its startup log ("build <id>"), and calibrated device profiles record it as
 # their provenance (src/runtime/engine/device_profile_build_id.cpp). The header is only rewritten
-# when its content changes, so only the files that include it recompile when the id does.
+# when its content changes, so only the files that include it recompile when the id does. The
+# header also names the CUDA compiler and architectures of the build (NINFER_TOOLCHAIN), which the
+# startup log and --version print beside the id: the same sources can compile wrong with another
+# nvcc release, so a report needs the toolkit as well as the commit.
 set(NINFER_BUILD_ID_HEADER "${CMAKE_BINARY_DIR}/generated/ninfer_build_id.h")
+string(REPLACE ";" " " _ninfer_toolchain_architectures "${NINFER_ARCHITECTURES}")
 add_custom_target(ninfer_build_id_stamp ALL
   COMMAND ${CMAKE_COMMAND}
           -DSRC_DIR=${CMAKE_SOURCE_DIR}
           -DOUT=${NINFER_BUILD_ID_HEADER}
+          "-DTOOLCHAIN=nvcc ${CMAKE_CUDA_COMPILER_VERSION}, ${_ninfer_toolchain_architectures}"
           -P ${CMAKE_SOURCE_DIR}/cmake/GenerateBuildId.cmake
   BYPRODUCTS ${NINFER_BUILD_ID_HEADER}
   COMMENT "Stamping NINFER build id from git (build-time)"
@@ -365,3 +418,5 @@ endif()
 if(NINFER_SHARED_RUNTIME)
   ninfer_finalize_runtime()
 endif()
+
+ninfer_check_source_owners()

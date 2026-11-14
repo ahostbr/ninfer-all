@@ -8,10 +8,11 @@ function(ninfer_runtime_program name program)
     SOURCES ${arg_SOURCES} LIBRARIES ${arg_LIBRARIES})
   add_executable(${name} "${PROJECT_SOURCE_DIR}/apps/launcher/main.cpp")
   target_compile_definitions(${name} PRIVATE NINFER_COMMAND="${name}")
-  target_link_libraries(${name} PRIVATE ${CMAKE_DL_LIBS})
+  # The launcher reads --config files for the device and backend choices before loading a backend.
+  target_include_directories(${name} PRIVATE "${PROJECT_SOURCE_DIR}/src")
+  target_link_libraries(${name} PRIVATE ${CMAKE_DL_LIBS} ninfer_product_launch_config)
   if(name STREQUAL "ninfer-serve")
     target_compile_definitions(${name} PRIVATE NINFER_ROUTER_LAUNCHER=1)
-    target_include_directories(${name} PRIVATE "${PROJECT_SOURCE_DIR}/src")
     target_link_libraries(${name} PRIVATE ninfer_model_catalog)
   endif()
   ninfer_stamp_build_id(${name})
@@ -45,7 +46,7 @@ function(ninfer_finalize_runtime)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/portable/backends/cuda${cuda_major}/$<0:>"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/portable/backends/cuda${cuda_major}/$<0:>"
     BUILD_RPATH_USE_ORIGIN ON)
-  string(REPLACE ";" " " runtime_architectures "${CMAKE_CUDA_ARCHITECTURES}")
+  string(REPLACE ";" " " runtime_architectures "${NINFER_ARCHITECTURES}")
   file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/portable/backends/cuda${cuda_major}/architectures.txt"
     CONTENT "${runtime_architectures}\n")
   if(UNIX AND NOT APPLE)

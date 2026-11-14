@@ -40,13 +40,23 @@ struct SpeculativeOptions {
     SpeculativeBackend backend = SpeculativeBackend::None;
     // Startup-fixed K: MTP, DFlash and DFlash2 1..15 (query width K+1).
     std::uint32_t draft_tokens = 0;
-    // Flash-Next MTP: end drafting and verification at the first draft whose absolute probability
-    // is at or below this floor. Zero keeps the full window. Unset keeps it with --spec mtp, and
-    // is kAutomaticDraftMinP when the Engine chooses MTP (automatic).
+    // Qwen3.8-Flash-Next: MTP ends drafting and verification at the first draft whose absolute
+    // probability is at or below this floor; DFlash2 verifies through the first draft whose
+    // selector confidence is at or below it. Zero keeps the full window. Unset keeps it with
+    // --spec, and is kAutomaticDraftMinP when the Engine chooses MTP (automatic) and
+    // kAutomaticDFlash2MinP when it chooses DFlash2.
     std::optional<float> draft_min_p;
     // DeepSeek-V4.1 DSpark: verify a round's drafts up to the first its confidence head scores below
     // this, in [0,1]; 0 keeps every draft. Unset keeps the drafter's default floor (0.5).
     std::optional<float> draft_confidence;
+    // DeepSeek-V4.1 DSpark: each drafter block keeps the N experts of its 128 that its shipped
+    // ranking routes most to on the device and routes among those (the others stay in pinned host
+    // memory); 0 keeps every expert on the device. Unset: 64 with the STQ drafter and host or disk
+    // experts, otherwise every expert.
+    std::optional<std::uint32_t> draft_experts;
+    // --spec dspine: the DSpine drafter artifact (tools/convert, recipe dspine_q8 or dspine_bf16),
+    // trained for the model's hidden width, vocabulary and layers. Empty otherwise.
+    std::string draft_model;
     // An Engine's options() report the resolved head.
     ProposalHead proposal_head = ProposalHead::Auto;
     // Context-lookup drafting: match this many trailing tokens against the sequence so far and
@@ -69,15 +79,20 @@ struct SpeculativeOptions {
     // its query instead of the whole history; target verification keeps full attention, so the
     // committed tokens do not depend on it. Zero reads the whole history.
     std::uint32_t mtp_attention_window = 0;
-    // The backend was left to the Engine (no --spec): a MoE model whose artifact carries its MTP
-    // block or assistant drafts with it, kAutomaticDraftTokens a round, since a verification
-    // window's routes share the layer's missing experts: Qwen3.8-Flash-Next with host experts
-    // (ending a round's drafting at its first draft at or below kAutomaticDraftMinP), Gemma 4
-    // with host or disk experts; others run without drafts. The Engine's options() report the
-    // resolved backend.
+    // The backend was left to the Engine (no --spec): a MoE model whose artifact carries a drafter
+    // drafts with it, since a verification window's routes share the layer's missing experts:
+    // Qwen3.8-Flash-Next with host experts with its DFlash2 drafter, kAutomaticDFlash2Tokens a
+    // round verified through the first draft at or below kAutomaticDFlash2MinP, or without one
+    // with its MTP block, kAutomaticDraftTokens a round ending at the first draft at or below
+    // kAutomaticDraftMinP, a round of several requests with a CPU share verifying at most the
+    // tokens of the widest call the CPU shares (64 with GGUF host experts), Edge0's form also with
+    // device experts at max_concurrency 1; Gemma 4 with host or disk experts with its assistant,
+    // kAutomaticDraftTokens a round; others run without drafts. options() report the backend.
     bool automatic = false;
-    static constexpr std::uint32_t kAutomaticDraftTokens = 3;
-    static constexpr float kAutomaticDraftMinP           = 0.5F;
+    static constexpr std::uint32_t kAutomaticDraftTokens   = 3;
+    static constexpr float kAutomaticDraftMinP             = 0.5F;
+    static constexpr std::uint32_t kAutomaticDFlash2Tokens = 4;
+    static constexpr float kAutomaticDFlash2MinP           = 0.7F;
 };
 
 enum class DiagnosticLevel : std::uint8_t {
@@ -148,9 +163,13 @@ private:
 struct HybridPrefixCacheOptions {
     // Device StateImage slots holding inactive snapshots (and tap/endpoint staging). Total Device
     // StateImage capacity is max_concurrency + device_snapshot_slots. Default: one per request
-    // lane plus one staging slot with a Host tier, plus two without one (Device slots are then
-    // the only snapshot storage).
+    // lane plus two (a staging slot and one for a shared prefix or another conversation).
     std::optional<std::uint32_t> device_snapshot_slots;
+    // Whether startup may lower device_snapshot_slots, down to one, when the KV capacity asked
+    // for (an explicit one, or one --max-context window beside the automatic headroom) would not
+    // fit beside them. Normalization sets it when device_snapshot_slots is not given; a given
+    // count is kept and a capacity that does not fit beside it fails.
+    bool fit_device_snapshot_slots = false;
     // New prefill state snapshots one request may create. Default 8 with a Host tier, 2 without.
     std::optional<std::uint32_t> max_new_taps;
     // Geometric ladder base G: ladder taps target prompt_tokens - G * 2^k. Default
@@ -201,6 +220,12 @@ struct ContextCacheOptions {
     HybridPrefixCacheOptions hybrid;
     // Extra Device checkpoint StateImage slots H. Total Device StateImage capacity is C + H.
     std::optional<std::uint32_t> device_state_slots;
+    // Legacy mode, Qwen3.5-core models: one more Device StateImage for each of the C requests,
+    // outside the catalog, keeps the state at the token where a stop string's match began, so a
+    // turn that the stop string ends rounds later resumes its next turn from there. A startup
+    // whose KV capacity does not fit beside them drops them, and Engine::options() reports it.
+    // The hybrid cache keeps that state in a snapshot slot.
+    bool stop_hold_images = true;
     // Host StateImages and Host KV bytes are independently configured pinned-memory capacities.
     std::uint32_t host_state_slots     = kDefaultHostStateSlots;
     std::size_t host_kv_capacity_bytes = kDefaultHostKvCapacityBytes;
@@ -416,10 +441,17 @@ struct HybridExpertOptions {
     bool adaptive_cache = false;
     std::filesystem::path routing_profile; // initial per-layer expert counts for this artifact
     std::filesystem::path record_profile; // write accumulated counts at request boundaries
+    // Disk experts: a directory on a second drive holding byte-identical copies of the artifact's
+    // files (by file name). A read goes to one of the two copies by the 1 MiB stripe of its offset,
+    // so both drives serve a call's misses. Empty: the artifact's files only.
+    std::filesystem::path mirror;
+    // Disk experts: NVMe reads straight into device memory (ExpertDirect).
+    ExpertDirect direct = ExpertDirect::Auto;
 };
 
-// The n-gram table of Qwen3.8-Flash-Next's per-layer embedding: the model artifact's own rows, or
-// a separate table artifact holding the table the model names by digest.
+// The n-gram table of Qwen3.8-Flash-Next's per-layer embedding or DeepSeek-V4.1-Flash's Engram: the
+// model artifact's own rows, or a separate table artifact holding the table the model names by
+// digest.
 struct NgramTableOptions {
     // A table artifact to read the rows from; empty takes the model artifact's own.
     std::filesystem::path path;
@@ -434,6 +466,13 @@ struct NgramTableOptions {
     bool lock = false;
     // Row reads in flight at once.
     std::uint32_t io_depth = 64;
+    // A pass that addresses one row several times (a repeated n-gram, image positions) reads it from
+    // the file once and copies it to the others. The rows are the file's either way.
+    bool dedupe = true;
+    // DeepSeek-V4.1-Flash: while a prompt call computes, the rows of the sequence's next prompt call
+    // are read into a second pinned buffer, if the Engine knows that call's tokens. The rows are
+    // the same either way.
+    bool read_ahead = true;
     // Runs the model without its table: a non-standard, experimental mode that badly degrades the
     // output, since the model was trained with the table.
     bool disabled = false;
@@ -473,9 +512,10 @@ struct EngineOptions {
     // With tensor parallelism over a Qwen3.5-core model or Qwen3.8-Flash-Next, how the devices
     // exchange their partial sums (TensorParallelTransport).
     TensorParallelTransport tensor_parallel_transport = TensorParallelTransport::Auto;
-    // With tensor parallelism over a Qwen3.5-core model, how a prompt chunk's partial sums cross
-    // pinned host memory (TensorParallelPartials): BF16 moves half their bytes and rounds each
-    // device's partial once more, so prompt outputs differ from FP32 partials' slightly.
+    // With tensor parallelism over a Qwen3.5-core model or Qwen3.8-Flash-Next, how a prompt
+    // chunk's partial sums cross between the devices (TensorParallelPartials): BF16 moves half
+    // their bytes and rounds each device's partial once more, so prompt outputs differ from FP32
+    // partials' slightly.
     TensorParallelPartials tensor_parallel_prompt_partials = TensorParallelPartials::Fp32;
     // Qwen3.5-core models: attention reductions that do not depend on the call's width, batch or
     // split schedule. Every call of up to 16 columns per sequence takes the split-KV routes with
@@ -518,6 +558,14 @@ struct EngineOptions {
     // Reserves the grammar mask planes that JSON and JSON Schema constrained requests sample
     // through. Off, those requests are refused and a DFlash round carries no grammar stage.
     bool structured_output = false;
+    // Every sampled request draws its tokens by Gumbel-max over keyed noise
+    // (ResolvedSamplingParameters::gumbel) instead of by inverse CDF, and its chained drafts (an
+    // MTP block, Gemma 4's assistant) become the drafter's own draws under the noise of the
+    // positions they fill instead of its argmax, so a draft matches the verified token whenever
+    // the drafter and the target rank the drawn token first. The draws differ from the default's
+    // for the same seed; greedy requests are unaffected. DSpark drafts stay the drafter's argmax,
+    // and DFlash2 drafts keep their rejection-sampled verification.
+    bool gumbel_sampling = false;
     // Admit waiting requests to free lanes while other requests prefill, instead of holding
     // admission until the staged prefill finishes.
     bool concurrent_prefill = false;
@@ -539,8 +587,25 @@ struct EngineOptions {
     std::uint32_t pending_timeout_ms   = 30000;
     // Prompt tokens per prefill chunk; 0 is automatic: 1024, or 4096 for a native Qwen3.5-family MoE
     // whose routed experts live in host memory or files (each chunk carries the whole expert bank
-    // across the bus once). Gemma 4 and Flint choose their own chunk.
+    // across the bus once). Gemma 4 and Flint choose their own chunk; DeepSeek-V4.1-Flash takes
+    // 2048 by default and at most 4096, and the widest of 2048, 1024 and 512 below that where the
+    // device lacks room for its workspace.
     std::uint32_t prefill_chunk        = 0;
+    // DeepSeek-V4.1-Flash: the prompt rows its decoder blocks (those after the last key-value source
+    // block) run (PrefillTail). Exact leaves out only rows that decide nothing the Engine keeps or
+    // returns, on the prefill chunk grid, so the output is a full run's bit for bit. Rows keeps the
+    // last prefill_tail_rows (128 at least, the attention window) before each position whose state
+    // the Engine keeps, from that row: a lossy mode whose products round differently from Full's,
+    // and below the exact count (2,414) the kept state also loses rows it depends on.
+    PrefillTail prefill_tail        = PrefillTail::Exact;
+    std::uint32_t prefill_tail_rows = 0;
+    // GGUF IQ1_M routed experts of a call wider than eight tokens (DeepSeek-V4.1-Flash and
+    // Qwen3.8-Flash-Next): the integer matrix kernel once the call routes more than 16 rows to
+    // each expert on average for gate and up products, 6 for down products (the vector kernel
+    // below), or (false) always the vector kernel in groups of eight columns. Both multiply 8-bit
+    // activations; their sums differ in rounding. Gemma 4 and Flint run every call wider than
+    // eight tokens on the matrix kernel.
+    bool iq1m_expert_matrix = true;
     // Decode rounds that run before a prefill chunk while other requests generate, proportionally
     // fewer (at least one) before a shorter prefill unit and more before a longer one. A decode
     // round takes tens of milliseconds and a chunk hundreds, so strict alternation (1) leaves

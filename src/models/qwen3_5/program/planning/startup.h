@@ -36,6 +36,8 @@ struct DFlashPersistentLayout {
     TensorLayout prefill_features;
     TensorLayout prefill_positions;
     TensorLayout pending_features;
+    // --spec dspine: the head-write table its Drafter derives from the target's head at startup.
+    std::optional<TensorLayout> dspine_head_write;
 
     [[nodiscard]] std::size_t kv_payload_bytes() const noexcept {
         return full ? full->payload_bytes() : 0;
@@ -65,6 +67,8 @@ struct PersistentLayout {
     std::optional<TensorLayout> score_hidden;
     std::optional<TensorLayout> token_counts;
     std::optional<TensorLayout> sampling_config;
+    // Each lane's MTP proposal sampler (runtime::draft_sampling of its sampling_config).
+    std::optional<TensorLayout> draft_sampling_config;
     std::optional<TensorLayout> grammar_masks;
     // One per rank with LoRA adapters or control vectors; empty without.
     std::vector<SteeringRankLayout> steering;
@@ -137,6 +141,9 @@ struct SequencePlanningInputs {
     std::size_t cuda_graph_allowance_bytes = 0;
     bool causal_scoring    = false;
     bool structured_output = false;
+    // EngineOptions::gumbel_sampling: a sampling row's MTP proposals draw from the drafter's
+    // distribution at the keys of the columns they fill (runtime::draft_sampling).
+    bool gumbel_sampling   = false;
     int device             = 0;
     ContextCacheOptions context_cache;
     // Main KV pages that stay allocated for the life of the Engine (injected graft prefixes). The
@@ -179,6 +186,9 @@ struct SequencePlanImpl {
     bool use_cuda_graph    = true;
     bool causal_scoring    = false;
     bool structured_output = false;
+    // EngineOptions::gumbel_sampling: a sampling row's MTP proposals draw from the drafter's
+    // distribution at the keys of the columns they fill (runtime::draft_sampling).
+    bool gumbel_sampling   = false;
     int device             = 0;
     ContextCacheOptions context_cache;
     std::uint32_t steering_adapters = 0;
@@ -195,6 +205,15 @@ struct SequencePlanImpl {
 // The widest round a decode frame verifies: the draft window, or the copy window when wider.
 [[nodiscard]] inline std::uint32_t widest_verify_window(const SequencePlanImpl& plan) noexcept {
     return std::max(plan.draft_window, plan.ngram_draft_window);
+}
+
+// The widest proposal a masked drafter makes: its draft window, or above one request the copy
+// window when wider, since a copy round of several rows runs the drafter at the round's width
+// (execution/draft.cpp). A copy window past 15 holds one request, whose copy rounds skip it.
+[[nodiscard]] inline std::uint32_t masked_proposal_window(std::uint32_t draft_window,
+                                                          std::uint32_t ngram_draft_window,
+                                                          std::uint32_t max_concurrency) noexcept {
+    return max_concurrency > 1 ? std::max(draft_window, ngram_draft_window) : draft_window;
 }
 
 // The widest forward pass a pipeline stage boundary carries: prefill columns, or every lane's

@@ -11,9 +11,10 @@
 #include "runtime/engine/prefill_pacing.h"
 #include "artifact/reader.h"
 #include "artifact/formats.h"
-#include "core/paged_kv_cache.h"
+#include "core/paged_kv_view.h"
 #include "core/startup.h"
 #include "core/tensor_parallel.h"
+#include "core/wddm_budget.h"
 #include "models/qwen3_5/frontend/graft.h"
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/execution/expert_runtime.h"
@@ -248,11 +249,13 @@ std::vector<std::size_t> free_bytes_by_rank(const DeviceContext& device,
 }
 
 // Disk-tier pages are keyed by token digests, which say nothing about the weights that produced
-// them: each artifact, and each set of control vectors run with it, gets its own directory so one
-// model can never restore another's KV.
+// them: each artifact, each set of control vectors run with it and each DSpine drafter beside it
+// (whose ring every StateImage holds) gets its own directory so one model can never restore
+// another's KV or drafter state.
 EngineOptions artifact_scoped_disk_tier(const EngineOptions& options,
                                         const artifact::ArtifactId& artifact,
-                                        const std::string& control_vectors) {
+                                        const std::string& control_vectors,
+                                        const std::string& drafter) {
     EngineOptions scoped = options;
     if (scoped.context_cache.disk_kv_path.empty()) { return scoped; }
     std::string name = "artifact_";
@@ -262,6 +265,7 @@ EngineOptions artifact_scoped_disk_tier(const EngineOptions& options,
         name += hex;
     }
     if (!control_vectors.empty()) { name += "_control_" + control_vectors; }
+    if (!drafter.empty()) { name += "_dspine_" + drafter; }
     scoped.context_cache.disk_kv_path /= name;
     return scoped;
 }
@@ -361,10 +365,13 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         HybridPrefixCacheOptions& hybrid = cache.hybrid;
         // One resident snapshot per request lane keeps every live conversation's latest
         // endpoint restorable without PCIe traffic; one more slot stages taps and endpoints while
-        // their Host copies are written. Without a Host tier these slots are the only snapshot
-        // storage, so one more is kept for shared prefixes.
-        hybrid.device_snapshot_slots =
-            hybrid.device_snapshot_slots.value_or(concurrency + (host_tier ? 1U : 2U));
+        // their Host copies are written, and one more keeps a shared prefix or another
+        // conversation's snapshot. A Host tier smaller than the conversations it serves cannot
+        // stand in for that slot: its images would take the slabs their blocks need.
+        // The default yields to a KV capacity that would not fit beside it (kv_capacity.cpp).
+        hybrid.fit_device_snapshot_slots =
+            hybrid.fit_device_snapshot_slots || !hybrid.device_snapshot_slots.has_value();
+        hybrid.device_snapshot_slots = hybrid.device_snapshot_slots.value_or(concurrency + 2U);
         // Taps without a Host tier would evict other conversations' resident snapshots.
         hybrid.max_new_taps = hybrid.max_new_taps.value_or(host_tier ? 8U : 2U);
         // Ladder taps are realized on prefill chunk boundaries, so the ladder never refines below
@@ -700,8 +707,10 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
     // An automatic draft head is the artifact's optimized proposal head when it stores one: it
     // projects drafts onto a shortlist of the vocabulary instead of all of it.
     if (options.speculative.proposal_head == ProposalHead::Auto) {
+        // DSpine's refinement reads the whole head's logits, so it never takes a shortlist.
         const bool stored = options.purpose == EnginePurpose::Generation &&
                             options.speculative.backend != SpeculativeBackend::None &&
+                            options.speculative.backend != SpeculativeBackend::DSpine &&
                             reader.directory().component("text").proposal.has_value();
         options.speculative.proposal_head = stored ? ProposalHead::Optimized : ProposalHead::Full;
     }
@@ -719,7 +728,8 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
         split_sizing = models::qwen3_5::StageSizing{
             .kv_storage = options.kv_cache,
             .state_slots =
-                options.max_concurrency + options.context_cache.device_state_slots.value_or(0U),
+                options.max_concurrency + options.context_cache.device_state_slots.value_or(0U) +
+                models::stop_hold_slots(options.context_cache, options.max_concurrency),
             .kv_tokens         = std::uint64_t(options.max_context) * options.max_concurrency,
             .minimum_kv_tokens = options.max_context,
             .automatic_kv      = options.kv_capacity.mode == KvCapacityMode::Automatic,
@@ -734,7 +744,8 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
         const models::qwen3_5::StageSizing sizing{
             .kv_storage = options.kv_cache,
             .state_slots =
-                options.max_concurrency + options.context_cache.device_state_slots.value_or(0U),
+                options.max_concurrency + options.context_cache.device_state_slots.value_or(0U) +
+                models::stop_hold_slots(options.context_cache, options.max_concurrency),
             .automatic_kv      = options.kv_capacity.mode == KvCapacityMode::Automatic,
             .kv_headroom_bytes = options.kv_capacity.automatic_headroom_bytes};
         options.stage_layers = models::qwen3_5::default_stage_layers(
@@ -747,6 +758,17 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
     std::optional<StartupPhaseScope> planning;
     std::vector<std::size_t> free_by_rank;
     std::size_t overlay_window_bytes = 0;
+    std::uint32_t graft_main_pages   = 0;
+    const auto plan_sequences = [&] {
+        planner.emplace(models::qwen3_5::make_sequence_planner(
+            instance->parameters, device,
+            artifact_scoped_disk_tier(options, instance->model->info().artifact_id,
+                                      control_vectors_digest(instance->steering.get()),
+                                      instance->model->dspine() != nullptr
+                                          ? instance->model->dspine()->artifact_hex()
+                                          : std::string()),
+            graft_main_pages));
+    };
     for (int refits = 0;; ++refits) {
         StartupPhaseScope binding(options.startup_observer, StartupPhase::TargetPlan);
         auto plan = models::qwen3_5::plan_load(reader, models::load_options(options),
@@ -785,18 +807,14 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
             models::qwen3_5::prepare_vision_overlay(instance->parameters, device, options);
         // Each injected graft keeps its text KV pages for good; the pool grows by that many so a
         // request can still use all the capacity that was asked for.
-        std::uint32_t graft_main_pages = 0;
+        graft_main_pages = 0;
         for (const auto& graft : instance->frontend.grafts()) {
             if (graft.kind != models::qwen3_5::GraftKind::PrefillKV) {
                 const auto page_tokens = static_cast<std::uint32_t>(kPagedKVPageSize);
                 graft_main_pages += (graft.n_slots + page_tokens - 1U) / page_tokens;
             }
         }
-        planner.emplace(models::qwen3_5::make_sequence_planner(
-            instance->parameters, device,
-            artifact_scoped_disk_tier(options, instance->model->info().artifact_id,
-                                      control_vectors_digest(instance->steering.get())),
-            graft_main_pages));
+        plan_sequences();
         free_by_rank = free_bytes_by_rank(device, options.wddm_evictable_budget,
                                           instance->model->storage_stats().device_capacity_bytes);
         if (!automatic_split || refits == 2) { break; }
@@ -866,9 +884,56 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
                 context_cost_hardware_class(device.props.name, device.props.major, device.props.minor),
             .prefill_signature = signature},
         options.context_cost.preset_path);
-    auto resolution = resolve_kv_capacity(
-        options.kv_capacity, planner->capacity_curve(), free_by_rank.front(),
-        std::span<const std::size_t>(free_by_rank).subspan(1));
+    // A default count of hybrid snapshot slots that yields to the KV capacity is planned again
+    // with that many fewer slots, and the capacity resolved on that plan; arena alignment may
+    // leave it a little off the curve's estimate, so the smaller plan may yield further.
+    const auto resolve_capacity = [&] {
+        const auto extra_free = std::span<const std::size_t>(free_by_rank).subspan(1);
+        ContextCacheOptions& cache = options.context_cache;
+        // The catalog's stop-string hold images give way to the capacity asked for.
+        if (models::stop_hold_slots(cache, options.max_concurrency) != 0 &&
+            !kv_capacity_fits(options.kv_capacity, planner->capacity_curve(), free_by_rank.front(),
+                              extra_free)) {
+            cache.stop_hold_images = false;
+            plan_sequences();
+            publish_diagnostic(
+                options.diagnostic_observer, DiagnosticLevel::Info,
+                "stop-string hold images dropped to fit the %s KV capacity: a turn that a stop "
+                "string ends rounds after its match began resumes from the prompt",
+                options.kv_capacity.mode == KvCapacityMode::Explicit ? "requested"
+                                                                     : "--max-context window's");
+        }
+        const std::uint32_t from   = cache.device_state_slots.value_or(0U);
+        const std::size_t per_slot = planner->capacity_curve().bytes_per_state_slot;
+        for (;;) {
+            KvCapacityResolution fitted = resolve_kv_capacity(
+                options.kv_capacity, planner->capacity_curve(), free_by_rank.front(), extra_free);
+            const std::uint32_t slots = cache.device_state_slots.value_or(0U);
+            if (fitted.yielded_state_slots == 0) {
+                if (slots != from) {
+                    publish_diagnostic(
+                        options.diagnostic_observer, DiagnosticLevel::Info,
+                        "device snapshot slots %u -> %u to fit the %s KV capacity (%.1f MiB per "
+                        "slot; --device-snapshot-slots sets them)",
+                        from, slots,
+                        options.kv_capacity.mode == KvCapacityMode::Explicit
+                            ? "requested"
+                            : "--max-context window's",
+                        static_cast<double>(per_slot) / (1024.0 * 1024.0));
+                }
+                return fitted;
+            }
+            if (!cache.enabled || cache.mode != ContextCacheMode::Hybrid ||
+                slots <= fitted.yielded_state_slots) {
+                throw std::logic_error(
+                    "only default hybrid device snapshot slots yield to the KV capacity");
+            }
+            cache.device_state_slots           = slots - fitted.yielded_state_slots;
+            cache.hybrid.device_snapshot_slots = cache.device_state_slots;
+            plan_sequences();
+        }
+    };
+    auto resolution = resolve_capacity();
     std::unique_ptr<models::qwen3_5::execution::NativeExpertRuntime> experts;
     if (!instance->model->expert_sources().layers.empty()) {
         // Price startup with the real allocations before the KV plan is finalized: the delivery
@@ -900,10 +965,11 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
         }
         profile.record   = options.hybrid_experts.record_profile;
         profile.artifact = instance->model->info().artifact_id;
-        experts = std::make_unique<models::qwen3_5::execution::NativeExpertRuntime>(
+        experts          = std::make_unique<models::qwen3_5::execution::NativeExpertRuntime>(
             *instance->model, device, reserved, options.expert_cache_bytes, std::move(profile),
             models::qwen3_5::execution::NativeExpertCpu{options.hybrid_experts.dma_share,
-                                                        options.hybrid_experts.cpu_threads});
+                                                        options.hybrid_experts.cpu_threads},
+            ExpertDiskReads{options.hybrid_experts.mirror, options.hybrid_experts.direct});
         if (const std::string cpu = experts->cpu_description(); !cpu.empty()) {
             publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
                                "native experts: missing experts split between copies and %s (%s)",
@@ -912,9 +978,7 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
         }
         free_by_rank = free_bytes_by_rank(device, options.wddm_evictable_budget,
                                           instance->model->storage_stats().device_capacity_bytes);
-        resolution = resolve_kv_capacity(
-            options.kv_capacity, planner->capacity_curve(), free_by_rank.front(),
-            std::span<const std::size_t>(free_by_rank).subspan(1));
+        resolution = resolve_capacity();
     }
     auto sequence   = std::move(*planner).finalize(resolution.main_page_groups);
     if (sequence.device_reservation_bytes() != resolution.runtime_reservation_bytes ||

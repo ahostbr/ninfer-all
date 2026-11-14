@@ -1,12 +1,17 @@
 #include "core/expert_delivery.h"
 
-#include "core/arena.h"
 #include "core/cpu_spin_pool.h"
 #include "core/cuda_host_handshake.h"
 #include "core/cuda_host_handshake.cuh"
+#include "core/device.h"
+#include "core/device_buffer.h"
+#include "core/device_wait.h"
+#include "core/expert_direct.h"
+#include "core/expert_mirror.h"
 #include "core/expert_split.h"
 #include "core/file_read_queue.h"
 #include "core/growable_region.h"
+#include "core/pinned_memory.h"
 #include "core/vmm.h"
 
 #include <algorithm>
@@ -91,13 +96,12 @@ struct Storage {
                 }
                 std::size_t end = at + g;
                 while (end < growable.bytes() && growable.mapped(end, g)) { end += g; }
-                CUDA_CHECK(cudaMemset(static_cast<std::byte*>(p) + at, 0, end - at));
+                CUDA_CHECK(ninfer::fill_and_wait(static_cast<std::byte*>(p) + at, 0, end - at));
                 at = end;
             }
         } else {
-            CUDA_CHECK(cudaMemset(p, 0, bytes));
+            CUDA_CHECK(ninfer::fill_and_wait(p, 0, bytes));
         }
-        CUDA_CHECK(cudaStreamSynchronize(nullptr));
     }
     [[nodiscard]] std::uint64_t backing_bytes() const noexcept {
         return growable ? growable.mapped_bytes() : region ? region.reserved_bytes() : bytes;
@@ -382,8 +386,15 @@ struct ExpertDelivery::Impl {
     std::vector<QueuedFileRead> batch_reads;
     struct StagedCopy { std::byte* target; const std::uint8_t* source; std::size_t bytes; };
     std::vector<StagedCopy> batch_copies;
-    std::vector<std::ifstream> files;
+    std::vector<std::ifstream> files; // the artifact's, then a drive mirror's
     std::unique_ptr<FileReadQueue> read_queue;
+    std::size_t artifact_files = 0; // with a drive mirror, the artifact's file count
+    std::vector<QueuedFileRead> striped_reads;
+    // Direct reads (core/expert_direct.h): the window holds the two staging halves, then the round
+    // area of round_window bytes; a batch's reads go to direct_reads instead of batch_reads.
+    std::unique_ptr<DirectExpertWindow> direct;
+    std::vector<DirectRead> direct_reads;
+    std::uint64_t round_window = 0;
     std::atomic<bool> stopping{false};
     std::atomic<std::uint32_t> finished{0}; // the last request whose service, post work included, ended
     std::thread service;
@@ -484,14 +495,21 @@ struct ExpertDelivery::Impl {
             (options.cpu.product_bytes == 0 || !(options.cpu.share >= 0 && options.cpu.share <= 1))) {
             throw std::invalid_argument("expert delivery: a CPU share needs its products and a share in [0, 1]");
         }
-        std::uint64_t largest_expert = 0;
+        // The largest expert's bytes, and its file reads' direct covers.
+        std::uint64_t largest_expert = 0, largest_cover = 0;
         for (std::size_t index = 0; index < specs.size(); ++index) {
             auto& spec = specs[index];
             Layer layer;
             for (const auto& expert : spec.experts) {
-                std::uint64_t bytes = 0;
-                for (const auto& blob : expert) { bytes += blob.bytes; }
+                std::uint64_t bytes = 0, cover = 0;
+                for (const auto& blob : expert) {
+                    bytes += blob.bytes;
+                    for (const auto& extent : blob.extents) {
+                        cover += direct_cover(extent.offset, extent.bytes);
+                    }
+                }
                 largest_expert = std::max(largest_expert, bytes);
+                largest_cover  = std::max(largest_cover, cover);
             }
             layer.total.assign(spec.experts.size(), 0);
             layer.cpu = options.cpu.products != nullptr && options.cpu.products->supports(index);
@@ -564,15 +582,33 @@ struct ExpertDelivery::Impl {
         }
         if (disk) {
             half_bytes = aligned(std::max<std::uint64_t>(options.staging_bytes / 2, 256));
-            staging = std::make_unique<PinnedHostBuffer>(2 * half_bytes);
-            allocation.pinned_bytes += staging->size();
-            for (const auto& path : paths) {
+            const auto mirror = expert_mirror_files(paths, options.disk.mirror);
+            artifact_files    = mirror.empty() ? 0 : paths.size();
+            std::vector<std::filesystem::path> all = paths;
+            all.insert(all.end(), mirror.begin(), mirror.end());
+            for (const auto& path : all) {
                 files.emplace_back(path, std::ios::binary);
                 if (!files.back()) {
                     throw std::runtime_error("expert delivery: cannot open " + path.string());
                 }
             }
-            read_queue = FileReadQueue::open(paths, false, 16);
+            read_queue = FileReadQueue::open(all, false, 16);
+            // Direct reads fill halves of whole blocks and a round area that holds the largest
+            // expert's covers; host staging is then unused.
+            const std::uint64_t direct_half =
+                checked_add(half_bytes, kDirectBlock - 1) / kDirectBlock * kDirectBlock;
+            round_window = checked_add(std::max(kRoundFileBytes, largest_cover), kDirectBlock - 1) /
+                           kDirectBlock * kDirectBlock;
+            direct =
+                open_direct_window(options.disk, rank.device, all,
+                                   checked_add(2 * direct_half, round_window), "expert delivery");
+            if (direct) {
+                half_bytes = direct_half;
+                allocation.metadata_bytes += direct->bytes();
+            } else {
+                staging = std::make_unique<PinnedHostBuffer>(2 * half_bytes);
+                allocation.pinned_bytes += staging->size();
+            }
         }
         const std::uint64_t granule = options.suspendable ? vmm::granularity(rank.device) : 1;
         if (!granule) {
@@ -704,7 +740,7 @@ struct ExpertDelivery::Impl {
         }
         tier = std::make_unique<ExpertTier>(widths, layer_pools, options.tier);
         set_free();
-        if (disk) {
+        if (disk && !direct) {
             round_staging = std::make_unique<PinnedHostBuffer>(
                 std::size_t(std::max(kRoundFileBytes, largest_expert)));
             allocation.pinned_bytes += round_staging->size();
@@ -756,11 +792,11 @@ struct ExpertDelivery::Impl {
     ~Impl() {
         DeviceBinding bind(rank.device);
         // Keep the worker alive until the last graph's waits and consumers finish.
-        cudaStreamSynchronize(rank.stream);
+        ninfer::wait_for_stream(rank.stream);
         stopping.store(true, std::memory_order_release);
         if (service.joinable()) { service.join(); }
-        cudaStreamSynchronize(copies);
-        cudaStreamSynchronize(rounds);
+        ninfer::wait_for_stream(copies);
+        ninfer::wait_for_stream(rounds);
         for (auto event : copied) { cudaEventDestroy(event); }
         for (auto& layer : layers) {
             for (auto event : layer.uploaded) { if (event) { cudaEventDestroy(event); } }
@@ -1038,7 +1074,7 @@ struct ExpertDelivery::Impl {
             if (!layer.dirty) { continue; }
             const int u = layer.next_upload;
             layer.next_upload = 1 - u;
-            CUDA_CHECK(cudaEventSynchronize(layer.uploaded[u]));
+            CUDA_CHECK(ninfer::wait_for_event(layer.uploaded[u]));
             std::memcpy(layer.upload[u]->data(), layer.mirror->data(), layer.mirror->size());
             CUDA_CHECK(cudaMemcpyAsync(layer.tables.p, layer.upload[u]->data(), layer.mirror->size(),
                                        cudaMemcpyHostToDevice, copies));
@@ -1083,7 +1119,15 @@ struct ExpertDelivery::Impl {
 
     // Several reads share one bounded half. FileReadQueue can submit their extents together.
     // Its fallback reads the same ranges through the OS page cache.
+    // With a drive mirror, a read whose offset lies in an odd stripe goes to the mirror's copy.
     void read_now(std::span<const QueuedFileRead> reads) {
+        if (artifact_files != 0) {
+            striped_reads.assign(reads.begin(), reads.end());
+            for (auto& read : striped_reads) {
+                if (expert_mirror_copy(read.offset) == 1) { read.file += artifact_files; }
+            }
+            reads = striped_reads;
+        }
         if (read_queue) {
             read_queue->read(reads);
             return;
@@ -1098,22 +1142,66 @@ struct ExpertDelivery::Impl {
         }
     }
 
+    // The window file a direct read of `file` at `offset` goes to: with a drive mirror, the
+    // mirror's copy for an odd stripe, as read_now() picks.
+    [[nodiscard]] std::size_t window_file(std::size_t file, std::uint64_t offset) const noexcept {
+        return artifact_files != 0 && expert_mirror_copy(offset) == 1 ? file + artifact_files
+                                                                      : file;
+    }
+
+    [[nodiscard]] const std::uint8_t* in_window(std::uint64_t at) const noexcept {
+        return reinterpret_cast<const std::uint8_t*>(direct->data() + at);
+    }
+
     void flush_reads() {
-        if (batch_reads.empty()) { return; }
-        CUDA_CHECK(cudaEventSynchronize(copied[half]));
-        read_now(batch_reads);
+        if (batch_reads.empty() && direct_reads.empty()) { return; }
+        CUDA_CHECK(ninfer::wait_for_event(copied[half]));
+        if (direct) {
+            direct->read(direct_reads);
+        } else {
+            read_now(batch_reads);
+        }
         for (const auto& copy : batch_copies) {
             CUDA_CHECK(cudaMemcpyAsync(copy.target, copy.source, copy.bytes,
-                                       cudaMemcpyHostToDevice, copies));
+                                       direct ? cudaMemcpyDefault : cudaMemcpyHostToDevice,
+                                       copies));
         }
         CUDA_CHECK(cudaEventRecord(copied[half], copies));
         batch_reads.clear();
+        direct_reads.clear();
         batch_copies.clear();
         staging_cursor = 0;
         half = 1 - half;
     }
 
+    // Direct reads: each extent's cover in the half being filled (whole blocks, so the cursor
+    // stays on a block and a half's room always exceeds a lead), its copy out of the window.
+    void stage_direct(const Piece& piece, ExpertDeliveryStats& delta) {
+        std::uint64_t destination = 0;
+        for (const auto& extent : piece.extents) {
+            std::uint64_t within = 0;
+            while (within < extent.bytes) {
+                if (staging_cursor == half_bytes) { flush_reads(); }
+                const std::uint64_t offset = extent.offset + within;
+                const std::uint64_t at     = half * half_bytes + staging_cursor;
+                const auto bytes = std::min(extent.bytes - within,
+                                            half_bytes - staging_cursor - direct_lead(offset));
+                direct_reads.push_back({window_file(extent.file, offset), offset, bytes, at});
+                batch_copies.push_back({piece.target + destination,
+                                        in_window(at + direct_lead(offset)), std::size_t(bytes)});
+                staging_cursor += direct_cover(offset, bytes);
+                destination += bytes;
+                within += bytes;
+                delta.read_bytes += bytes;
+            }
+        }
+    }
+
     void stage(const Piece& piece, ExpertDeliveryStats& delta) {
+        if (direct) {
+            stage_direct(piece, delta);
+            return;
+        }
         std::uint64_t destination = 0;
         for (const auto& extent : piece.extents) {
             std::uint64_t within = 0;
@@ -1284,24 +1372,52 @@ struct ExpertDelivery::Impl {
         std::uint64_t staged = 0;
         std::size_t issued = 0;
         std::vector<QueuedFileRead> reads;
+        std::vector<DirectRead> window_reads;
         std::vector<StagedCopy> staged_copies;
         auto* staging = round_staging ? static_cast<std::uint8_t*>(round_staging->data()) : nullptr;
+        // Direct reads: the round area follows the window's two halves; `staged` counts covers.
+        const std::uint64_t round_base = 2 * half_bytes;
+        const std::uint64_t room = direct ? round_window : (staging ? round_staging->size() : 0);
         for (; issued < queued.size() && issued < kRoundExperts; ++issued) {
             const auto& d = queued[issued];
             const auto& expert = layers[d.layer].source.experts[std::size_t(d.expert)];
             std::uint64_t file_bytes = 0;
-            for (const auto& blob : expert) { file_bytes += blob.pinned ? 0 : blob.bytes; }
+            for (const auto& blob : expert) {
+                if (blob.pinned) { continue; }
+                if (!direct) {
+                    file_bytes += blob.bytes;
+                    continue;
+                }
+                for (const auto& extent : blob.extents) {
+                    file_bytes += direct_cover(extent.offset, extent.bytes);
+                }
+            }
             if (file_bytes != 0 && staged != 0 &&
-                (staged + file_bytes > round_staging->size() || staged + file_bytes > kRoundFileBytes)) {
+                (staged + file_bytes > room || staged + file_bytes > kRoundFileBytes)) {
                 break;
             }
-            if (file_bytes != 0 && staged == 0) { CUDA_CHECK(cudaEventSynchronize(round_staged)); }
+            if (file_bytes != 0 && staged == 0) {
+                CUDA_CHECK(ninfer::wait_for_event(round_staged));
+            }
             for (std::size_t b = 0; b < expert.size(); ++b) {
                 const auto& blob = expert[b];
                 std::byte* target = slot_blob(d.slot, b);
                 if (blob.pinned) {
                     CUDA_CHECK(cudaMemcpyAsync(target, blob.pinned, blob.bytes, cudaMemcpyHostToDevice,
                                                rounds));
+                } else if (direct) {
+                    std::uint64_t at = 0;
+                    for (const auto& extent : blob.extents) {
+                        const std::uint64_t window_at = round_base + staged;
+                        window_reads.push_back({window_file(extent.file, extent.offset),
+                                                extent.offset, extent.bytes, window_at});
+                        staged_copies.push_back({target + at,
+                                                 in_window(window_at + direct_lead(extent.offset)),
+                                                 std::size_t(extent.bytes)});
+                        staged += direct_cover(extent.offset, extent.bytes);
+                        at += extent.bytes;
+                    }
+                    delta.read_bytes += blob.bytes;
                 } else {
                     std::uint64_t at = 0;
                     for (const auto& extent : blob.extents) {
@@ -1321,11 +1437,16 @@ struct ExpertDelivery::Impl {
                 delta.copied_bytes += blob.bytes;
             }
         }
-        if (!reads.empty()) {
-            read_now(reads);
+        if (!reads.empty() || !window_reads.empty()) {
+            if (direct) {
+                direct->read(window_reads);
+            } else {
+                read_now(reads);
+            }
             for (const auto& copy : staged_copies) {
                 CUDA_CHECK(cudaMemcpyAsync(copy.target, copy.source, copy.bytes,
-                                           cudaMemcpyHostToDevice, rounds));
+                                           direct ? cudaMemcpyDefault : cudaMemcpyHostToDevice,
+                                           rounds));
             }
             CUDA_CHECK(cudaEventRecord(round_staged, rounds));
         }
@@ -1676,7 +1797,7 @@ struct ExpertDelivery::Impl {
             ranges_dirty = false;
         }
         upload_tables();
-        CUDA_CHECK(cudaStreamSynchronize(copies));
+        CUDA_CHECK(ninfer::wait_for_stream(copies));
         if (timed) {
             float milliseconds = 0;
             CUDA_CHECK(cudaEventElapsedTime(&milliseconds, copies_begun, copies_done));
@@ -1774,7 +1895,7 @@ struct ExpertDelivery::Impl {
                 *static_cast<std::int32_t*>(host_flag->data()) = 0;
             }
         }
-        cudaStreamSynchronize(copies);
+        ninfer::wait_for_stream(copies);
     }
 
     void run() {
@@ -1817,13 +1938,13 @@ struct ExpertDelivery::Impl {
     // post work included, and its copies are done.
     void quiesce() {
         DeviceBinding bind(rank.device);
-        CUDA_CHECK(cudaStreamSynchronize(rank.stream));
+        CUDA_CHECK(ninfer::wait_for_stream(rank.stream));
         while (const auto request = handshake->pending(finished.load(std::memory_order_acquire))) {
             (void)request;
             std::this_thread::yield();
         }
-        CUDA_CHECK(cudaStreamSynchronize(copies));
-        CUDA_CHECK(cudaStreamSynchronize(rounds));
+        CUDA_CHECK(ninfer::wait_for_stream(copies));
+        CUDA_CHECK(ninfer::wait_for_stream(rounds));
     }
 
     // An elastic cache, quiesced and locked: gives back at least `bytes` of whole granules, or
@@ -1886,7 +2007,7 @@ struct ExpertDelivery::Impl {
             pool.count = keep[p];
         }
         upload_tables();
-        CUDA_CHECK(cudaStreamSynchronize(copies));
+        CUDA_CHECK(ninfer::wait_for_stream(copies));
         cache.bytes = 0;
         for (const auto& pool : pools) {
             const std::uint64_t end = std::uint64_t(pool.count) * pool.slot_bytes;
@@ -1937,7 +2058,7 @@ struct ExpertDelivery::Impl {
             std::sort(pool.free.begin(), pool.free.end(), std::greater<>());
             pool.count = want;
         }
-        CUDA_CHECK(cudaStreamSynchronize(copies));
+        CUDA_CHECK(ninfer::wait_for_stream(copies));
         cache.bytes = 0;
         for (const auto& pool : pools) { cache.bytes += backing(pool, pool.count); }
         set_free();
@@ -2006,6 +2127,15 @@ void ExpertDelivery::await(cudaStream_t stream) {
 }
 const void* const* ExpertDelivery::tables(std::size_t layer) const {
     return static_cast<const void* const*>(impl_->layers.at(layer).tables.p);
+}
+bool ExpertDelivery::alias_aligned(std::size_t layer, std::size_t alias,
+                                   std::uint64_t bytes) const {
+    if (bytes == 0 || bytes > 256 || (bytes & (bytes - 1)) != 0) {
+        throw std::invalid_argument("expert delivery: an alignment is a power of two up to 256");
+    }
+    const auto& l = impl_->layers.at(layer);
+    const auto& a = l.source.aliases.at(alias);
+    return a.offset % bytes == 0 && l.stride.at(a.blob) % bytes == 0;
 }
 void ExpertDelivery::check() const { impl_->check(); }
 void ExpertDelivery::drain() {
@@ -2155,7 +2285,7 @@ void ExpertDelivery::prime(const std::vector<std::vector<std::uint64_t>>* profil
     }
     p.flush_pieces(delta);
     p.upload_tables();
-    CUDA_CHECK(cudaStreamSynchronize(p.copies));
+    CUDA_CHECK(ninfer::wait_for_stream(p.copies));
     p.set_free();
     p.counters = p.counters + delta;
 }

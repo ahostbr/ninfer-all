@@ -5,11 +5,12 @@
 #include "models/qwen3_5/program/graph_execution.h"
 #include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "core/nvtx.h"
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ninfer/ops/logprob_topk.h"
 #include "ninfer/ops/prepare_ragged_prefix.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/scatter.h"
+#include "runtime/contract/draft_sampling.h"
 
 #include <algorithm>
 #include <array>
@@ -164,6 +165,7 @@ void ProgramImpl::update_sampling(SequenceHandle handle,
     host.min_p                = sampling.min_p;
     host.presence_penalty     = sampling.presence_penalty;
     host.frequency_penalty    = sampling.frequency_penalty;
+    host.draw = sampling.gumbel ? ops::kSampleDrawGumbel : ops::kSampleDrawInverseCdf;
     // Penalties that start now count only the tokens sampled from here on.
     if ((host.presence_penalty != 0.0F || host.frequency_penalty != 0.0F) &&
         host.token_counts == nullptr) {
@@ -172,9 +174,21 @@ void ProgramImpl::update_sampling(SequenceHandle handle,
         CUDA_CHECK(cudaMemsetAsync(counts.data, 0, counts.bytes(), device.stream));
         host.token_counts = static_cast<std::int32_t*>(counts.data);
     }
+    upload_sampling(lane, request);
+}
+
+void ProgramImpl::upload_sampling(std::uint32_t lane, RequestControl& request) {
     Tensor config_lane = sampling_config.slice(1, static_cast<std::int32_t>(lane), 1);
-    CUDA_CHECK(cudaMemcpyAsync(config_lane.data, &host, sizeof(host), cudaMemcpyHostToDevice,
+    CUDA_CHECK(cudaMemcpyAsync(config_lane.data, &request.sampling_host,
+                               sizeof(request.sampling_host), cudaMemcpyHostToDevice,
                                device.stream));
+    request.draft_sampling_host = runtime::draft_sampling(request.sampling_host);
+    if (draft_sampling_config.data != nullptr) {
+        Tensor draft_lane = draft_sampling_config.slice(1, static_cast<std::int32_t>(lane), 1);
+        CUDA_CHECK(cudaMemcpyAsync(draft_lane.data, &request.draft_sampling_host,
+                                   sizeof(request.draft_sampling_host), cudaMemcpyHostToDevice,
+                                   device.stream));
+    }
 }
 
 void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& request,
@@ -194,20 +208,18 @@ void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& requ
         .enabled               = speculative_backend != SpeculativeBackend::None,
         .draft_window          = draft_window,
         .accepted_per_position = std::vector<std::uint64_t>(widest_verify_window(), 0),
-        .adaptive              = mtp_controller.has_value(),
-        .rounds_per_window =
-            std::vector<std::uint64_t>(mtp_controller.has_value() ? draft_window : 0U, 0),
+        .adaptive              = mtp_controller.has_value() || masked_controller.has_value(),
+        .rounds_per_window     = std::vector<std::uint64_t>(
+            mtp_controller.has_value() || masked_controller.has_value() ? draft_window : 0U, 0),
     };
     request.mtp_signal.reset();
+    if (masked_controller) { request.masked_signal = masked_controller->pooled(); }
     const bool penalties = request.sampling_host.presence_penalty != 0.0F ||
                            request.sampling_host.frequency_penalty != 0.0F;
     if (penalties) { CUDA_CHECK(cudaMemsetAsync(counts.data, 0, counts.bytes(), device.stream)); }
     request.sampling_host.token_counts =
         penalties ? static_cast<std::int32_t*>(counts.data) : nullptr;
-    Tensor config_lane = sampling_config.slice(1, static_cast<std::int32_t>(sequence.lane), 1);
-    CUDA_CHECK(cudaMemcpyAsync(config_lane.data, &request.sampling_host,
-                               sizeof(request.sampling_host), cudaMemcpyHostToDevice,
-                               device.stream));
+    upload_sampling(sequence.lane, request);
 }
 
 void ProgramImpl::arm_logprobs(bool any) {
@@ -416,10 +428,12 @@ void ProgramImpl::record_ngram_round(RequestControl& request, const NgramPropose
 
 void ProgramImpl::enqueue_dflash_context_append(std::span<const std::uint32_t> lanes,
                                                 std::span<const std::uint32_t> starts,
-                                                std::span<const std::uint32_t> counts) {
+                                                std::span<const std::uint32_t> counts,
+                                                std::span<const std::int32_t> destinations) {
     if (!is_masked_draft_backend(speculative_backend) || !dflash || !io.dflash_decode ||
         lanes.empty() || lanes.size() > max_concurrency || starts.size() != lanes.size() ||
-        counts.size() != lanes.size()) {
+        counts.size() != lanes.size() ||
+        (!destinations.empty() && destinations.size() != lanes.size())) {
         throw std::logic_error("DFlash context append has invalid membership");
     }
 
@@ -454,7 +468,8 @@ void ProgramImpl::enqueue_dflash_context_append(std::span<const std::uint32_t> l
         dflash_host_ingress->active_lanes[row]            = static_cast<std::int32_t>(lane);
         const StateImageSelectors selectors               = state_selectors(sequence);
         dflash_host_ingress->state_source_slots[row]      = selectors.source;
-        dflash_host_ingress->state_destination_slots[row] = selectors.destination;
+        dflash_host_ingress->state_destination_slots[row] =
+            destinations.empty() ? selectors.destination : destinations[row];
         // Context append writes only the draft caches. Target execution owns Main KV
         // coverage, including any uncommitted suffix that survives until the round is settled.
         // DFlash2 has only fixed cyclic state; DFlash also grows its Full backend KV here.
@@ -480,9 +495,11 @@ void ProgramImpl::enqueue_dflash_context_append(std::span<const std::uint32_t> l
     Tensor device_counts            = frame.append_counts.slice(0, 0, batch);
 
     work.reset();
-    Tensor features =
-        work.alloc(DType::BF16, {dimension(parameters.draft->feature_projection.weight.k),
-                                 static_cast<std::int32_t>(widest_count), batch});
+    const auto& draft_config = *parameters.model.config().draft;
+    Tensor features          = work.alloc(
+        DType::BF16, {dimension(parameters.model.config().text.hidden_size *
+                                std::uint64_t(draft_config.target_layer_ids.size())),
+                      static_cast<std::int32_t>(widest_count), batch});
     ops::prepare_ragged_prefix(dflash->pending_features, active_lane_tensor, device_starts,
                                device_ends, features, positions, device_counts, device.stream);
 
@@ -557,12 +574,16 @@ void ProgramImpl::observe_masks(std::span<const std::uint32_t> lanes) {
     }
 }
 
-void ProgramImpl::validate_licensed_tokens(std::span<const TokenId> tokens) const {
-    for (const TokenId token : tokens) {
-        if (token < 0 || token >= dimension(parameters.model.resources().public_token_count)) {
-            throw std::runtime_error("target returned a token outside the public token domain");
+bool ProgramImpl::license_tokens(std::span<TokenId> tokens) const noexcept {
+    const auto limit = dimension(parameters.model.resources().public_token_count);
+    bool inside      = true;
+    for (TokenId& token : tokens) {
+        if (token < 0 || token >= limit) {
+            token  = 0;
+            inside = false;
         }
     }
+    return inside;
 }
 
 runtime::BatchedGeneratedRound
@@ -680,8 +701,8 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             RequestControl& request    = requests[lanes[row]];
             const std::uint32_t base_E = sequence.execution_frontier;
             const std::uint32_t base_S = sequence.ledger_frontier;
-            const TokenId token        = ordinary_host_egress->sampled_tokens[row];
-            validate_licensed_tokens(std::span<const TokenId>(&token, 1));
+            TokenId& token             = ordinary_host_egress->sampled_tokens[row];
+            if (!license_tokens(std::span<TokenId>(&token, 1))) { numerical_faults[row] = true; }
             // A round gathers every row when any of its requests asks; a row keeps a record only
             // for a request that asked.
             if (request.logprobs) {
@@ -851,6 +872,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             mtp_host_ingress->state_destination_slots[row] = selectors.destination;
             mtp_host_ingress->rope_deltas[row]             = sequence.rope_delta;
             mtp_host_ingress->sampling[row]                = request.sampling_host;
+            mtp_host_ingress->draft_sampling[row]          = request.draft_sampling_host;
             logprobs = logprobs || request.logprobs;
             if (request.grammar) {
                 if (auto ready = take_next_mask(request, sequence, extent)) {
@@ -879,6 +901,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             *mtp_host_ingress,
             *mtp_host_egress,
             state_images->continuation_hidden_store()};
+        schedule_state.sampled_drafts = gumbel_sampling;
 
         mark_workspace_usage(workspace_plan.mtp_round);
         execution::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
@@ -911,10 +934,9 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                     capacity) {
                 throw std::runtime_error("MTP batch returned invalid row metadata");
             }
-            const std::span<const TokenId> row_tokens(mtp_host_egress->licensed_tokens.data() +
-                                                          row * width,
-                                                      static_cast<std::size_t>(count_i));
-            validate_licensed_tokens(row_tokens);
+            const std::span<TokenId> row_tokens(mtp_host_egress->licensed_tokens.data() + row * width,
+                                                static_cast<std::size_t>(count_i));
+            if (!license_tokens(row_tokens)) { numerical_faults[row] = true; }
             // The gather row of verification column c in batch row r is c + r * width.
             for (std::size_t c = 0; request.logprobs && c < row_tokens.size(); ++c) {
                 round_logprobs[row * width + c] =
@@ -1003,11 +1025,31 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
     // viewed at that width. At batch>1 the drafter also runs and the copy payload overlays it on
     // the device, so a row without a copy keeps its neural proposal; at batch one the copy alone
     // is verified.
+    // Without a copy, adaptive MTP verifies the width its controller selects (the draft window or
+    // its half) and the drafter drafts at that width.
     const std::vector<NgramProposer::Match> matches = propose_ngram(lanes, budgets);
     const bool copy_round =
         std::any_of(matches.begin(), matches.end(),
                     [](const NgramProposer::Match& match) { return !match.tokens.empty(); });
-    const std::uint32_t verify_drafts = copy_round ? ngram_draft_window : draft_window;
+    std::uint32_t neural_drafts = draft_window;
+    if (masked_controller && !copy_round &&
+        std::all_of(lanes.begin(), lanes.end(),
+                    [this](std::uint32_t lane) { return lane < max_concurrency; })) {
+        std::array<const MaskedWidthSignal*, kMaximumConcurrency> signals{};
+        std::array<std::uint32_t, kMaximumConcurrency> room{};
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            const SequenceState& sequence = active_sequence(lanes[row]);
+            signals[row]                  = &requests[lanes[row]].masked_signal;
+            room[row] = std::min(budgets[row].generated_tokens_remaining,
+                                 capacity > sequence.execution_frontier
+                                     ? capacity - sequence.execution_frontier
+                                     : 0U);
+        }
+        neural_drafts = masked_controller->select(
+            std::span<const MaskedWidthSignal* const>(signals.data(), lanes.size()),
+            std::span<const std::uint32_t>(room.data(), lanes.size()));
+    }
+    const std::uint32_t verify_drafts = copy_round ? ngram_draft_window : neural_drafts;
     const bool drafter_runs           = !copy_round || lanes.size() > 1;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         dflash_host_ingress->copy_rows[row] = !matches[row].tokens.empty() ? 1 : 0;
@@ -1076,9 +1118,9 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         auto target_envelope                 = target_envelope_for(maximum_frontier);
         if (use_cuda_graph) {
             DecodeGraphFamily& family   = copy_round ? ngram_graphs : dflash_graphs;
-            DecodeGraphProfile& profile = select_graph_profile(
-                family, static_cast<std::uint32_t>(lanes.size()), maximum_frontier, "DFlash batch",
-                copy_round ? verify_drafts : 0U);
+            DecodeGraphProfile& profile =
+                select_graph_profile(family, static_cast<std::uint32_t>(lanes.size()),
+                                     maximum_frontier, "DFlash batch", verify_drafts);
             executable = &install_graph_profile(family, profile, "DFlash batch");
             envelopes =
                 dflash_envelopes(profile.min_execution_frontier, profile.max_execution_frontier);
@@ -1096,7 +1138,7 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             const std::uint32_t proposed =
                 !matches[row].tokens.empty()
                     ? static_cast<std::uint32_t>(matches[row].tokens.size())
-                    : (drafter_runs ? draft_window : 0U);
+                    : (drafter_runs ? neural_drafts : 0U);
             const std::uint32_t extent = std::min(
                 {proposed, max_by_budget, capacity - frontier - 1U, speculative_extent(request)});
             dflash_host_ingress->anchors[row] = sequence.ledger.back();
@@ -1105,7 +1147,7 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             dflash_host_ingress->context_frontiers[row] =
                 checked_i32(sequence.dflash_context_frontier, "DFlash context frontier");
             dflash_host_ingress->proposal_valid_columns[row] =
-                static_cast<std::int32_t>(draft_window + 1U);
+                static_cast<std::int32_t>(neural_drafts + 1U);
             dflash_host_ingress->proposal_extents[row]       = static_cast<std::int32_t>(extent);
             dflash_host_ingress->target_valid_columns[row] = static_cast<std::int32_t>(extent + 1U);
             for (std::uint32_t column = 0; column < width; ++column) {
@@ -1156,7 +1198,7 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             *dflash_host_egress,
             state_images->continuation_hidden_store()};
         schedule_state.ngram                  = copy_round;
-        schedule_state.neural_proposal_drafts = draft_window;
+        schedule_state.neural_proposal_drafts = neural_drafts;
 
         mark_workspace_usage(workspace_plan.dflash_round);
         execution::dflash_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
@@ -1189,10 +1231,9 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                     capacity) {
                 throw std::runtime_error("DFlash batch returned invalid row metadata");
             }
-            const std::span<const TokenId> row_tokens(dflash_host_egress->licensed_tokens.data() +
-                                                          row * width,
-                                                      static_cast<std::size_t>(count_i));
-            validate_licensed_tokens(row_tokens);
+            const std::span<TokenId> row_tokens(dflash_host_egress->licensed_tokens.data() + row * width,
+                                                static_cast<std::size_t>(count_i));
+            if (!license_tokens(row_tokens)) { numerical_faults[row] = true; }
             for (std::size_t c = 0; request.logprobs && c < row_tokens.size(); ++c) {
                 round_logprobs[row * width + c] =
                     fetched_logprob(static_cast<std::int32_t>(row * width + c), row_tokens[c]);
@@ -1208,9 +1249,20 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                         1;
                 }
             }
+            // The adaptive controller measures the neural drafter only.
+            if (masked_controller && !copy_round) {
+                request.speculative_stats.rounds_per_window[verify_drafts - 1U] += 1;
+                if (masked_controller->transitioned()) {
+                    request.speculative_stats.window_transitions += 1;
+                }
+            }
             if (!matches[row].tokens.empty()) {
                 record_ngram_round(request, matches[row], extent,
                                    static_cast<std::uint32_t>(accepted_i));
+            } else if (masked_controller && extent == verify_drafts) {
+                // A round its budget cut short says nothing of the width's survival.
+                masked_controller->observe_round(request.masked_signal, verify_drafts,
+                                                 static_cast<std::uint32_t>(accepted_i));
             }
             sequence.dflash_context_frontier = base_E;
             request.pending                  = PendingCandidate{
@@ -1223,6 +1275,10 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             };
             request.lifecycle = Lifecycle::Pending;
             request.timings.decode_seconds += seconds;
+        }
+        if (masked_controller && !copy_round) {
+            masked_controller->observe_execution(static_cast<std::uint32_t>(lanes.size()),
+                                                 verify_drafts, seconds);
         }
         return runtime::BatchedGeneratedRound{
             .tokens     = std::span<const TokenId>(dflash_host_egress->licensed_tokens.data(),
@@ -1252,6 +1308,7 @@ runtime::BatchedGeneratedRound
 ProgramImpl::decode_raw(std::span<const std::uint32_t> lanes,
                         std::span<const runtime::RoundBudget> budgets,
                         runtime::ExecutionTiming* failed_timing) {
+    numerical_faults.fill(false);
     if (speculative_backend == SpeculativeBackend::None) {
         return decode_ordinary_batch(lanes, budgets, failed_timing);
     }
@@ -1264,7 +1321,7 @@ ProgramImpl::decode_raw(std::span<const std::uint32_t> lanes,
 runtime::ExecutionTiming ProgramImpl::resolve_non_speculative_pending(
     SequenceState& sequence, RequestControl& request, std::uint32_t accepted_tokens, bool terminal,
     std::optional<std::uint32_t> prefix_execution_split_after,
-    runtime::ExecutionTiming* failed_timing) {
+    std::optional<std::uint32_t> stop_hold_after, runtime::ExecutionTiming* failed_timing) {
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Post, failed_timing);
     if (request.lifecycle != Lifecycle::Pending) {
         throw std::logic_error("pending resolution requires a pending generated round");
@@ -1320,6 +1377,12 @@ runtime::ExecutionTiming ProgramImpl::resolve_non_speculative_pending(
         settle_state_fork(sequence);
     }
     trim_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
+    // The round's one token begins a stop string's hold: the state has not read it yet.
+    if (stop_hold_after) {
+        timing.resume_submit();
+        stop_hold_copy(sequence);
+        timing.resume_post();
+    }
     if (terminal) { sequence.mtp_draft_count = 0; }
     request.lifecycle = terminal ? Lifecycle::Finishable : Lifecycle::Active;
     request.pending   = {};

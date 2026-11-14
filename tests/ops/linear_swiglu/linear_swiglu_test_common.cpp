@@ -4,6 +4,7 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/decode_graph.h"
+#include "core/qtype.h"
 #include "ninfer/ops/linear_swiglu.h"
 #include "ops/linear/nvfp4/nvfp4_int8_grouped_host.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
@@ -258,6 +259,9 @@ void validate_profile(const Profile& profile) {
          profile.activation_compute != ActivationCompute::A8IntDecode)) {
         throw std::invalid_argument("linear_swiglu test: invalid activation-compute profile");
     }
+    if (profile.valid_scale_words && !nvfp4) {
+        throw std::invalid_argument("linear_swiglu test: valid scale words are an NVFP4 fixture");
+    }
 }
 
 } // namespace
@@ -287,8 +291,9 @@ int run_profile(std::string_view label, const Profile& profile,
 
     quantized_weight::PatternedWeightOptions weight_options;
     if (profile.qtype == QType::NVFP4) {
-        weight_options.weight_scale_divisor = 0.125F;
+        weight_options.weight_scale_divisor = profile.valid_scale_words ? 0.1F : 0.125F;
         weight_options.input_scale_divisor  = 3.5F;
+        weight_options.wide_scale_range     = profile.valid_scale_words;
     }
     quantized_weight::PackedWeight host_weight = quantized_weight::make_patterned_weight(
         profile.qtype, profile.gate_up_rows, profile.input_rows, profile.seed, weight_options);

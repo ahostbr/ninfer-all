@@ -1,5 +1,7 @@
 #include "options.h"
 #include "product/kv_resident_options.h"
+#include "product/launch_config/launch_config.h"
+#include "product/option_layers.h"
 #include "product/ngram_table_options.h"
 #include "product/hybrid_expert_options.h"
 #include "product/post_thinking_options.h"
@@ -125,6 +127,8 @@ KvCacheStorage parse_kv_cache(std::string_view text) {
     if (text == "rk2v4-e8") { return KvCacheStorage::RotatedE8RootKeyInt4Value; }
     if (text == "nvfp4") { return KvCacheStorage::Nvfp4Group16; }
     if (text == "k8v4") { return KvCacheStorage::Fp8KeyNvfp4Value; }
+    // bf16p: BF16 rows packed losslessly into 392 bytes (bf16p_codec.cuh). Opt-in.
+    if (text == "bf16p") { return KvCacheStorage::Bf16Packed; }
     throw std::invalid_argument("invalid kv-dtype: " + std::string(text));
 }
 
@@ -132,6 +136,18 @@ KvCapacityPolicy parse_kv_capacity(const char* text) {
     if (std::string_view(text) == "auto") { return KvCapacityPolicy::automatic(); }
     return KvCapacityPolicy::explicit_capacity(parse_u32(text, "kv-capacity"));
 }
+
+// Spellings of one setting: a later layer's option replaces an earlier layer's other spelling.
+constexpr product::SettingAlias kSettingAliases[] = {
+    {"device", "devices"},
+    {"vram-headroom-mib", "kv-headroom-mib"},
+    {"full-draft-head", "lm-head-draft"},
+    {"json-schema", "json"},
+    {"vision-offload", "vision-residency"},
+    {"vision-cpu", "vision-residency"},
+    {"lora-scaled", "lora"},
+    {"control-vector-scaled", "control-vector"},
+};
 
 ReasoningEffort parse_reasoning_effort(std::string_view text) {
     if (text == "none") { return ReasoningEffort::None; }
@@ -154,6 +170,11 @@ std::string usage_text(const char* argv0) {
            "to stderr.\n"
            "  --help, -h                    show this help and exit\n"
            "  --version                     print the build version and exit\n"
+           "  --config FILE                 read options from a launch configuration file\n"
+           "                                (`key = value` lines, docs/cli.md); repeatable,\n"
+           "                                each later file and the command line override\n"
+           "                                earlier ones; a file's `model` names the artifact\n"
+           "  Every switch below also takes a --no- form, which turns it off.\n"
            "\n"
            "INPUT\n"
            "  --prompt TEXT                 one user message\n"
@@ -167,10 +188,13 @@ std::string usage_text(const char* argv0) {
            "  --max-context N               context ceiling in tokens (default 2048)\n"
            "  --prefill-chunk N             prefill chunk in tokens, a multiple of 128\n"
            "                                (default 1024; 4096 for native MoE experts\n"
-           "                                in host memory or files); with an int8 or\n"
-           "                                rk* KV cache a Qwen3.5-core model runs the\n"
-           "                                nearby multiple of 128 that best fills the\n"
-           "                                GPU's attention waves (up to 256 more)\n"
+           "                                in host memory or files; 2048 for\n"
+           "                                DeepSeek-V4.1); with an int8 or rk* KV cache\n"
+           "                                a Qwen3.5-core model runs the nearby multiple\n"
+           "                                of 128 that best fills the GPU's attention\n"
+           "                                waves (up to 256 more)\n" +
+           std::string(ninfer::product::kPrefillTailHelp) +
+           std::string(ninfer::product::kIq1mExpertsHelp) +
            "  --max-new N                   cap on generated tokens (default 128)\n"
            "  --device N                    CUDA device index (default 0)\n"
            "  --devices A,B,...             one pipeline stage per listed GPU, each owning\n"
@@ -215,21 +239,37 @@ std::string usage_text(const char* argv0) {
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            "); alias --vram-headroom-mib\n"
            "  --kv-dtype T                  bf16 (default), int8, fp8, rk8v4, rk4v4,\n"
-           "                                rk4v4-e8, rk2v4-e8, nvfp4 or k8v4\n" +
+           "                                rk4v4-e8, rk2v4-e8, nvfp4, k8v4 or bf16p\n" +
            std::string(product::kKvResidentHelp) +
            "\n"
            "SPECULATIVE DECODING\n"
-           "  --spec none|mtp|dflash|dflash2|dspark\n"
-           "                                speculative decoding backend (default: mtp with 3\n"
-           "                                drafts for Flash-Next host experts and Gemma 4 host\n"
-           "                                or disk experts whose artifact has the drafter, else\n"
-           "                                none; dspark: DeepSeek-V4.1's DSpark drafter)\n"
-           "  --draft-tokens N              drafts per round, 1..15 (dspark: up to its block\n"
-           "                                of 5, the default)\n"
-           "  --draft-min-p P               Flash-Next MTP confidence floor, 0..1 (default 0\n"
-           "                                with --spec mtp, 0.5 when the engine chooses MTP)\n"
+           "  --spec none|mtp|dflash|dflash2|dspark|dspine\n"
+           "                                speculative decoding backend (default: dflash2\n"
+           "                                with 4 drafts for Flash-Next host experts on one\n"
+           "                                device whose artifact has that drafter, mtp with\n"
+           "                                3 for those over pipeline stages or with only the\n"
+           "                                MTP block, for Edge0 device experts serving one\n"
+           "                                request at a time and for Gemma 4 host or disk\n"
+           "                                experts whose artifact has the drafter, else\n"
+           "                                none; dspark: DeepSeek-V4.1's DSpark drafter;\n"
+           "                                dspine: the DSpine drafter --draft-model names)\n"
+           "  --draft-model PATH            dspine: the DSpine drafter artifact, trained for\n"
+           "                                this model\n"
+           "  --draft-tokens N              drafts per round, 1..15 (Flash-Next dflash2: 1..7;\n"
+           "                                dspark: up to its block of 5, the default; dspine:\n"
+           "                                up to its block less one, 7 for Gemma 4, Flint\n"
+           "                                and DeepSeek-V4.1)\n"
+           "  --draft-min-p P               confidence floor 0..1 of Flash-Next MTP, DFlash2\n"
+           "                                or DSpine, and of DSpine on Gemma 4, Flint or\n"
+           "                                DeepSeek-V4.1 (default 0 with --spec, 0.5 when\n"
+           "                                the engine chooses MTP, 0.7 when it chooses\n"
+           "                                DFlash2)\n"
            "  --draft-confidence C          dspark: verify drafts while their confidence is\n"
            "                                at least C, 0..1 (default 0.5; 0 keeps every draft)\n"
+           "  --draft-experts N             dspark: each drafter block keeps its N most routed\n"
+           "                                experts on the GPU, 3..128 (0 keeps all; default 64\n"
+           "                                with the STQ drafter and host or disk experts,\n"
+           "                                else all)\n"
            "  --lm-head-draft               draft with the optimized proposal head, which\n"
            "                                the artifact must store (the default when it does)\n"
            "  --full-draft-head             draft with the full output head even when the\n"
@@ -301,6 +341,10 @@ std::string usage_text(const char* argv0) {
            "  --frequency-penalty F         -2..2\n"
            "  --seed N                      fixed random seed\n"
            "  --greedy                      force temperature 0 (exact argmax)\n"
+           "  --gumbel-sampling             draw sampled tokens by Gumbel-max over keyed\n"
+           "                                noise, and MTP-style drafts as the drafter's\n"
+           "                                draws under the same noise: other tokens than\n"
+           "                                the default draw for the same seed (default off)\n"
            "  --post-thinking               sample the answer of a thinking request with the\n"
            "                                post-thinking preset (temperature 0.2) from the\n"
            "                                token after its reasoning closes (default off)\n"
@@ -355,18 +399,13 @@ std::string usage_text(const char* argv0) {
            "  individual fields.\n";
 }
 
-Options parse_options(int argc, char** argv) {
+namespace {
+
+// The options after the artifact path, as one list. With `spans` it only splits them into options
+// (product::parse_layered); without, it also validates them together.
+Options parse_arguments(const std::vector<std::string>& arguments,
+                        std::vector<product::OptionSpan>* spans) {
     Options options;
-    if (argc >= 2 && std::string_view(argv[1]) == "--version") {
-        options.version_requested = true;
-        return options;
-    }
-    if (argc >= 2 && (std::string_view(argv[1]) == "--help" || std::string_view(argv[1]) == "-h")) {
-        options.help_requested = true;
-        return options;
-    }
-    if (argc < 2) { throw std::invalid_argument(".ninfer model path is required"); }
-    options.artifact_path     = argv[1];
     bool kv_capacity_explicit = false;
     bool device_explicit      = false;
     bool ngram_width_explicit       = false;
@@ -374,15 +413,23 @@ Options parse_options(int argc, char** argv) {
     bool vision_max_merged_explicit = false;
     std::optional<std::size_t> kv_headroom_mib;
 
-    for (int i = 2; i < argc; ++i) {
-        const std::string_view arg(argv[i]);
+    product::OptionSpanRecorder recorder(spans);
+    for (std::size_t i = 0; i < arguments.size(); ++i) {
+        recorder.begin(i);
+        const std::string_view arg(arguments[i]);
         const auto value = [&](std::string_view flag) -> const char* {
-            if (++i >= argc) { throw std::invalid_argument(std::string(flag) + " needs a value"); }
-            return argv[i];
+            if (++i >= arguments.size()) {
+                throw std::invalid_argument(std::string(flag) + " needs a value");
+            }
+            return arguments[i].c_str();
         };
 
         if (ninfer::product::parse_steering_flag(
                 arg, [&]() -> const char* { return value(arg); }, options.steering)) {
+            continue;
+        }
+        if (ninfer::product::parse_prompt_route_option(arg, options.prompt_routes,
+                                                       [&] { return value(arg); })) {
             continue;
         }
         if (arg == "--prompt") {
@@ -414,8 +461,8 @@ Options parse_options(int argc, char** argv) {
             options.devices = parse_device_list(value(arg));
         } else if (arg == "--stage-layers") {
             options.stage_layers = parse_stage_layers(value(arg));
-        } else if (arg == "--tensor-parallel") {
-            options.tensor_parallel = true;
+        } else if (product::switch_option(arg, "tensor-parallel",
+                                          [&](bool on) { options.tensor_parallel = on; })) {
         } else if (arg == "--tensor-split") {
             options.tensor_split = ninfer::product::parse_tensor_split(value(arg));
         } else if (arg == "--tensor-attention") {
@@ -426,8 +473,8 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--tensor-parallel-prompt-partials") {
             options.tensor_parallel_prompt_partials =
                 ninfer::product::parse_tensor_parallel_partials(value(arg));
-        } else if (arg == "--invariant-attention") {
-            options.invariant_attention = true;
+        } else if (product::switch_option(arg, "invariant-attention",
+                                          [&](bool on) { options.invariant_attention = on; })) {
         } else if (arg == "--expert-residency") {
             const std::string residency = value(arg);
             if (residency == "device") {
@@ -469,9 +516,13 @@ Options parse_options(int argc, char** argv) {
             spec_explicit               = true;
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = parse_u32(value(arg), "draft-tokens");
+        } else if (arg == "--draft-model") {
+            options.speculative.draft_model = value(arg);
         } else if (arg == "--draft-confidence") {
             options.speculative.draft_confidence =
                 parse_float(value(arg), "draft-confidence", 0.0F, 1.0F);
+        } else if (arg == "--draft-experts") {
+            options.speculative.draft_experts = parse_u32(value(arg), "draft-experts", true);
         } else if (arg == "--draft-min-p") {
             options.speculative.draft_min_p = parse_float(value(arg), "draft-min-p", 0.0F, 1.0F);
         } else if (arg == "--ngram-draft-tokens") {
@@ -480,24 +531,27 @@ Options parse_options(int argc, char** argv) {
             ngram_width_explicit = true;
         } else if (arg == "--ngram-min-match") {
             options.speculative.ngram_min_match = parse_u32(value(arg), "ngram-min-match");
-        } else if (arg == "--lm-head-draft") {
-            options.speculative.proposal_head = ProposalHead::Optimized;
-        } else if (arg == "--full-draft-head") {
-            options.speculative.proposal_head = ProposalHead::Full;
-        } else if (arg == "--lm-head-q4") {
-            options.lm_head_q4 = true;
-        } else if (arg == "--lm-head-q6") {
-            options.lm_head_q6 = true;
-        } else if (arg == "--embedding-q4") {
-            options.embedding_q4 = true;
-        } else if (arg == "--embedding-q6") {
-            options.embedding_q6 = true;
-        } else if (arg == "--mtp-experts-q4") {
-            options.mtp_experts_q4 = true;
-        } else if (arg == "--gdn-state-fp16") {
-            options.gdn_state_fp16 = true;
-        } else if (arg == "--rope-yarn") {
-            options.rope_yarn = true;
+        } else if (product::switch_option(arg, "lm-head-draft", [&](bool on) {
+                       options.speculative.proposal_head =
+                           on ? ProposalHead::Optimized : ProposalHead::Auto;
+                   })) {
+        } else if (product::switch_option(arg, "full-draft-head", [&](bool on) {
+                       options.speculative.proposal_head = on ? ProposalHead::Full : ProposalHead::Auto;
+                   })) {
+        } else if (product::switch_option(arg, "lm-head-q4",
+                                          [&](bool on) { options.lm_head_q4 = on; })) {
+        } else if (product::switch_option(arg, "lm-head-q6",
+                                          [&](bool on) { options.lm_head_q6 = on; })) {
+        } else if (product::switch_option(arg, "embedding-q4",
+                                          [&](bool on) { options.embedding_q4 = on; })) {
+        } else if (product::switch_option(arg, "embedding-q6",
+                                          [&](bool on) { options.embedding_q6 = on; })) {
+        } else if (product::switch_option(arg, "mtp-experts-q4",
+                                          [&](bool on) { options.mtp_experts_q4 = on; })) {
+        } else if (product::switch_option(arg, "gdn-state-fp16",
+                                          [&](bool on) { options.gdn_state_fp16 = on; })) {
+        } else if (product::switch_option(arg, "rope-yarn",
+                                          [&](bool on) { options.rope_yarn = on; })) {
         } else if (arg == "--rope-yarn-factor") {
             options.rope_yarn_factor = product::parse_rope_yarn_factor(value(arg));
         } else if (arg == "--rope-scaling-factor") {
@@ -505,40 +559,46 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--rope-scaling-original-context") {
             options.rope_scaling_original_context =
                 product::parse_rope_scaling_original_context(value(arg));
-        } else if (arg == "--wddm-evictable-budget") {
-            options.wddm_evictable_budget = true;
-        } else if (arg == "--mlp-a8-decode") {
-            options.mlp_a8_decode = true;
-        } else if (arg == "--no-prefill-a8") {
-            options.prefill_a8 = false;
-        } else if (arg == "--nvfp4-w4a8-int") {
-            options.nvfp4_w4a8_int = true;
-        } else if (arg == "--nvfp4-w4a16") {
-            options.nvfp4_w4a16 = true;
+        } else if (product::switch_option(arg, "wddm-evictable-budget",
+                                          [&](bool on) { options.wddm_evictable_budget = on; })) {
+        } else if (product::switch_option(arg, "mlp-a8-decode",
+                                          [&](bool on) { options.mlp_a8_decode = on; })) {
+        } else if (product::switch_option(arg, "prefill-a8",
+                                          [&](bool on) { options.prefill_a8 = on; })) {
+        } else if (product::switch_option(arg, "nvfp4-w4a8-int",
+                                          [&](bool on) { options.nvfp4_w4a8_int = on; })) {
+        } else if (product::switch_option(arg, "nvfp4-w4a16",
+                                          [&](bool on) { options.nvfp4_w4a16 = on; })) {
         } else if (arg == "--lookup-ngram") {
             options.speculative.lookup_ngram = parse_u32(value("--lookup-ngram"), "lookup-ngram");
         } else if (arg == "--mtp-attention-window") {
             options.speculative.mtp_attention_window =
                 parse_u32(value(arg), "mtp-attention-window", true);
-        } else if (arg == "--prefill-cublas") {
-            options.prefill_cublas = true;
-        } else if (arg == "--no-prefill-cublas-projections") {
-            options.prefill_cublas_projections = false;
-        } else if (arg == "--json" || arg == "--json-schema") {
+        } else if (product::switch_option(arg, "prefill-cublas",
+                                          [&](bool on) { options.prefill_cublas = on; })) {
+        } else if (product::switch_option(arg, "prefill-cublas-projections", [&](bool on) {
+                       options.prefill_cublas_projections = on;
+                   })) {
+        } else if (product::switch_option(arg, "json", [&](bool on) {
+                       if (on && options.structured_output.kind != StructuredOutputKind::None) {
+                           throw std::invalid_argument("choose exactly one structured output mode");
+                       }
+                       options.structured_output.kind =
+                           on ? StructuredOutputKind::JsonObject : StructuredOutputKind::None;
+                       options.structured_output.schema.clear();
+                   })) {
+        } else if (arg == "--json-schema") {
             if (options.structured_output.kind != StructuredOutputKind::None) {
                 throw std::invalid_argument("choose exactly one structured output mode");
             }
-            options.structured_output.kind = arg == "--json" ? StructuredOutputKind::JsonObject
-                                                             : StructuredOutputKind::JsonSchema;
-            if (arg == "--json-schema") {
-                std::ifstream schema(value(arg));
-                if (!schema) { throw std::invalid_argument("cannot read JSON schema file"); }
-                options.structured_output.schema.assign(std::istreambuf_iterator<char>(schema), {});
-            }
-        } else if (arg == "--raw-output") {
-            options.raw_output = true;
-        } else if (arg == "--print-token-ids") {
-            options.print_token_ids = true;
+            options.structured_output.kind = StructuredOutputKind::JsonSchema;
+            std::ifstream schema(value(arg));
+            if (!schema) { throw std::invalid_argument("cannot read JSON schema file"); }
+            options.structured_output.schema.assign(std::istreambuf_iterator<char>(schema), {});
+        } else if (product::switch_option(arg, "raw-output",
+                                          [&](bool on) { options.raw_output = on; })) {
+        } else if (product::switch_option(arg, "print-token-ids",
+                                          [&](bool on) { options.print_token_ids = on; })) {
         } else if (arg == "--log-colours") {
             const std::string_view mode = value(arg);
             if (mode == "on") {
@@ -548,16 +608,16 @@ Options parse_options(int argc, char** argv) {
             } else {
                 throw std::invalid_argument("--log-colours accepts on or off");
             }
-        } else if (arg == "--no-thinking") {
-            options.enable_thinking = false;
+        } else if (product::switch_option(arg, "thinking",
+                                          [&](bool on) { options.enable_thinking = on; })) {
         } else if (arg == "--thinking-budget") {
             options.thinking_budget = parse_u32(value(arg), "thinking-budget");
         } else if (arg == "--reasoning-loop") {
             options.reasoning_loop = ninfer::product::parse_reasoning_loop_action(value(arg));
         } else if (arg == "--reasoning-effort") {
             options.reasoning_effort = parse_reasoning_effort(value(arg));
-        } else if (arg == "--vision") {
-            options.enable_vision = true;
+        } else if (product::switch_option(arg, "vision",
+                                          [&](bool on) { options.enable_vision = on; })) {
         } else if (arg == "--vision-residency") {
             const std::string_view mode = value(arg);
             if (mode == "resident") {
@@ -569,10 +629,11 @@ Options parse_options(int argc, char** argv) {
             } else {
                 throw std::invalid_argument("--vision-residency must be resident, overlay or cpu");
             }
-        } else if (arg == "--vision-cpu") {
-            // The gzenz fork's switch for Vision on CPU threads.
-            options.enable_vision    = true;
-            options.vision_residency = VisionResidency::Cpu;
+        } else if (product::switch_option(arg, "vision-cpu", [&](bool on) {
+                       // The gzenz fork's switch for Vision on CPU threads.
+                       if (on) { options.enable_vision = true; }
+                       options.vision_residency = on ? VisionResidency::Cpu : VisionResidency::Resident;
+                   })) {
         } else if (arg == "--vision-offload") {
             // The Wallawalla47 fork's switch for the same overlay residency.
             const std::string_view mode = value(arg);
@@ -589,8 +650,8 @@ Options parse_options(int argc, char** argv) {
             if (options.vision_max_merged_tokens < 64 || options.vision_max_merged_tokens > 16384) {
                 throw std::invalid_argument("--vision-max-merged must be in [64, 16384]");
             }
-        } else if (arg == "--no-cuda-graph") {
-            options.use_cuda_graph = false;
+        } else if (product::switch_option(arg, "cuda-graph",
+                                          [&](bool on) { options.use_cuda_graph = on; })) {
         } else if (arg == "--gpu-clock-floor") {
             options.gpu_clock_floor_mhz = parse_u32(value(arg), "gpu-clock-floor");
             if (options.gpu_clock_floor_mhz == 0 || options.gpu_clock_floor_mhz > 5000) {
@@ -629,10 +690,16 @@ Options parse_options(int argc, char** argv) {
                 parse_float(value(arg), "frequency-penalty", -2.0F, 2.0F);
         } else if (arg == "--seed") {
             options.sampling.seed = parse_u64(value(arg), "seed");
-        } else if (arg == "--greedy") {
-            options.greedy = true;
-        } else if (arg == "--post-thinking") {
-            if (!options.post_thinking_sampling) { options.post_thinking_sampling.emplace(); }
+        } else if (product::switch_option(arg, "greedy", [&](bool on) { options.greedy = on; })) {
+        } else if (product::switch_option(arg, "gumbel-sampling",
+                                          [&](bool on) { options.gumbel_sampling = on; })) {
+        } else if (product::switch_option(arg, "post-thinking", [&](bool on) {
+                       if (!on) {
+                           options.post_thinking_sampling.reset();
+                       } else if (!options.post_thinking_sampling) {
+                           options.post_thinking_sampling.emplace();
+                       }
+                   })) {
         } else if (arg == "--post-thinking-temperature" || arg == "--post-thinking-top-p" ||
                    arg == "--post-thinking-top-k") {
             const std::string_view key = arg == "--post-thinking-temperature" ? "temp"
@@ -649,6 +716,8 @@ Options parse_options(int argc, char** argv) {
             throw std::invalid_argument("unknown argument: " + std::string(arg));
         }
     }
+    recorder.finish(arguments.size());
+    if (recorder.splitting()) { return options; }
 
     if (!kv_capacity_explicit) {
         options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
@@ -657,10 +726,12 @@ Options parse_options(int argc, char** argv) {
         throw std::invalid_argument("--device and --devices are mutually exclusive");
     }
     if (!options.stage_layers.empty() && options.devices.size() < 2) {
-        throw std::invalid_argument("--stage-layers needs --devices naming more than one device");
+        throw product::OptionConflict(
+            {"stage-layers", "devices"}, "--stage-layers needs --devices naming more than one device");
     }
     if (options.tensor_parallel && options.devices.size() < 2) {
-        throw std::invalid_argument("--tensor-parallel needs --devices naming more than one device");
+        throw product::OptionConflict({"tensor-parallel", "devices"},
+                                      "--tensor-parallel needs --devices naming more than one device");
     }
     ninfer::product::check_tensor_split(options.tensor_split, options.devices.size(),
                                         options.tensor_parallel);
@@ -671,7 +742,8 @@ Options parse_options(int argc, char** argv) {
                                                     options.tensor_parallel);
     if (kv_headroom_mib.has_value()) {
         if (options.kv_capacity.mode != KvCapacityMode::Automatic) {
-            throw std::invalid_argument("--kv-headroom-mib requires --kv-capacity auto");
+            throw product::OptionConflict({"kv-headroom-mib", "kv-capacity"},
+                                          "--kv-headroom-mib requires --kv-capacity auto");
         }
         options.kv_capacity = KvCapacityPolicy::automatic(*kv_headroom_mib << 20);
     }
@@ -679,20 +751,23 @@ Options parse_options(int argc, char** argv) {
     const bool has_prompt   = !options.prompt.empty();
     const bool has_messages = !options.messages_path.empty();
     if (has_prompt == has_messages) {
-        throw std::invalid_argument("pass exactly one of --prompt or --messages");
+        throw product::OptionConflict({"prompt", "messages"},
+                                      "pass exactly one of --prompt or --messages");
     }
     if (options.prefill_chunk % 128 != 0) {
         throw std::invalid_argument("--prefill-chunk must be a multiple of 128");
     }
     if (options.kv_capacity.mode == KvCapacityMode::Explicit &&
         options.kv_capacity.explicit_tokens < options.max_context) {
-        throw std::invalid_argument("--kv-capacity must be at least --max-context");
+        throw product::OptionConflict({"kv-capacity", "max-context"},
+                                      "--kv-capacity must be at least --max-context");
     }
     product::apply_default_ngram_draft_tokens(options.speculative, ngram_width_explicit);
     product::apply_automatic_speculation(options.speculative, spec_explicit);
     product::validate_speculative_cli_options(options.speculative);
     if (options.vision_residency != VisionResidency::Resident && !options.enable_vision) {
-        throw std::invalid_argument("--vision-residency overlay or cpu requires --vision");
+        throw product::OptionConflict({"vision-residency", "vision"},
+                                      "--vision-residency overlay or cpu requires --vision");
     }
     // A CPU encode grows with the square of an item's patches: 256 merged tokens (about 512x512
     // pixels) keeps one to a few seconds.
@@ -702,7 +777,8 @@ Options parse_options(int argc, char** argv) {
     if (options.structured_output.kind != StructuredOutputKind::None) {
         if (options.raw_output || !options.stop_strings.empty() ||
             !options.stop_token_ids.empty()) {
-            throw std::invalid_argument(
+            throw product::OptionConflict(
+                {"json", "raw-output", "stop", "reasoning-stop", "stop-token-id"},
                 "structured output requires decoded text and default stops");
         }
         if (!options.reasoning_effort && !options.thinking_budget) {
@@ -711,20 +787,44 @@ Options parse_options(int argc, char** argv) {
     }
     if (options.enable_thinking == false && options.reasoning_effort &&
         *options.reasoning_effort != ReasoningEffort::None) {
-        throw std::invalid_argument("--reasoning-effort cannot be combined with --no-thinking");
+        throw product::OptionConflict({"reasoning-effort", "thinking"},
+                                      "--reasoning-effort cannot be combined with --no-thinking");
     }
     if (options.reasoning_effort == ReasoningEffort::None) options.enable_thinking = false;
     if (options.enable_thinking == false && options.thinking_budget) {
-        throw std::invalid_argument("--thinking-budget cannot be combined with --no-thinking");
+        throw product::OptionConflict({"thinking-budget", "thinking"},
+                                      "--thinking-budget cannot be combined with --no-thinking");
     }
     if (options.enable_thinking == false &&
         options.reasoning_loop != ninfer::ReasoningLoopAction::Off) {
-        throw std::invalid_argument("--reasoning-loop cannot be combined with --no-thinking");
+        throw product::OptionConflict({"reasoning-loop", "thinking"},
+                                      "--reasoning-loop cannot be combined with --no-thinking");
     }
     if (options.greedy) {
         options.sampling.temperature = 0.0F;
         if (options.post_thinking_sampling) { options.post_thinking_sampling->temperature = 0.0F; }
     }
+    return options;
+}
+
+} // namespace
+
+Options parse_options(int argc, char** argv) {
+    const product::CommandLine command_line =
+        product::read_command_line(argc, argv, product::PositionalArtifact::Taken);
+    Options options;
+    if (command_line.version) {
+        options.version_requested = true;
+        return options;
+    }
+    if (command_line.help) {
+        options.help_requested = true;
+        return options;
+    }
+    if (!command_line.artifact) { throw std::invalid_argument(".ninfer model path is required"); }
+    options = product::parse_layered(command_line.layer_arguments(), kSettingAliases,
+                                     parse_arguments);
+    options.artifact_path = *command_line.artifact;
     return options;
 }
 

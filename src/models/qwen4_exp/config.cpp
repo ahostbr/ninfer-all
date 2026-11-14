@@ -1,5 +1,8 @@
 #include "models/qwen4_exp/config.h"
 
+#include "models/qwen3_5/draft_config.h"
+
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <string>
@@ -51,7 +54,7 @@ TextConfig parse_text_config(const Json& value) {
          "shared_expert_intermediate_size", "hc_count", "hc_lowrank", "ple_layers",
          "ple_embed_dim", "ple_conv_kernel_size", "ngram_size", "heads_per_ngram",
          "ngram_vocab_size_base", "make_ngram_vocab_size_divisible_by", "ngram_seed"},
-        {}, "Qwen4Exp text config");
+        {"latent_moe"}, "Qwen4Exp text config");
     const auto& architectures = value.at("architectures");
     if (!architectures.is_array() || architectures.size() != 1 ||
         architectures[0] != "Qwen4ExpForCausalLM" || value.at("model_type") != "qwen4_exp_text") {
@@ -176,6 +179,31 @@ TextConfig parse_text_config(const Json& value) {
     require_value(out.ngram.ngram_size, 3, "ngram_size");
     require_value(out.ngram.heads_per_ngram, 8, "heads_per_ngram");
     require_value(out.ple_embed_dim / out.ngram_heads(), 160, "n-gram head width");
+    if (value.contains("latent_moe")) {
+        const auto& latent = value.at("latent_moe");
+        artifact::require_members(latent, {"width", "groups", "expert_scales", "column_scale"}, {},
+                                  "Qwen4Exp latent MoE");
+        LatentMoe moe;
+        moe.width  = integer(latent, "width");
+        moe.groups = integer(latent, "groups");
+        for (const char* name : {"expert_scales", "column_scale"}) {
+            if (!latent.at(name).is_boolean()) {
+                throw ArtifactError(std::string("latent_moe.") + name + " must be boolean");
+            }
+        }
+        moe.expert_scales = latent.at("expert_scales").get<bool>();
+        moe.column_scale  = latent.at("column_scale").get<bool>();
+        // ops::moe_latent_gguf: whole 256-value steps of the expert matrix kernel, up to 16 groups.
+        if (moe.width == 0 || moe.width % 256 != 0 || moe.width > 8192) {
+            throw ArtifactError("latent_moe.width is " + std::to_string(moe.width) +
+                                "; this engine implements multiples of 256 up to 8192");
+        }
+        if (moe.groups == 0 || moe.groups > 16 || moe.groups > out.num_experts) {
+            throw ArtifactError("latent_moe.groups is " + std::to_string(moe.groups) +
+                                "; this engine implements 1 to 16, at most one per expert");
+        }
+        out.latent_moe = moe;
+    }
     return out;
 }
 
@@ -197,6 +225,30 @@ MtpConfig parse_mtp_config(const Json& value, const TextConfig& text) {
     if (out.num_experts < text.num_experts_per_tok || out.num_experts > 512) {
         throw ArtifactError("the MTP block keeps " + std::to_string(out.num_experts) +
                             " experts; this engine implements 10 to 512");
+    }
+    return out;
+}
+
+DFlash2Config parse_dflash2_config(const Json& value, const TextConfig& text) {
+    DFlash2Config out = qwen3_5::parse_draft_config(
+        value, {text.hidden_size, text.vocab_size, text.num_hidden_layers}, true);
+    const auto& extra = out.dflash2.value();
+    // The drafter's Ops: sliding-window attention of 32 query and 8 KV heads of 128 over a window
+    // of 2048 or 4096, the conditional selector's 16 candidates of rank 256 over this vocabulary,
+    // the dynamic convolution's two taps in groups of 16, and a ring per local layer.
+    const bool local = std::all_of(out.layer_types.begin(), out.layer_types.end(), [](auto kind) {
+        return kind == qwen3_5::DraftAttentionKind::SlidingAttention;
+    });
+    if (!local || !out.sliding_window ||
+        (*out.sliding_window != 2048 && *out.sliding_window != 4096) ||
+        out.attention.head_dim != 128 || out.attention.num_attention_heads != 32 ||
+        out.attention.num_key_value_heads != 8 || extra.conv_kernel_size != 2 ||
+        extra.conv_group_size != 16 || extra.selector_rank != 256 || extra.selector_top_k != 16 ||
+        text.vocab_size != 248320 || out.num_hidden_layers == 0 || out.num_hidden_layers > 8) {
+        throw ArtifactError("Qwen4Exp DFlash2 config: the drafter's geometry is outside the one "
+                            "this engine implements (1-8 sliding-window layers of 32x8 heads of "
+                            "128 over 2048 or 4096 positions, 2-tap convolutions in groups of 16, "
+                            "a 16-candidate selector of rank 256)");
     }
     return out;
 }

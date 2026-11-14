@@ -27,8 +27,9 @@ downloaded files.
 ## Start with an official recipe
 
 Source-weight conversion requires a Python 3.11 environment with PyTorch and NumPy. It uses CUDA
-by default; `--device cpu` selects CPU conversion. The input paths below are placeholders for your
-local checkpoint directories.
+by default; `--device cpu` selects CPU conversion. PyTorch runs one thread per CPU the process may
+use, capped by a container's CPU quota; `OMP_NUM_THREADS` overrides that. The input paths below are
+placeholders for your local checkpoint directories.
 
 For Qwen3.6-27B floating-point source weights:
 
@@ -75,9 +76,10 @@ The built-in recipes are ordinary Python functions in
 | `bonsai2_27b_ternary` | Imported ternary T2 text tower with Hadamard-rotated Uses, Q8 primal embedding | `ternary` (GGUF) |
 | `qwen3_8_27b_gguf` | Every text, embedding, head and MTP tensor in its GGUF block format, byte for byte; an untied BF16 output head as BF16 words | `gguf` (GGUF), `vision` (mmproj GGUF) |
 | `qwen3_8_flash_next_gguf` | Qwen3.8-Flash-Next: every text tensor in its GGUF block format, byte for byte, expert banks expert-major, and the n-gram table's IQ4_NL rows in the same artifact or in a table artifact of their own; every hyper-connection matrix as ggml Q8_0 rows (the release's BF16 ones re-quantised); the MTP block from an MTP GGUF, its matrices in their blocks | `gguf` (the release's first shard), `ngram` (its second shard), `vision` (mmproj GGUF), `mtp` (an MTP GGUF) |
+| `edge0_pack`, `edge0_pack_q8`, `edge0_pack_q4` | Edge0-145B and Edge0-120B from an Edge0 release folder: the Flash-Next skeleton GGUF as `qwen3_8_flash_next_gguf` reads it, every latent expert row (NVFP4, Q3_K, IQ4_NL) and encoder and decoder row (Q8_0 or Q4_0: the release's choice, or the one the recipe names) byte for byte, the labels, the NVFP4 experts' FP32 multipliers or the reciprocals of the Q3_K builds' column scales; the FP8 n-gram table's codes in the artifact or in a table artifact of their own; the release's MTP block | `pack` (the release folder); `gguf`, `ngram`, `mtp` override its files |
 | `gemma4_gguf` | Gemma 4 26B-A4B from Google's QAT GGUF (or a mixed-format GGUF of it): every matrix in its block format (Q4_0, the tied token table Q6_K), byte for byte, a block's Q, K and V grouped into one parent when they share a format and the [gate; up] MLP projections always, the vectors and expert scales as FP32; with `--components text,mtp` the assistant from its own GGUF the same way | `gguf`, `mtp` |
 | `flint_gguf` | Flint from a llama.cpp GGUF (Unsloth's UD-Q4_K_XL or another quantization): every matrix in its block format, byte for byte, the routed experts' gate and up banks interleaved per expert by whole rows, a block's Q, K and V grouped into one parent when they share a format and the [gate; up] rows of the dense MLP and the shared expert always, the router (BF16 in the GGUF), norms and sinks as FP32 | `gguf` |
-| `deepseek_v41_gguf` | DeepSeek-V4.1-Flash from ISTA-DASLab's split GSQ-RCO GGUF: every matrix in its block format, byte for byte, the routed experts' gate and up banks interleaved per expert by whole rows, the BF16 and F32 tensors (router, compressors, indexers, hyper-connection matrices, norms, sinks) as FP32, the Engram gate as the FP32 product of its BF16 factors; the Engram GGUF's IQ4_NL rows in the same artifact or in a table artifact of their own | `gguf` (the first shard), `engram` (the Engram GGUF) |
+| `deepseek_v41_gguf` | DeepSeek-V4.1-Flash from ISTA-DASLab's split GSQ-RCO GGUF, in llama.cpp's layout or the earlier one: every matrix in its block format, byte for byte, the routed experts' gate and up banks interleaved per expert by whole rows, the BF16 and F32 tensors (router, compressors, indexers, hyper-connection matrices, norms, sinks) as FP32, the Engram gate as the FP32 product of its BF16 factors; the Engram GGUF's IQ4_NL rows in the same artifact or in a table artifact of their own | `gguf` (the first shard), `engram` (the Engram GGUF), `dspark`, `vision`, `bias_vl` (the earlier layout's image routing bias) |
 
 The QUASAR Qwen3.8-27B NVFP4 checkpoint, which quantizes every Linear layer to NVFP4, has a driver
 of its own, `python3 -m tools.convert.quasar_nvfp4 --model DIR --dflash2 REFERENCE.ninfer --out
@@ -158,7 +160,9 @@ python3 -m tools.convert \
 
 Vision uses the main source, and so does MTP unless `--source mtp=PATH` supplies a separately trained
 head under the checkpoint's `mtp.*` tensor names. DFlash and DFlash2 use the corresponding named
-source, supplied as `--source dflash=PATH` or `--source dflash2=PATH`. An artifact may contain several optional
+source, supplied as `--source dflash=PATH` or `--source dflash2=PATH` (for Qwen3.6-35B-A3B,
+[incoai's drafter](https://huggingface.co/incoai/Qwen3.6-35B-A3B-DFlash2) with `--components
+text,vision,mtp,dflash2`). An artifact may contain several optional
 components; the Engine loads only the ones selected at startup, including at most one speculative
 backend. Component availability and startup selection are independent.
 
@@ -282,6 +286,16 @@ reference rounding, which halves the largest share of a decoded token's weight r
 runtime options and measurements:
 [Qwen3.8-Flash-Next](qwen3-8-flash-next.md).
 
+### Edge0 release folders
+
+`edge0_pack` ([`edge0.py`](../tools/convert/edge0.py)) imports an Edge0 release folder
+(`--source pack=FOLDER`) with `--model` holding the base Qwen3.8-Flash-Next's configuration and
+tokenizer files: the skeleton GGUF as the Flash-Next recipe imports it, and the latent MoE beside it,
+its expert, encoder and decoder rows byte for byte. The text configuration gains `latent_moe` (the
+latent width, the 8 groups and which scales the artifact stores). The FP8 n-gram table becomes
+`fp8_e4m3fn_row_fp16` rows with the release's one scale in each row, and `--components` places it as
+for Flash-Next. Commands, runtime options and the mathematics: [Edge0](edge0.md).
+
 ### Gemma 4 GGUF releases
 
 `gemma4_gguf` ([`gemma4.py`](../tools/convert/gemma4.py)) imports the text model of
@@ -309,14 +323,23 @@ Commands, runtime defaults and measurements: [Flint](flint.md).
 `deepseek_v41_gguf` ([`deepseek_v41.py`](../tools/convert/deepseek_v41.py)) imports
 DeepSeek-V4.1-Flash from ISTA-DASLab's split GGUF with `--model` holding the base release's
 `config.json` and tokenizer, `--source gguf=` the first shard (the others are found beside it) and
-`--source engram=` the Engram GGUF. It checks the GGUF's metadata against the config (the block
-geometry, the compression ratios, the hyper-connections, the expert widths and scale, the Engram
-blocks and the ranges of their hash constants) and imports every row as stored. The release ships no Jinja chat
+`--source engram=` the Engram GGUF. It reads both layouts of these GGUFs and converts either to the
+same artifact: llama.cpp's own (b11870 and newer, ISTA-DASLab's files since 2026-10-27), whose
+split ends with the Engram GGUF as its last shard (a link beside the others, or absent), and the
+earlier layout of ISTA-DASLab's llama.cpp branch. It checks the GGUF's metadata against the config
+(the block geometry, the compression ratios, the hyper-connections, the expert widths and scale,
+the Engram blocks and the ranges of their hash constants) and imports every row as stored. A build
+with fewer routed experts per block than the release, such as the Coder, converts with its GGUF's
+expert count. The release ships no Jinja chat
 template: the recipe stores its own transcription of the release's encoder and generation defaults
 ([`templates/deepseek_v41`](../tools/convert/templates/deepseek_v41)) unless `--model` or
 `--resource` provides them. `--components text` stores the model alone, naming its table by the
 SHA-256 of its rows, and `engram` that table artifact, the layout the published conversions use;
-`text,engram` (the default) stores both in one file. Commands, runtime defaults and measurements: [DeepSeek-V4.1-Flash](deepseek-v41.md).
+`text,engram` (the default) stores both in one file. `--resource engram.hot=PATH` stores a hot-row
+profile made by `ninfer-ngram-profile` beside the stored Engram table as
+`engram.resources.hot_profile`, after checking its row IDs and the Engram hash and token map it was
+counted for against `--source gguf`, which a table alone then also needs; the table's bytes and
+digest stay the same. Commands, runtime defaults and measurements: [DeepSeek-V4.1-Flash](deepseek-v41.md).
 
 ## Change part of a recipe
 
@@ -745,6 +768,24 @@ An artifact is one file, whatever its size: the runtime reads what each placemen
 such as `models/my_qwen.ninfer` plus `my_qwen.ninfer.part-0001`, `my_qwen.ninfer.part-0002`, and so on
 in the same directory, each at most N bytes including framing. Pass only the entry path to NInfer and
 keep all its recorded parts together.
+
+Conversion reads its Safetensors and GGUF sources in bounded pieces and never maps them, so its
+memory use does not grow with the size of a source, on Windows too. On Linux each piece leaves the
+page cache once read, and the output is synced and dropped from it every 64 MiB. On Windows the
+output is synced every 512 MiB, which bounds the written data that the cache still holds; on macOS
+it is synced once, when the artifact is complete.
+
+Windows file systems fill the range between a file's written data and a later write with zeros
+before that write. On Windows conversion therefore writes each object in file order: the later
+planes of a row-split, FP8 row or NVFP4 object, its high bits and scales, wait in memory until its
+first plane is written. They take up to 36% of a Q6 object, 358 MB for the Q6 vocabulary of
+Qwen3.6-27B.
+
+Before it writes, conversion checks that the output directory's file system has room for every
+file of the artifact and stops if it has not. Each file is written under a hidden temporary name,
+such as `.my_qwen.ninfer.k3x9q0zb.tmp`, and gets its own name when the whole artifact is complete.
+A conversion that was killed leaves these files behind; the next conversion of the same artifact
+deletes them, and refuses to start while another conversion is still writing them.
 
 Conversion writes `models/my_qwen.ninfer.conversion.json` alongside the artifact, recording sources,
 methods, formats, component configs, files and timing. Existing output files are not overwritten.

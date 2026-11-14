@@ -232,9 +232,11 @@ int main(int argc, char** argv) {
         std::cout << ninfer::serve::serve_usage_text(argv[0]);
         return 0;
     }
-    options.build_version = std::string(NINFER_VERSION) + "+" + NINFER_BUILD_ID;
+    options.build_version   = std::string(NINFER_VERSION) + "+" + NINFER_BUILD_ID;
+    options.build_toolchain = NINFER_TOOLCHAIN;
     if (options.version_requested) {
-        std::cout << "ninfer-serve " << options.build_version << '\n';
+        std::cout << "ninfer-serve " << options.build_version << " (" << options.build_toolchain
+                  << ")\n";
         return 0;
     }
     // --log-colours on colours the statistics tokens as well as the levels; off keeps the log plain.
@@ -303,7 +305,7 @@ int main(int argc, char** argv) {
         // has been listenable since bind() either way; the difference is whether a caller arriving
         // during the ten seconds of weight loading gets a documented "still loading" or a hang.
         server.start_serving_during_startup();
-        logger->info("build {}", options.build_version);
+        logger->info("build {} ({})", options.build_version, options.build_toolchain);
 
         if (!options.slot_save_path.empty()) {
             std::error_code directory_error;
@@ -356,39 +358,37 @@ int main(int argc, char** argv) {
                 ninfer::serve::ModelDefinition{.id = ninfer::serve::resolve_public_model_id(
                                                    options, first->load_summary().model_name),
                                                .options         = options,
-                                               .arguments       = options.model_arguments,
+                                               .arguments       = options.effective_arguments,
                                                .load_on_startup = true});
         } else {
-            std::optional<ninfer::serve::PresetFile> preset;
+            std::optional<ninfer::product::ConfigFile> preset;
             if (options.models_preset) {
-                std::ifstream file(*options.models_preset);
-                if (!file) {
-                    operational_log.server_failure(false, "cannot read --models-preset " +
-                                                              options.models_preset->string());
+                try {
+                    preset = ninfer::product::read_config_file(*options.models_preset);
+                } catch (const std::exception& exception) {
+                    operational_log.server_failure(false, std::string("--models-preset ") +
+                                                              exception.what());
                     return 1;
                 }
-                std::stringstream text;
-                text << file.rdbuf();
-                preset = ninfer::serve::parse_preset_file(text.str());
             }
             for (ninfer::serve::CatalogModel& model : ninfer::serve::build_catalog(
-                     options.models_dir, preset, options.model_arguments)) {
-                std::vector<std::string> words{argv[0], model.artifact.string()};
-                words.insert(words.end(), model.arguments.begin(), model.arguments.end());
-                std::vector<char*> model_argv;
-                for (std::string& word : words) { model_argv.push_back(word.data()); }
-                ninfer::serve::ServeOptions model_options = ninfer::serve::parse_serve_options(
-                    static_cast<int>(model_argv.size()), model_argv.data());
+                     options.models_dir, preset, options.model_layers)) {
+                ninfer::serve::ServeOptions model_options =
+                    ninfer::serve::parse_serve_options(ninfer::product::CommandLine{
+                        .program  = argv[0],
+                        .artifact = model.artifact.string(),
+                        .layers   = model.layers});
                 // The router owns the address, the key and the logs; a model never binds its own.
                 model_options.host              = options.host;
                 model_options.port              = options.port;
                 model_options.api_key           = options.api_key;
                 model_options.model_id_override = model.id;
+                std::vector<std::string> arguments = model_options.effective_arguments;
                 definitions.push_back(
                     ninfer::serve::ModelDefinition{.id              = model.id,
                                                    .aliases         = model.aliases,
                                                    .options         = std::move(model_options),
-                                                   .arguments       = model.arguments,
+                                                   .arguments       = std::move(arguments),
                                                    .load_on_startup = model.load_on_startup});
             }
         }

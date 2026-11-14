@@ -5,6 +5,7 @@
 #include <array>
 #include <compare>
 #include <span>
+#include <stdexcept>
 
 namespace ninfer::runtime {
 
@@ -45,6 +46,10 @@ struct CommitDecision {
     // Copied unchanged from the corresponding OutputDecision; still relative to this row's
     // accepted span.
     std::optional<std::uint32_t> prefix_execution_split_after;
+    // Copied unchanged from the corresponding OutputDecision; relative to the accepted span.
+    std::optional<std::uint32_t> stop_hold_after;
+    // The row ends at a stop string: the visible text ends before the tokens the hold covers.
+    bool stop_cut = false;
 };
 
 struct BeginSummary {
@@ -66,6 +71,16 @@ struct RawTokenLogprob {
     // readout_count values are the named tokens' log probabilities in the request's order.
     std::uint32_t readout_count = 0;
     std::array<float, kMaximumReadoutTokens> readout_values{};
+};
+
+// Thrown by a Program when a prompt's first sampled token is the sampler's non-finite marker or
+// lies outside the vocabulary. No logits vouch for what the prompt computed on the way, so the
+// Engine recovers as from an out-of-memory failure: it ends the running requests with
+// RequestErrorKind::NumericalFailure and drops every cached prefix. A decode round reports such a
+// row on its PendingBatch instead, and only that row's request ends.
+class NumericalFault final : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
 };
 
 struct GeneratedRound {

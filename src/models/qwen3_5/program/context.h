@@ -8,7 +8,7 @@
 #include "ninfer/ops/rope.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/sliding_window_attention.h"
-#include "ninfer/ops/softmax_attention.h"
+#include "ninfer/ops/softmax_attention_envelope.h"
 #include "models/qwen3_5/program/storage/draft_context.h"
 #include "models/qwen3_5/execution/stage_runtime.h"
 #include "models/qwen3_5/execution/text.h"
@@ -99,6 +99,15 @@ struct PrefillContext {
     // Enqueues the first token's copies to the host as soon as a text chunk samples it; the chunk
     // then returns without waiting for the drafter's work behind them. Empty waits for everything.
     std::function<void()> first_token;
+    // Exact prefix-cache taps inside a text chunk (TextContext::set_gdn_taps).
+    std::span<const GdnTap> gdn_taps;
+    // The caller reads no prefill_hidden column of a chunk that ends before the prompt and samples
+    // nothing, so such a chunk may run its last layer as K/V only
+    // (TextContext::set_last_layer_kv_only).
+    bool last_layer_kv_only = false;
+    // The lane's MTP proposal sampler (runtime::draft_sampling of `sampling`), or null for argmax
+    // proposals.
+    const ops::SamplingConfig* draft_sampling = nullptr;
 };
 
 struct OrdinaryBatchContext {
@@ -118,6 +127,9 @@ struct MtpBatchContext {
     const qwen3_5::MtpDecodeIngress& host_ingress;
     qwen3_5::MtpDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
+    // --gumbel-sampling: each row's proposals are draws under frame.draft_sampling at the keys of
+    // the verification columns they fill; otherwise every proposal is the drafter's argmax.
+    bool sampled_drafts = false;
 };
 
 struct DFlashBatchContext {
@@ -174,8 +186,10 @@ struct TargetVerifyFrameView {
     DFlashFeatureSink* feature_sink        = nullptr;
 };
 
+// `draft_sampling` is the lane's proposal sampler (TextContext::set_proposal_sampling), or null.
 void configure_text_card(TextContext& card, const ExecutionCore& execution,
-                         const ops::SamplingConfig* sampling, std::int32_t state_source_slot,
+                         const ops::SamplingConfig* sampling,
+                         const ops::SamplingConfig* draft_sampling, std::int32_t state_source_slot,
                          std::int32_t state_destination_slot, std::uint32_t mtp_proposal_extent);
 void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
                           TextContext& card, TargetVerifyFrameView frame,

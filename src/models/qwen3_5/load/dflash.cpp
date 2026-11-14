@@ -41,21 +41,6 @@ DraftWeights bind_draft(Bindings& b, const DraftConfig& config, const TextConfig
         out.layers.push_back(std::move(layer));
     }
     if (config.dflash2) { bind_dflash2(b, out, config, target); }
-    if (config.dspine) {
-        const auto& d = *config.dspine;
-        const auto v  = target.vocab_size;
-        const auto n  = config.num_hidden_layers;
-        const auto p  = component + "/dspine/";
-        out.bridge    = DSpineBridgeWeights{
-            b.direct(p + "codebook", {v, d.code_size}),
-            b.direct(p + "read_weight", {d.code_size, h}),
-            b.direct(p + "early_read_weights", {n - 1, d.code_size, h}),
-            b.direct(p + "feature_write_weights", {n, h, d.rank}),
-            b.direct(p + "gate_weight", {d.rank, d.code_size}),
-            b.direct(p + "gate_bias", {d.rank}),
-            b.direct(p + "predecessor_gate_weight", {d.rank, d.code_size}),
-            b.direct(p + "prev_weight", {d.rank, d.code_size})};
-    }
     return out;
 }
 

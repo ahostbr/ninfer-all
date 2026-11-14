@@ -10,14 +10,24 @@
 // target's final hidden state before it, a chain of steps at the anchor's position, each attending
 // over the target's caches, proposes the tokens after it; verify() runs the anchor and the drafts
 // of each sequence as decode rows, and commit() keeps the first ones.
+//
+// With ExecutorOptions::dspine, a standalone DSpine drafter (models/dspine/runtime.h) drafts in the
+// assistant's place: every pass leaves the residual after each block the drafter taps, a prompt
+// chunk's last window of rows, a decode step's rows and the rows commit() keeps continue each
+// sequence's lane of its context ring, and draft() proposes for several sequences at once. Branch
+// passes keep nothing there. A rewind leaves the lane's later positions in place, which the
+// sequence writes again before a proposal reads them; only a ring that wraps (a context longer than
+// the drafter's window) then loses earlier positions, which lowers the drafts' acceptance and
+// leaves the output exact.
 
-#include "core/arena.h"
 #include "core/device.h"
+#include "core/expert_disk.h"
 #include "core/tensor.h"
 #include "models/expert_profile.h"
 #include "models/gemma4/kv_format.h"
 #include "models/gemma4/model.h"
 #include "ninfer/ops/rope.h"
+#include "ninfer/ops/sampling.h"
 
 #include <cuda_runtime.h>
 
@@ -61,6 +71,13 @@ struct ExecutorOptions {
     // bus times. CPU threads: 0 for one per physical core.
     std::optional<float> expert_dma_share;
     std::uint32_t expert_cpu_threads = 0;
+    // Disk experts: a drive mirror and the direct path (core/expert_disk.h).
+    ExpertDiskReads expert_disk{};
+    // --gumbel-sampling: draft() may take samplers, whose rows' assistant then draws its drafts.
+    bool sampled_drafts = false;
+    // The model's standalone DSpine drafter (Model::dspine()) drafts draft_tokens a round in the
+    // assistant's place.
+    bool dspine = false;
     // YaRN past the model's native window (a factor above one) for the full-attention blocks'
     // rotation, the assistant's included: their proportional schedule takes YaRN's frequencies,
     // and the queries the square of its attention factor. The sliding-window blocks never see a
@@ -92,6 +109,8 @@ struct ExecutorMemory {
     // the tower owns beside the model's weights (the streamed window and its resident copies).
     std::uint64_t vision_encode_bytes = 0;
     std::uint64_t vision_owned_bytes  = 0;
+    // A DSpine drafter's ring, head-write table, features, operands and workspace.
+    std::uint64_t dspine_bytes = 0;
     ExpertDeliveryMemory experts;
 };
 
@@ -103,9 +122,9 @@ struct SequenceSnapshot {
     std::uint32_t position = 0;
 };
 
-// A sequence's state in host memory, laid out as image_bytes() sizes it: its sliding-window rings
-// and its full-attention rows below `position`. The context cache keeps prefixes this way beyond
-// the device's sequences; the header travels beside the bytes.
+// A sequence's state in host memory, laid out as image_bytes() sizes it: its sliding-window rings,
+// its full-attention rows below `position` and a DSpine drafter's lane. The context cache keeps
+// prefixes this way beyond the device's sequences; the header travels beside the bytes.
 struct SequenceImage {
     std::uint32_t position = 0;
 };
@@ -136,10 +155,12 @@ public:
     // The CPU's share of missing experts: its threads and backend, or empty without one.
     [[nodiscard]] std::string expert_cpu_description() const;
     // Runs up to prefill_chunk tokens at the sequence's next positions and leaves the logits of the
-    // last `logit_rows` (at most kMaxLogitRows) in logits(). The soft tokens of `media` take the
-    // place of their rows' placeholder embeddings, and with the vision config's bidirectional
-    // attention a unit's soft tokens see each other in the sliding-window blocks; a unit must lie
-    // whole in one chunk.
+    // last `logit_rows` (at most kMaxLogitRows) in logits(). With no logit rows (a chunk whose
+    // output nothing reads), a full-attention last block only writes the chunk's keys and values,
+    // the bytes the whole block writes, and the assistant drafts after the next chunk. The soft
+    // tokens of `media` take the place of their rows' placeholder embeddings, and with the vision
+    // config's bidirectional attention a unit's soft tokens see each other in the sliding-window
+    // blocks; a unit must lie whole in one chunk.
     void forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,
                  std::uint32_t logit_rows, std::span<const ChunkMedia> media = {});
     // Branches of a text prompt in one pass, each continuing the sequence from its position:
@@ -160,13 +181,27 @@ public:
     [[nodiscard]] Tensor logits(std::uint32_t rows) const;
 
     // The assistant (draft_tokens > 0). A sequence can draft once a prompt chunk, a decode step or
-    // a commit has left the target's hidden state after its last fed token.
+    // a commit has left the target's hidden state after its last fed token; with a DSpine drafter,
+    // once it holds a position.
     [[nodiscard]] std::uint32_t draft_tokens() const noexcept;
     [[nodiscard]] bool can_draft(std::uint32_t sequence) const;
-    // `steps` (1..draft_tokens) greedy drafts after each sequence's anchor, the token its next
-    // position takes: drafts[j * steps + i] is sequence j's i-th draft.
+    // `steps` (1..draft_tokens) drafts after each sequence's anchor, the token its next position
+    // takes: drafts[j * steps + i] is sequence j's i-th draft, the assistant's argmax. With
+    // `configs` (one per sequence; penalties, masks and counts unused) and `lengths`, draft i of
+    // sequence j is drawn from the assistant's distribution under configs[j] with the key
+    // (configs[j].seed, lengths[j] + i + 1, kSamplePurposeDecode), the key of the verification
+    // column that draws the target's token at its place; a row at temperature 0 takes the argmax.
     void draft(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> anchors,
-               std::span<std::int32_t> drafts, std::uint32_t steps);
+               std::span<std::int32_t> drafts, std::uint32_t steps,
+               std::span<const ops::SamplingConfig> configs = {},
+               std::span<const std::int32_t> lengths    = {});
+    // The DSpine drafter's proposals (ExecutorOptions::dspine): for each of up to eight `sequences`
+    // (distinct), the k (1..draft_tokens) greedy drafts after its anchor, the token its next
+    // position takes, and each draft's probability under the drafter's refined law;
+    // drafts[j * k + i] and confidence[j * k + i] are sequence j's i-th. Returns once both are on
+    // the host.
+    void draft(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> anchors,
+               std::uint32_t k, std::span<std::int32_t> drafts, std::span<float> confidence);
     // widths[j] tokens of sequence j (its anchor, then its drafts; without widths, tokens.size() /
     // sequences.size() each) at its next positions, as decode rows: logits one column each,
     // sequence by sequence. The positions advance only with commit().
@@ -177,6 +212,16 @@ public:
     [[nodiscard]] cudaStream_t head_stream() const noexcept;
     void snapshot(std::uint32_t sequence, SequenceSnapshot& out);
     void restore(std::uint32_t sequence, const SequenceSnapshot& from);
+    // Takes the sequence back `tokens` positions, to the state it had before it read them: false,
+    // changing nothing, when its sliding-window rings no longer hold the window before that
+    // position. They hold it for as many positions as their slots exceed the window and a
+    // round's drafts, and not before the sequence's last prompt, checkpoint or image; rings no
+    // wider than the window hold it for the 32 decode steps after hold().
+    bool rewind(std::uint32_t sequence, std::uint32_t tokens);
+    // The sequence may return to its current position: its next decode steps keep the rows they
+    // overwrite in rings no wider than the window. release_hold() ends that.
+    void hold(std::uint32_t sequence);
+    void release_hold(std::uint32_t sequence);
     // Bytes of an image at `position`.
     [[nodiscard]] std::uint64_t image_bytes(std::uint32_t position) const;
     // Copies the sequence's state into `pages`, pinned host memory that holds image_bytes() of its

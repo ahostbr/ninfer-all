@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
+#include <filesystem>
 #include <string_view>
 #include <vector>
 
@@ -14,6 +16,8 @@ struct LoadOptions {
     EnginePurpose purpose          = EnginePurpose::Generation;
     bool vision                    = false;
     SpeculativeBackend speculative = SpeculativeBackend::None;
+    // --spec dspine: the standalone drafter artifact, loaded beside the model's own.
+    std::filesystem::path draft_model;
     ProposalHead proposal_head     = ProposalHead::Full;
     // Device-memory trades that store a stored Q8 vocabulary matrix (or the MoE MTP layer's routed
     // experts) at a narrower group-64 width while the weights load; the artifact is unchanged.
@@ -67,7 +71,8 @@ struct LoadOptions {
     TensorAttention tensor_attention = TensorAttention::Heads;
     // How the ranks exchange their partial sums (`--tensor-parallel-transport`).
     TensorParallelTransport tensor_parallel_transport = TensorParallelTransport::Auto;
-    // How a prompt chunk's partial sums cross host memory (`--tensor-parallel-prompt-partials`).
+    // How a prompt chunk's partial sums cross between the devices
+    // (`--tensor-parallel-prompt-partials`).
     TensorParallelPartials tensor_parallel_prompt_partials = TensorParallelPartials::Fp32;
 
     bool operator==(const LoadOptions&) const = default;
@@ -100,7 +105,11 @@ struct LoadOptions {
         return speculative == SpeculativeBackend::DFlash2;
     }
 
-    [[nodiscard]] bool masked_draft() const noexcept { return dflash() || dflash2(); }
+    [[nodiscard]] bool dspine() const noexcept {
+        return speculative == SpeculativeBackend::DSpine;
+    }
+
+    [[nodiscard]] bool masked_draft() const noexcept { return dflash() || dflash2() || dspine(); }
 
     [[nodiscard]] bool proposal_enabled() const noexcept {
         return purpose == EnginePurpose::Generation && speculative != SpeculativeBackend::None &&
@@ -119,13 +128,32 @@ struct LoadOptions {
             return "dflash2";
         case SpeculativeBackend::DSpark:
             return "dspark";
+        case SpeculativeBackend::DSpine:
+            return "dspine";
         }
         return {};
     }
 };
 
 [[nodiscard]] constexpr bool is_masked_draft_backend(SpeculativeBackend backend) noexcept {
-    return backend == SpeculativeBackend::DFlash || backend == SpeculativeBackend::DFlash2;
+    return backend == SpeculativeBackend::DFlash || backend == SpeculativeBackend::DFlash2 ||
+           backend == SpeculativeBackend::DSpine;
+}
+
+// A masked drafter whose round verifies a sparse law of 16 candidates a draft (DFlash2's frame).
+[[nodiscard]] constexpr bool is_sparse_draft_backend(SpeculativeBackend backend) noexcept {
+    return backend == SpeculativeBackend::DFlash2 || backend == SpeculativeBackend::DSpine;
+}
+
+// Device state images a Qwen3.5-core Program with the context catalog keeps beside the catalog's,
+// one for each concurrent request: the state at the token where a stop string's match began,
+// which a turn that ends at that stop string returns to. The hybrid prefix cache keeps that state
+// in a snapshot slot.
+[[nodiscard]] inline std::uint32_t stop_hold_slots(const ContextCacheOptions& cache,
+                                                   std::uint32_t concurrency) noexcept {
+    return cache.enabled && cache.mode == ContextCacheMode::Legacy && cache.stop_hold_images
+               ? concurrency
+               : 0U;
 }
 
 // The draft head a plan uses: an automatic head not yet resolved against an artifact
@@ -138,6 +166,7 @@ struct LoadOptions {
     return {.purpose        = options.purpose,
             .vision         = options.enable_vision,
             .speculative    = options.speculative.backend,
+            .draft_model    = options.speculative.draft_model,
             .proposal_head  = planned_proposal_head(options.speculative.proposal_head),
             .lm_head_q4     = options.lm_head_q4,
             .lm_head_q6     = options.lm_head_q6,

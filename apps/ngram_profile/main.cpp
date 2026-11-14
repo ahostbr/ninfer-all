@@ -1,13 +1,17 @@
-// ninfer-ngram-profile: the hot-row profile of a Qwen3.8-Flash-Next n-gram table, counted from a
-// text corpus's tokens alone (the rows a token addresses depend on the token and its predecessors
-// only, so no model runs), and the share of a held-out corpus's row reads a profile's leading rows
-// serve at a range of RAM budgets.
+// ninfer-ngram-profile: the hot-row profile of a Qwen3.8-Flash-Next n-gram table or a
+// DeepSeek-V4.1 Engram table, counted from a text corpus's tokens alone (the rows a token addresses
+// depend on the token and its predecessors only, so no model runs), and the share of a held-out
+// corpus's row reads a profile's leading rows serve at a range of RAM budgets.
 
 #include "artifact/reader.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
 #include "models/qwen3_5/frontend/frontend.h"
 #include "models/qwen3_5/frontend/resources.h"
+#include "product/launch_config/launch_config.h"
+#include "product/option_layers.h"
 #include "product/prompt_input/prompt_input.h"
+#include "models/deepseek_v41/config.h"
+#include "models/deepseek_v41/engram.h"
 #include "models/qwen4_exp/config.h"
 #include "models/qwen4_exp/ngram_hash.h"
 #include "models/qwen4_exp/ngram_profile.h"
@@ -44,8 +48,9 @@ constexpr const char* kUsage =
     "usage: ninfer-ngram-profile <model.ninfer> --out PROFILE [--max-rows N] TEXT...\n"
     "       ninfer-ngram-profile <model.ninfer> --evaluate PROFILE [--row-bytes B] TEXT...\n"
     "\n"
-    "Counts the n-gram table rows a corpus addresses, from its tokens alone (no model runs), and\n"
-    "writes them, the most frequent first, as a hot-row profile for --ngram-residency ram-hot.\n"
+    "Counts the n-gram table rows (Qwen3.8-Flash-Next) or Engram table rows (DeepSeek-V4.1) a\n"
+    "corpus addresses, from its tokens alone (no model runs), and writes them, the most frequent\n"
+    "first, as a hot-row profile for --ngram-residency ram-hot.\n"
     "A TEXT file is one document, or a .jsonl file one document per line: its \"text\", or its\n"
     "\"messages\" rendered by the model's Frontend, including tools and the generation prompt.\n"
     "Message documents may set \"enable_thinking\"; absent uses the template's default.\n"
@@ -57,14 +62,17 @@ constexpr const char* kUsage =
     "                       repeat a row their document read before, and what a page cache of\n"
     "                       the budget would serve at best (the 4 KiB pages these reads read\n"
     "                       most)\n"
-    "  --row-bytes B        bytes per stored row the budgets are reckoned in (default 90, the\n"
-    "                       published gguf_iq4_nl table; 320 for bf16)\n";
+    "  --row-bytes B        bytes per stored row the budgets are reckoned in (default: the\n"
+    "                       gguf_iq4_nl row, 90 for Flash-Next and 144 for DeepSeek-V4.1; 162 for\n"
+    "                       the Edge0 FP8 table, 320 for bf16)\n"
+    "  --config FILE        options from a launch configuration file (docs/cli.md); the command\n"
+    "                       line overrides it, and its `model` names the artifact\n";
 
 struct Options {
     std::filesystem::path model, out, evaluate;
     std::vector<std::filesystem::path> texts;
     std::uint64_t max_rows  = std::numeric_limits<std::uint64_t>::max();
-    std::uint64_t row_bytes = 90;
+    std::uint64_t row_bytes = 0; // 0: the family's gguf_iq4_nl row
 };
 
 std::uint64_t parse_count(std::string_view text, const char* option) {
@@ -76,18 +84,20 @@ std::uint64_t parse_count(std::string_view text, const char* option) {
     return value;
 }
 
-Options parse(int argc, char** argv) {
-    if (argc < 2 || std::string_view(argv[1]) == "--help" || std::string_view(argv[1]) == "-h") {
-        std::cout << kUsage;
-        std::exit(argc < 2 ? 2 : 0);
-    }
+// The arguments after the model, as one list. With `spans` it only splits them into options
+// (product::parse_layered); without, it also validates them together.
+Options parse_arguments(const std::vector<std::string>& arguments,
+                        std::vector<product::OptionSpan>* spans) {
     Options out;
-    out.model = argv[1];
-    for (int i = 2; i < argc; ++i) {
-        const std::string_view arg = argv[i];
+    product::OptionSpanRecorder recorder(spans);
+    for (std::size_t i = 0; i < arguments.size(); ++i) {
+        recorder.begin(i);
+        const std::string_view arg = arguments[i];
         const auto value           = [&]() -> std::string_view {
-            if (++i >= argc) { throw std::invalid_argument(std::string(arg) + " needs a value"); }
-            return argv[i];
+            if (++i >= arguments.size()) {
+                throw std::invalid_argument(std::string(arg) + " needs a value");
+            }
+            return arguments[i];
         };
         if (arg == "--out") {
             out.out = std::filesystem::path(value());
@@ -103,27 +113,48 @@ Options parse(int argc, char** argv) {
             out.texts.emplace_back(arg);
         }
     }
+    recorder.finish(arguments.size());
+    if (recorder.splitting()) { return out; }
     if (out.out.empty() == out.evaluate.empty()) {
-        throw std::invalid_argument("give one of --out and --evaluate");
+        throw product::OptionConflict({"out", "evaluate"}, "give one of --out and --evaluate");
     }
     if (out.texts.empty()) { throw std::invalid_argument("give the corpus's TEXT files"); }
     return out;
 }
 
-// The model's tokenizer and n-gram hash, read from its artifact without its weights.
+Options parse(int argc, char** argv) {
+    const product::CommandLine command_line =
+        product::read_command_line(argc, argv, product::PositionalArtifact::Taken);
+    if (command_line.help || !command_line.artifact) {
+        std::cout << kUsage;
+        std::exit(command_line.help ? 0 : 2);
+    }
+    Options out = product::parse_layered(command_line.layer_arguments(), {}, parse_arguments);
+    out.model   = *command_line.artifact;
+    return out;
+}
+
+// The model's tokenizer and the hash that addresses its table, read from its artifact without its
+// weights: Flash-Next's n-gram hash, or (an artifact with an `engram` component) DeepSeek-V4.1's
+// Engram hash.
 struct Hash {
     std::vector<std::byte> tokenizer_json, tokenizer_config, generation_config, chat_template;
     std::shared_ptr<const models::qwen3_5::frontend::Tokenizer> tokenizer;
     std::optional<models::qwen3_5::Frontend> frontend;
-    NgramHashConstants constants;
-    std::int32_t eos    = 0;
-    std::uint32_t vocab = 0;
+    std::optional<NgramHashConstants> constants;              // Flash-Next
+    std::optional<models::deepseek_v41::EngramHasher> engram; // DeepSeek-V4.1
+    std::int32_t eos            = 0;
+    std::uint32_t vocab         = 0;
+    std::uint64_t table_rows    = 0;
+    std::uint64_t fingerprint   = 0;
+    std::uint32_t per_token     = 0; // rows each token addresses
+    std::uint64_t iq4_row_bytes = 0; // the family's gguf_iq4_nl row
 
     explicit Hash(const std::filesystem::path& model) {
         const artifact::Reader reader(model);
-        const auto& text  = reader.directory().component("text");
-        const auto config = models::qwen4_exp::parse_text_config(text.config);
-        const auto object = [&](const char* role) {
+        const auto& text    = reader.directory().component("text");
+        const bool deepseek = reader.directory().components.contains("engram");
+        const auto object   = [&](const char* role) {
             const auto found = text.resources.find(role);
             if (found == text.resources.end()) {
                 throw std::runtime_error(model.string() + " has no " + role);
@@ -148,12 +179,29 @@ struct Hash {
             .tokenizer = tokenizer,
             .public_token_count = static_cast<std::uint32_t>(tokenizer->vocab_size())};
         frontend.emplace(models::qwen3_5::make_frontend(resources,
-            {.architecture = models::Architecture::Qwen4Exp, .vision_enabled = false,
+            {.architecture = deepseek ? models::Architecture::DeepSeekV41
+                                      : models::Architecture::Qwen4Exp,
+             .vision_enabled = false,
              .max_context = std::numeric_limits<std::uint32_t>::max()}));
-        constants = models::qwen4_exp::derive_ngram_hash_constants(config.ngram);
-        eos       = config.eos_token_id;
-        vocab     = config.vocab_size;
-        if (constants.rows > std::numeric_limits<std::uint32_t>::max()) {
+        if (deepseek) {
+            const auto config    = models::deepseek_v41::parse_text_config(text.config);
+            const auto token_map = models::deepseek_v41::engram_token_map(reader, config);
+            fingerprint = models::deepseek_v41::engram_hash_fingerprint(config.engram, token_map);
+            for (const auto rows : config.engram.layer_rows) { table_rows += rows; }
+            engram.emplace(config.engram, token_map);
+            per_token     = engram->rows_per_token();
+            iq4_row_bytes = models::deepseek_v41::kEngramRowBytes;
+        } else {
+            const auto config = models::qwen4_exp::parse_text_config(text.config);
+            constants         = models::qwen4_exp::derive_ngram_hash_constants(config.ngram);
+            eos               = config.eos_token_id;
+            vocab             = config.vocab_size;
+            table_rows        = constants->rows;
+            fingerprint       = models::qwen4_exp::ngram_hash_fingerprint(*constants);
+            per_token         = constants->heads();
+            iq4_row_bytes     = 90;
+        }
+        if (table_rows > std::numeric_limits<std::uint32_t>::max()) {
             throw std::runtime_error("the table has more rows than a profile addresses");
         }
     }
@@ -161,9 +209,14 @@ struct Hash {
     // The rows each token of `text` addresses, document start to end, in order.
     void rows(std::span<const TokenId> ids, std::vector<std::uint64_t>& out) const {
         std::vector<std::int32_t> tokens(ids.begin(), ids.end());
-        NgramContext context = NgramContext::sequence_start(constants, eos);
-        out.resize(tokens.size() * constants.heads());
-        models::qwen4_exp::ngram_row_ids(constants, tokens, eos, vocab, context, out);
+        out.resize(tokens.size() * per_token);
+        if (engram) {
+            models::deepseek_v41::EngramHasher::History history;
+            engram->rows(history, tokens, out.data());
+            return;
+        }
+        NgramContext context = NgramContext::sequence_start(*constants, eos);
+        models::qwen4_exp::ngram_row_ids(*constants, tokens, eos, vocab, context, out);
     }
 };
 
@@ -214,7 +267,7 @@ void for_each_document(const std::vector<std::filesystem::path>& texts,
 }
 
 int profile(const Options& options, const Hash& hash) {
-    std::vector<std::uint32_t> counts(static_cast<std::size_t>(hash.constants.rows), 0);
+    std::vector<std::uint32_t> counts(static_cast<std::size_t>(hash.table_rows), 0);
     std::vector<std::uint64_t> rows;
     std::uint64_t documents = 0, tokens = 0;
     for_each_document(options.texts, hash, [&](std::span<const TokenId> ids) {
@@ -223,7 +276,7 @@ int profile(const Options& options, const Hash& hash) {
             if (counts[row] != std::numeric_limits<std::uint32_t>::max()) { ++counts[row]; }
         }
         ++documents;
-        tokens += rows.size() / hash.constants.heads();
+        tokens += rows.size() / hash.per_token;
     });
     std::vector<std::uint64_t> ranked; // count << 32 | ~row: descending count, then ascending row
     for (std::uint64_t row = 0; row < counts.size(); ++row) {
@@ -232,9 +285,7 @@ int profile(const Options& options, const Hash& hash) {
         }
     }
     std::sort(ranked.begin(), ranked.end(), std::greater<>());
-    NgramProfile out{.table_rows  = hash.constants.rows,
-                     .fingerprint = models::qwen4_exp::ngram_hash_fingerprint(hash.constants),
-                     .tokens      = tokens};
+    NgramProfile out{.table_rows = hash.table_rows, .fingerprint = hash.fingerprint, .tokens = tokens};
     const auto keep =
         static_cast<std::size_t>(std::min<std::uint64_t>(ranked.size(), options.max_rows));
     out.rows.reserve(keep);
@@ -245,37 +296,38 @@ int profile(const Options& options, const Hash& hash) {
     std::printf("%llu documents, %llu tokens, %llu row reads, %zu distinct rows; wrote %zu rows "
                 "to %s\n",
                 static_cast<unsigned long long>(documents), static_cast<unsigned long long>(tokens),
-                static_cast<unsigned long long>(tokens * hash.constants.heads()), ranked.size(),
+                static_cast<unsigned long long>(tokens * hash.per_token), ranked.size(),
                 keep, options.out.string().c_str());
     return 0;
 }
 
 int evaluate(const Options& options, const Hash& hash) {
     const NgramProfile profile = models::qwen4_exp::read_ngram_profile(options.evaluate);
-    models::qwen4_exp::check_ngram_profile(profile, hash.constants, options.evaluate);
+    models::qwen4_exp::check_ngram_profile(profile, hash.table_rows, hash.fingerprint,
+                                           options.evaluate);
+    const std::uint64_t row_bytes = options.row_bytes != 0 ? options.row_bytes : hash.iq4_row_bytes;
     constexpr std::uint32_t kAbsent = std::numeric_limits<std::uint32_t>::max();
-    std::vector<std::uint32_t> rank(static_cast<std::size_t>(hash.constants.rows), kAbsent);
+    std::vector<std::uint32_t> rank(static_cast<std::size_t>(hash.table_rows), kAbsent);
     for (std::size_t i = 0; i < profile.rows.size(); ++i) {
         rank[profile.rows[i]] = static_cast<std::uint32_t>(i);
     }
     // The RAM budgets, and the profile rows each holds beside the hot set's index.
-    const std::uint64_t index =
-        (hash.constants.rows + 63) / 64 * 8 + (hash.constants.rows + 511) / 512 * 4;
+    const std::uint64_t index = (hash.table_rows + 63) / 64 * 8 + (hash.table_rows + 511) / 512 * 4;
     std::vector<std::uint64_t> budgets;
     for (std::uint64_t mib = 256; mib <= 32768; mib *= 2) { budgets.push_back(mib << 20U); }
     std::vector<std::uint64_t> capacity;
     for (const auto budget : budgets) {
         capacity.push_back(
             budget > index
-                ? std::min<std::uint64_t>((budget - index) / options.row_bytes, profile.rows.size())
+                ? std::min<std::uint64_t>((budget - index) / row_bytes, profile.rows.size())
                 : 0);
     }
     std::vector<std::uint64_t> hits(budgets.size(), 0), repeat_misses(budgets.size(), 0);
     // The last document that read each row, for the reads that repeat within a document, and the
     // reads of each 4 KiB page of the table, for the page cache's best case at a budget.
-    std::vector<std::uint32_t> last(static_cast<std::size_t>(hash.constants.rows), 0);
+    std::vector<std::uint32_t> last(static_cast<std::size_t>(hash.table_rows), 0);
     std::vector<std::uint32_t> pages(
-        static_cast<std::size_t>((hash.constants.rows * options.row_bytes + 4095) / 4096), 0);
+        static_cast<std::size_t>((hash.table_rows * row_bytes + 4095) / 4096), 0);
     std::vector<std::uint64_t> rows;
     std::uint64_t documents = 0, reads = 0, repeats = 0, in_profile = 0;
     for_each_document(options.texts, hash, [&](std::span<const TokenId> ids) {
@@ -286,7 +338,7 @@ int evaluate(const Options& options, const Hash& hash) {
             const bool repeat = last[row] == document;
             last[row]         = document;
             repeats += repeat;
-            ++pages[row * options.row_bytes / 4096];
+            ++pages[row * row_bytes / 4096];
             const std::uint32_t r = rank[row];
             in_profile += r != kAbsent;
             for (std::size_t b = 0; b < budgets.size(); ++b) {
@@ -315,7 +367,7 @@ int evaluate(const Options& options, const Hash& hash) {
     std::printf("held-out: %llu documents, %llu tokens, %llu row reads; profile of %zu rows "
                 "from %llu tokens\n",
                 static_cast<unsigned long long>(documents),
-                static_cast<unsigned long long>(reads / hash.constants.heads()),
+                static_cast<unsigned long long>(reads / hash.per_token),
                 static_cast<unsigned long long>(reads), profile.rows.size(),
                 static_cast<unsigned long long>(profile.tokens));
     std::printf("reads of rows the profile lists: %.1f%%; reads that repeat a row of their "

@@ -4,16 +4,21 @@
 #include "ninfer/ops/sigmoid_mul.h"
 
 #include "core/layout.h"
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/paged_kv_storage.h"
 #include "ops/common/device_multiprocessors.h"
 #include "ops/common/device_tier.h"
 #include "ops/kv_cache/append/launch.h"
 #include "ops/kv_cache/d256_profile.h"
 #include "ops/softmax_attention/dense/causal_cache/geometry.cuh"
-#include "ops/softmax_attention/dense/causal_cache/launch.h"
-#include "ops/softmax_attention/dense/causal_cache/prompt_nvfp4_fast_plan.h"
-#include "ops/softmax_attention/dense/causal_cache/prompt_sm70.h"
+#include "ops/softmax_attention/dense/causal_cache/int8/prompt_fast_plan.h"
+#include "ops/softmax_attention/dense/causal_cache/prompt_launch.h"
+#include "ops/softmax_attention/dense/causal_cache/nvfp4/prompt_fast_launch.h"
+#include "ops/softmax_attention/dense/causal_cache/nvfp4/prompt_fast_plan.h"
+#include "ops/softmax_attention/dense/causal_cache/prompt_policy.h"
+#include "ops/softmax_attention/dense/causal_cache/sm70/prompt.h"
+#include "ops/softmax_attention/dense/causal_cache/route.h"
+#include "ops/softmax_attention/dense/causal_cache/small_t_launch.h"
 
 #include <algorithm>
 #include <cmath>
@@ -45,7 +50,8 @@ std::int32_t causal_attention_chunk_tokens(std::int32_t q_heads, std::int32_t wi
                                            CausalAttentionExecutionEnvelope envelope) {
     if (causal_attention_model_query_heads(q_heads) == 16) return 6;
     // Balance the two narrow BF16 chunks; INT8 benefits from 5+4/5 at long contexts.
-    if (batch_size == 1 && ((storage == KvCacheStorage::BFloat16 && width >= 9 && width <= 12) ||
+    const bool bf16 = storage == KvCacheStorage::BFloat16 || storage == KvCacheStorage::Bf16Packed;
+    if (batch_size == 1 && ((bf16 && width >= 9 && width <= 12) ||
                             (storage == KvCacheStorage::Int8Group64 && width >= 9 && width <= 10 &&
                              envelope.max_visible_keys > 4096)))
         return (width + 1) / 2;
@@ -449,6 +455,7 @@ CausalAttentionRoute causal_attention_resolve_route(std::int32_t call_q_heads, s
             std::uint32_t prompt_limit = 0;
             switch (storage) {
             case KvCacheStorage::BFloat16:
+            case KvCacheStorage::Bf16Packed:
                 prompt_limit = width <= 4 ? 128 : width <= 8 ? 256 : 640;
                 break;
             case KvCacheStorage::Int8Group64:
@@ -620,6 +627,9 @@ static std::size_t workspace_capacity_bytes(AttentionHeadGeometry geometry,
     // Propagate d256_kv_cache_profile's own diagnostic for an unrecognized storage selection
     // rather than folding it into the generic message below.
     (void)d256_kv_cache_profile(cache_storage);
+    if (cache_storage == KvCacheStorage::Bf16Packed && current_device_volta()) {
+        throw std::invalid_argument("--kv-dtype bf16p needs sm_75 or newer");
+    }
     if (batch_size <= 0 || batch_size > kMaximumBatchSize || min_width <= 0 ||
         max_width < min_width || (batch_size > 1 && max_width > kMaximumVerifyTokens) ||
         envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys ||
@@ -672,15 +682,20 @@ static std::size_t workspace_capacity_bytes(AttentionHeadGeometry geometry,
             maximum = std::max(maximum, exact_capacity(width));
         }
     }
-    if (batch_size == 1 && kv_cache_is_int8_family(cache_storage) &&
+    if (batch_size == 1 &&
+        (kv_cache_is_int8_family(cache_storage) ||
+         cache_storage == KvCacheStorage::Fp8E4M3Row256) &&
         detail::causal_attention_prompt_fast_kernel(cache_storage, envelope.fast_prompt_kernel)) {
-        // The fast INT8-family prompt kernel's split partials. Only widths past every
-        // graph-captured call split (prompt_i8_fast_plan.h), and those always take the prompt
-        // route, so each plans at the envelope's maximum, which bounds every launch inside it.
+        // The fast prompt kernels' (INT8 family, row-scaled FP8) split partials. Only widths past
+        // every graph-captured call split (int8/prompt_fast_plan.h), and those always take the prompt
+        // route, so each plans at the envelope's maximum, which bounds every launch inside it. The
+        // FP8 fast CTA is four warps, so its plan never takes the wide eight-warp candidate.
         const detail::CausalPromptI8FastSplitPolicy policy =
             detail::causal_attention_prompt_fast_split_policy();
         const std::int32_t multiprocessors = detail::current_device_multiprocessors(170);
-        const bool wide                    = detail::causal_prompt_i8_fast_wide(cache_storage);
+        const bool wide                    = cache_storage == KvCacheStorage::Fp8E4M3Row256
+                                                 ? false
+                                                 : detail::causal_prompt_i8_fast_wide(cache_storage);
         for (std::int32_t width = std::max(min_width, detail::kCausalPromptI8FastMinSplitWidth);
              width <= max_width && policy.maximum > 1; ++width) {
             const detail::CausalPromptI8FastPlan plan = detail::causal_prompt_i8_fast_plan(
@@ -793,9 +808,20 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
             "causal_softmax_attention: a position-split cache needs a valid rank and a partial");
     }
 
+    const bool packed = cache.storage == KvCacheStorage::Bf16Packed;
+    if (packed && cache.page_stride != 1) {
+        throw std::invalid_argument(
+            "causal_softmax_attention: a bf16p KV cache does not take position-split attention");
+    }
+
     auto scope = workspace.scope();
     const detail::CausalAttentionRoute route =
         detail::causal_attention_resolve_route(q.ne[1], width, batch, cache.storage, envelope);
+    // A bf16p cache's small-T kernels read packed rows only: the call's rows are appended first.
+    if (packed && route != detail::CausalAttentionRoute::Prompt) {
+        detail::kv_cache_append_batch_launch(k, v, positions, valid_columns, kv_table_rows, cache,
+                                             stream);
+    }
     if (route == detail::CausalAttentionRoute::ChunkedSmallT) {
         const bool fusable = kv_cache_is_int8_family(cache.storage);
         const bool gated   = launch_chunked_small_t(
@@ -814,8 +840,8 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
         // rk4v4-e8, rk2v4-e8). The FP8, NVFP4 and K8V4 storages reach their own reduce kernels, so
         // they take the standalone multiply like the routes that cannot fold it at all; every
         // caller still sees one contract.
-        const bool fusable =
-            cache.storage == KvCacheStorage::BFloat16 || kv_cache_is_int8_family(cache.storage);
+        const bool fusable = cache.storage == KvCacheStorage::BFloat16 || packed ||
+                             kv_cache_is_int8_family(cache.storage);
         detail::causal_attention_small_t_launch(
             q, k, v, positions, valid_columns, kv_table_rows, scale, cache, envelope, 0, width,
             partial.acc, partial.m, partial.l, out, stream,
@@ -824,7 +850,7 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
         return;
     }
     // A position-split rank's prompt: the rows it holds appended, then its keys' partial output
-    // (prompt_sm70.h), every storage on one route.
+    // (sm70/prompt.h), every storage on one route.
     if (partial_out != nullptr) {
         detail::kv_cache_append_batch_launch(k, v, positions, valid_columns, kv_table_rows, cache,
                                              stream);
@@ -855,6 +881,65 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                                            cache, envelope.max_visible_keys, workspace, out,
                                            envelope.fast_prompt_kernel, stream);
     if (gate != nullptr) { sigmoid_mul(*gate, out, stream); }
+}
+
+void causal_softmax_attention_append(const Tensor& k, const Tensor& v, const Tensor& positions,
+                                     const Tensor& valid_columns, const Tensor& kv_table_rows,
+                                     AttentionHeadGeometry geometry, PagedKVBatchLayerView cache,
+                                     CausalAttentionExecutionEnvelope envelope,
+                                     cudaStream_t stream) {
+    constexpr const char* op = "causal_softmax_attention_append";
+    require_causal_geometry(geometry, op);
+    if (k.dtype != DType::BF16 || v.dtype != DType::BF16) {
+        throw std::invalid_argument("causal_softmax_attention_append: k/v must be BF16");
+    }
+    const bool masked = valid_columns.data != nullptr;
+    if (positions.dtype != DType::I32 || kv_table_rows.dtype != DType::I32 ||
+        (masked && valid_columns.dtype != DType::I32)) {
+        throw std::invalid_argument("causal_softmax_attention_append: batch metadata must be I32");
+    }
+    const std::int32_t width    = k.ne[2];
+    const std::int32_t batch    = k.ne[3];
+    const std::int32_t kv_heads = geometry.kv_heads;
+    if (width <= 0 || batch <= 0 || batch > kMaximumBatchSize ||
+        (batch > 1 && width > kMaximumVerifyTokens)) {
+        throw std::invalid_argument("causal_softmax_attention_append: unsupported B/W domain");
+    }
+    require_shape(k, kHeadDim, kv_heads, width, batch, op, "k");
+    require_shape(v, kHeadDim, kv_heads, width, batch, op, "v");
+    require_shape(positions, width, batch, 1, 1, op, "positions");
+    if (masked) { require_shape(valid_columns, batch, 1, 1, 1, op, "valid columns"); }
+    require_shape(kv_table_rows, batch, 1, 1, 1, op, "KV table rows");
+    require_contiguous_nonnull(k, op, "k");
+    require_contiguous_nonnull(v, op, "v");
+    require_contiguous_nonnull(positions, op, "positions");
+    if (masked) { require_contiguous_nonnull(valid_columns, op, "valid columns"); }
+    require_contiguous_nonnull(kv_table_rows, op, "KV table rows");
+    if (cache.num_kv_heads != kv_heads) {
+        throw std::invalid_argument("causal_softmax_attention_append: invalid KV cache heads");
+    }
+    const std::uint32_t capacity = validate_batch_cache(cache, kv_heads, op);
+    if (cache.block_tables.ne[1] < batch || envelope.min_visible_keys == 0 ||
+        envelope.min_visible_keys > envelope.max_visible_keys ||
+        envelope.max_visible_keys > kCausalAttentionMaximumVisibleKeys ||
+        envelope.max_visible_keys > capacity ||
+        (!masked && envelope.max_visible_keys < static_cast<std::uint32_t>(width))) {
+        throw std::invalid_argument(
+            "causal_softmax_attention_append: invalid execution envelope or table");
+    }
+    if (cache.page_stride < 1 || cache.page_stride > kCausalAttentionMaximumMergeRanks ||
+        cache.page_residue < 0 || cache.page_residue >= cache.page_stride ||
+        (cache.storage == KvCacheStorage::Bf16Packed && cache.page_stride != 1)) {
+        throw std::invalid_argument("causal_softmax_attention_append: invalid position split");
+    }
+    // Every prompt route of causal_softmax_attention appends with this launch before it attends.
+    if (detail::causal_attention_resolve_route(geometry.query_heads, width, batch, cache.storage,
+                                               envelope) != detail::CausalAttentionRoute::Prompt) {
+        throw std::invalid_argument(
+            "causal_softmax_attention_append: the call does not take the prompt route");
+    }
+    detail::kv_cache_append_batch_launch(k, v, positions, valid_columns, kv_table_rows, cache,
+                                         stream);
 }
 
 void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,

@@ -15,8 +15,11 @@ stored ``1 + w`` (every norm but ``ssm_norm``), ``ssm_a`` becomes ``A_log`` agai
 interleaved ``attn_q`` splits into query and gate rows, and the indexer's split projections and the
 squeezed PLE convolution keep the layout the HF adapter (qwen4_exp.py) declares.
 
-The first shard of a release holds the model; the second holds only ``per_layer_token_embd``, the
-n-gram table, which every release shares byte for byte. The MTP block comes from an MTP GGUF of its
+The first shard of a GSQ-RCO release holds the model; the second holds only
+``per_layer_token_embd``, the n-gram table, which every release shares byte for byte. A llama.cpp
+split (Unsloth's releases: the metadata in the first shard, the tensors in the next ones, the table
+in the last) is read as one file from its first shard (``GGUFSplit``), and its last shard is the
+``ngram`` source. The MTP block comes from an MTP GGUF of its
 own (Unsloth's ``MTP/`` folder), block 48 with ``nextn.*`` tensors and no embedding or head. The recipe imports it row for row as the
 ``ngram`` component's table, into the model's artifact or into a table artifact of its own, and
 records the SHA-256 of its bytes, by which a model stored without the table names the one it reads.
@@ -161,10 +164,11 @@ def _hc(prefix: str) -> dict[str, tuple[tuple[int, ...], str]]:
 
 
 def expected_tensors(
-    ple_layers: tuple[int, ...] = (1,), experts: int = EXPERTS
+    ple_layers: tuple[int, ...] = (1,), experts: int = EXPERTS, routed: bool = True
 ) -> dict[str, tuple[tuple[int, ...], str]]:
     """Row-major shape and kind of every tensor of the model shard; an expert-pruned release keeps
-    `experts` of the 512 (and one router row for each)."""
+    `experts` of the 512 (and one router row for each). A skeleton GGUF, whose routed experts are
+    stored elsewhere (an Edge0 release), has none of the three expert banks (`routed` false)."""
 
     out = {
         "token_embd.weight": ((VOCABULARY, HIDDEN), MATRIX),
@@ -185,13 +189,16 @@ def expected_tensors(
         out |= {
             p + "ffn_gate_inp.weight": ((experts, HIDDEN), MATRIX),
             p + "ffn_gate_inp_shexp.weight": ((HIDDEN,), "direct"),
-            p + "ffn_gate_exps.weight": ((experts, EXPERT_WIDTH, HIDDEN), MATRIX),
-            p + "ffn_up_exps.weight": ((experts, EXPERT_WIDTH, HIDDEN), MATRIX),
-            p + "ffn_down_exps.weight": ((experts, HIDDEN, EXPERT_WIDTH), MATRIX),
             p + "ffn_gate_shexp.weight": ((SHARED_WIDTH, HIDDEN), MATRIX),
             p + "ffn_up_shexp.weight": ((SHARED_WIDTH, HIDDEN), MATRIX),
             p + "ffn_down_shexp.weight": ((HIDDEN, SHARED_WIDTH), MATRIX),
         }
+        if routed:
+            out |= {
+                p + "ffn_gate_exps.weight": ((experts, EXPERT_WIDTH, HIDDEN), MATRIX),
+                p + "ffn_up_exps.weight": ((experts, EXPERT_WIDTH, HIDDEN), MATRIX),
+                p + "ffn_down_exps.weight": ((experts, HIDDEN, EXPERT_WIDTH), MATRIX),
+            }
         if full_attention(layer):
             out |= {
                 p + "attn_q.weight": ((2 * QUERY_ROWS, HIDDEN), MATRIX),
@@ -284,8 +291,10 @@ def _stored(info, kind: str) -> bool:
     return info.type_id in DIRECT
 
 
-def validate(gguf: GGUFFile, config: dict, source_layers: tuple[int, ...] | None = None) -> None:
-    """Refuse any GGUF that is not the Flash-Next text model this config describes."""
+def validate(gguf: GGUFFile, config: dict, source_layers: tuple[int, ...] | None = None,
+             routed: bool = True) -> None:
+    """Refuse any GGUF that is not the Flash-Next text model this config describes (without its
+    routed expert banks when `routed` is false)."""
 
     for key, expected in EXPECTED_HEADER.items():
         if gguf.kv.get(key) != expected:
@@ -306,7 +315,7 @@ def validate(gguf: GGUFFile, config: dict, source_layers: tuple[int, ...] | None
     for layer, kind in zip(indices, config["layer_types"], strict=True):
         if (kind == "full_attention") != full_attention(layer):
             raise ValueError("the qwen4exp GGUF recipe needs QSA on every fourth block")
-    expected = expected_tensors((1,), config["num_experts"])
+    expected = expected_tensors((1,), config["num_experts"], routed)
     model = {name for name in gguf.tensors if name != NGRAM_TENSOR}
     if model != set(expected):
         missing = sorted(set(expected) - model)[:5]
@@ -314,10 +323,11 @@ def validate(gguf: GGUFFile, config: dict, source_layers: tuple[int, ...] | None
         raise ValueError(f"{gguf.path}: tensor set mismatch (missing {missing}, extra {extra})")
     for name, (shape, kind) in expected.items():
         info = gguf.tensors[name]
-        if info.shape != shape or not _stored(info, kind):
+        # A vector may be stored as a one-row matrix (Strata's skeleton keeps ffn_gate_inp_shexp so).
+        vector = kind == "direct" and len(shape) == 1 and info.shape == (1, *shape)
+        if (info.shape != shape and not vector) or not _stored(info, kind):
             raise ValueError(f"{gguf.path}: {name} is {info.type_name} {info.shape}")
-    end = max(info.offset + info.nbytes for info in gguf.tensors.values())
-    if gguf.data_bytes_available < end:
+    if gguf.truncated():
         raise ValueError(f"{gguf.path}: the data section is truncated")
 
 
@@ -342,8 +352,7 @@ def validate_mtp(gguf: GGUFFile, experts: int) -> None:
         info = gguf.tensors[name]
         if info.shape != shape or not _stored(info, kind):
             raise ValueError(f"{gguf.path}: {name} is {info.type_name} {info.shape}")
-    end = max(info.offset + info.nbytes for info in gguf.tensors.values())
-    if gguf.data_bytes_available < end:
+    if gguf.truncated():
         raise ValueError(f"{gguf.path}: the data section is truncated")
 
 
@@ -521,14 +530,15 @@ def mtp_sources(gguf: GGUFFile, experts: int) -> dict[str, tuple[LogicalSource, 
     return out
 
 
-def _moe_sources(out: dict, gguf: GGUFFile, g: str, m: str, experts: int) -> None:
+def _moe_sources(out: dict, gguf: GGUFFile, g: str, m: str, experts: int,
+                 routed: bool = True) -> None:
     out[m + "router"] = matrix_source(gguf, g + "ffn_gate_inp.weight", (experts, HIDDEN), rows())
     out[m + "shared_score"] = (
         _direct(_words(gguf, g + "ffn_gate_inp_shexp.weight").reshape(1, HIDDEN),
                 torch.bfloat16, g + "ffn_gate_inp_shexp.weight"),
         False,
     )
-    for expert in range(experts):
+    for expert in range(experts if routed else 0):
         e = m + f"experts/{expert}/"
         out[e + "gate"] = matrix_source(gguf, g + "ffn_gate_exps.weight", (EXPERT_WIDTH, HIDDEN),
                                         rows(expert * EXPERT_WIDTH))
@@ -544,9 +554,10 @@ def _moe_sources(out: dict, gguf: GGUFFile, g: str, m: str, experts: int) -> Non
                                            (HIDDEN, SHARED_WIDTH), rows())
 
 
-def text_sources(gguf: GGUFFile, config: dict, source_layers: tuple[int, ...] | None = None
-                 ) -> dict[str, tuple[LogicalSource, bool]]:
-    """Every text parameter's GGUF source; True marks encoded block rows."""
+def text_sources(gguf: GGUFFile, config: dict, source_layers: tuple[int, ...] | None = None,
+                 routed: bool = True) -> dict[str, tuple[LogicalSource, bool]]:
+    """Every text parameter's GGUF source; True marks encoded block rows. A skeleton GGUF supplies
+    every parameter but the routed experts (`routed` false)."""
 
     out: dict[str, tuple[LogicalSource, bool]] = {}
 
@@ -613,7 +624,7 @@ def text_sources(gguf: GGUFFile, config: dict, source_layers: tuple[int, ...] | 
                                        untile(taps[2 * GDN_KEY_DIM:], GDN_HEAD_DIM)])
             direct(n + "convolution", _direct(channels.T, torch.bfloat16, g + "ssm_conv1d.weight"))
             direct(n + "norm", _norm(gguf, g + "ssm_norm.weight", False))
-        _moe_sources(out, gguf, g, p + "moe/", config["num_experts"])
+        _moe_sources(out, gguf, g, p + "moe/", config["num_experts"], routed)
         if layer in config["ple_layers"]:
             q = p + "ple/"
             matrix(q + "key", g + "ple_key.weight", (WIDTH, HIDDEN))
@@ -684,9 +695,9 @@ def configure_ngram_gguf(model, recipe, table):
 
 
 def qwen3_8_flash_next_gguf(model, recipe, sources):
-    """A Qwen3.8-Flash-Next GSQ-RCO GGUF release in its own block formats: the model shard as
-    `--source gguf=SHARD1.gguf` (for the text component) and the n-gram table shard as
-    `--source ngram=SHARD2.gguf`, which is always read, since the model records the digest of the
+    """A Qwen3.8-Flash-Next GGUF release (GSQ-RCO's two shards or a llama.cpp split) in its own
+    block formats: the first shard as `--source gguf=SHARD1.gguf` (for the text component) and the
+    n-gram table shard, the release's last, as `--source ngram=SHARD.gguf`, which is always read, since the model records the digest of the
     table it reads even when the table's rows go into an artifact of their own. The Vision tower
     comes from the release's BF16 `mmproj` GGUF (`--source vision=mmproj.gguf`) and stays BF16; the
     MTP block from an MTP GGUF (`--source mtp=mtp-*.gguf`), whose matrices keep their blocks. Every

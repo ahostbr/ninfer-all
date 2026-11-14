@@ -5,7 +5,9 @@
 #include "ninfer/kv_cache_storage.h"
 #include "ninfer/model_enums.h"
 #include "ninfer/request.h"
+#include "product/launch_config/launch_config.h"
 #include "product/logging/logging.h"
+#include "product/prompt_route_options.h"
 #include "product/steering_options.h"
 #include "serve/request.h"
 
@@ -29,6 +31,9 @@ struct ServeOptions {
     // `<VERSION>+<build id>` of this binary, set by ninfer-serve from its build stamp (not a flag):
     // GET /health, the X-NInfer-Version header, /props build_info and the server_start record.
     std::string build_version;
+    // The CUDA compiler release and architectures of this binary (`nvcc 13.4.92, 86`), from the
+    // same stamp: ninfer-serve --version, the startup log and /props build_info.
+    std::string build_toolchain;
     std::string artifact_path;
     std::filesystem::path chat_template_path;
     std::string host = "127.0.0.1";
@@ -122,9 +127,9 @@ struct ServeOptions {
     // zero keeps it loaded. Both modes.
     std::uint32_t sleep_idle_seconds  = 0;
     std::uint32_t unload_idle_seconds = 0;
-    // The arguments after the artifact path, router options removed: what router mode starts each
-    // model with.
-    std::vector<std::string> model_arguments;
+    // The option layers after the artifact path (configuration files, then the command line),
+    // router options removed: what router mode starts each model with.
+    std::vector<product::ArgumentLayer> model_layers;
 
     [[nodiscard]] bool router() const noexcept { return models_dir || models_preset; }
     bool mlp_a8_decode      = false;
@@ -166,6 +171,8 @@ struct ServeOptions {
     // and --control-vector-layer-range: the adapters a request's `lora` names by index, and the
     // control vectors every request runs with.
     product::SteeringFlags steering;
+    // --prefill-tail and --iq1m-experts.
+    product::PromptRouteFlags prompt_routes;
     std::optional<std::uint32_t> default_thinking_budget;
     // --reasoning-loop off|stop|conclude: the reasoning-loop guard for every thinking request,
     // constrained ones included (off by default).
@@ -213,11 +220,16 @@ struct ServeOptions {
     // them a request opts in with its own `post_thinking` object.
     std::optional<SamplingOverrides> post_thinking_overrides;
     bool greedy                 = false; // --greedy: force temperature 0 (exact argmax)
+    bool gumbel_sampling        = false; // --gumbel-sampling (EngineOptions::gumbel_sampling)
     product::LogLevel log_level = product::LogLevel::Info;
 
     // Exact process argv for the server-start record. Secret-bearing option values are redacted
     // while parsing; this is provenance only and never affects execution.
     std::vector<std::string> startup_argv;
+    // The options the server was parsed from after its configuration files and command line were
+    // merged (product/option_layers.h), secrets redacted: the server-start record and a router's
+    // /models report them.
+    std::vector<std::string> effective_arguments;
 };
 
 // Parse-time limits. A request that omits max_tokens / max_completion_tokens / max_output_tokens
@@ -232,7 +244,10 @@ struct ServeOptions {
                          .lenient_image_detail      = options.lenient_image_detail};
 }
 
+// argv, with its --config files (product::read_command_line).
 ServeOptions parse_serve_options(int argc, char** argv);
+// One run's artifact and option layers: a router's model.
+ServeOptions parse_serve_options(const product::CommandLine& command_line);
 std::string resolve_public_model_id(const ServeOptions& options,
                                     std::string_view artifact_model_name);
 std::string serve_usage_text(const char* argv0);

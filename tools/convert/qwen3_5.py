@@ -178,10 +178,7 @@ def draft_config(raw: dict, target: dict, backend: str) -> dict:
     _fixed(raw, "model_type", "qwen3", backend)
     _fixed(raw, "hidden_act", "silu", backend)
     _fixed(raw, "attention_bias", False, backend)
-    # A DSpine draft (Tencent; DFlash layers plus a code bridge) is converted as the dflash
-    # component: it is block-causal, which plain DFlash and DFlash2 are not.
-    dspine = backend == "dflash" and "selected_prefix_code_bridge" in raw.get("dflash_config", {})
-    _fixed(raw, "is_causal", dspine, backend)
+    _fixed(raw, "is_causal", False, backend)
     for key, value in (
         ("hidden_size", target["hidden_size"]),
         ("vocab_size", target["vocab_size"]),
@@ -273,49 +270,8 @@ def draft_config(raw: dict, target: dict, backend: str) -> dict:
                 _fixed(scope, key, expected, backend)
             if scope.get("final_logit_softcapping") not in (None, 0, 0.0):
                 raise ValueError("DFlash2 final_logit_softcapping must be disabled")
-    if dspine:
-        output["dspine"] = _dspine_extra(raw, draft, result["num_hidden_layers"])
     result["dflash_config"] = output
     return result
-
-
-def _dspine_extra(raw: dict, draft: dict, num_layers: int) -> dict:
-    """Tencent DSpine (github.com/Tencent/DSpine, dspine_mlx/config.py): the code bridge after every
-    draft layer and the serial last-write refinement. Only the served variant is accepted."""
-    for key, expected in (
-        ("draft_block_causal", True),
-        ("selected_prefix_terminal", False),
-        ("selected_prefix_decode_mode", "serial"),
-        ("selected_prefix_feature_writes", True),
-        ("selected_prefix_feature_write_mode", "independent"),
-    ):
-        _fixed(draft, key, expected, "dspine")
-    bridge = draft.get("selected_prefix_code_bridge")
-    if not isinstance(bridge, dict):
-        raise ValueError("dspine: missing selected_prefix_code_bridge")
-    layers = draft.get("selected_prefix_feature_layers")
-    if layers != list(range(1, num_layers + 1)):
-        raise ValueError("dspine: the bridge must write after every draft layer")
-    second = raw.get("code_bridge_second_pass")
-    if (
-        not isinstance(second, dict)
-        or second.get("mode") != "serial_table"
-        or second.get("first_exact") != num_layers - 1
-    ):
-        raise ValueError("dspine: code_bridge_second_pass must be serial_table on the last layer")
-    refine = draft.get("selected_prefix_last_write_refine", {})
-    if refine.get("kind", "exact_sender") != "exact_sender" or refine.get("version", 1) != 1:
-        raise ValueError("dspine: unsupported selected_prefix_last_write_refine")
-    top_k = _positive(second.get("head_topk"), "dspine.head_topk")
-    if refine.get("head_topk", top_k) != top_k:
-        raise ValueError("dspine: refinement widths disagree")
-    return {
-        "block_size": _positive(raw.get("block_size"), "dspine.block_size"),
-        "code_size": _positive(bridge.get("code_size"), "dspine.code_size"),
-        "rank": _positive(bridge.get("rank"), "dspine.rank"),
-        "bridge_eps": _f32(bridge.get("eps", 1e-6), "dspine.eps"),
-        "head_topk": top_k,
-    }
 
 
 def _has_model_config(source: SafetensorsSource) -> bool:
@@ -642,7 +598,8 @@ class _Builder:
         )
         self.group(prefix + "mlp/gate", prefix + "mlp/up")
 
-    def moe(self, prefix, source_prefix, store, config):
+    def moe(self, prefix, source_prefix, store, config, *, routed=True):
+        """The router, the shared expert and, with `routed`, the routed experts of one MoE."""
         h, e = config["hidden_size"], config["num_experts"]
         ir, shared = (
             config["moe_intermediate_size"],
@@ -665,7 +622,7 @@ class _Builder:
         )
         self.group(p + "router", p + "shared_score")
         gate_up, downs = [], []
-        for expert in range(e):
+        for expert in range(e if routed else 0):
             ep = p + f"experts/{expert}/"
             for role, half in (("gate", 0), ("up", 1)):
                 self.add(
@@ -690,8 +647,9 @@ class _Builder:
                 inputs=(ep + "product",),
             )
             downs.append(ep + "down")
-        self.group(*gate_up)
-        self.group(*downs)
+        if routed:
+            self.group(*gate_up)
+            self.group(*downs)
         for role in ("gate", "up"):
             self.add(
                 p + "shared/" + role,
@@ -915,28 +873,6 @@ class _Builder:
                     "candidate_selector." + role,
                     (target["vocab_size"], rank),
                 )
-        if "dspine" in draft:
-            self.dspine_bridge(store, config, target, backend)
-
-    def dspine_bridge(self, store, config, target, backend):
-        """The code bridge stays BF16 (dspine_mlx quantize_draft keeps it unquantized: the
-        refinement tail depends on its exact rounding). The zero terminal projection and the
-        version scalars are checked by the loader of the source, not stored."""
-        h, v, n = target["hidden_size"], target["vocab_size"], config["num_hidden_layers"]
-        extra = config["dflash_config"]["dspine"]
-        c, r = extra["code_size"], extra["rank"]
-        src = "selected_prefix_bridge."
-        for name, field, shape in (
-            ("codebook", "codebook", (v, c)),
-            ("read_weight", "read_weight", (c, h)),
-            ("early_read_weights", "early_read_weights", (n - 1, c, h)),
-            ("feature_write_weights", "feature_write_weights", (n, h, r)),
-            ("gate_weight", "gate.weight", (r, c)),
-            ("gate_bias", "gate.bias", (r,)),
-            ("predecessor_gate_weight", "predecessor_gate.weight", (r, c)),
-            ("prev_weight", "prev.weight", (r, c)),
-        ):
-            self.add(backend + "/dspine/" + name, store, src + field, shape)
 
 
 def build_model(

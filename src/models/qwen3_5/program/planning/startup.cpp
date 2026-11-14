@@ -1,4 +1,5 @@
 #include "models/qwen3_5/execution/attention.h"
+#include "models/qwen3_5/execution/dspine_head.h"
 #include "models/qwen3_5/execution/rotation.h"
 #include "models/qwen3_5/execution/ffn.h"
 #include "models/qwen3_5/execution/gdn.h"
@@ -7,6 +8,7 @@
 #include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/planning/startup.h"
+#include "models/qwen3_5/frontend/graft.h"
 #include "models/qwen3_5/program/prefix/hybrid_host_layout.h"
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/execution/text.h"
@@ -29,6 +31,7 @@
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/sliding_window_attention.h"
+#include "models/dspine/drafter.h"
 #include "ninfer/ops/softmax_attention.h"
 #include "ninfer/ops/speculative_round.h"
 #include "runtime/contract/rope_scaling.h"
@@ -136,7 +139,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         throw std::logic_error("Qwen3.5 context cache options are not normalized");
     }
     const std::int32_t state_image_slots = checked_i32(
-        static_cast<std::uint64_t>(plan.max_concurrency) + *plan.context_cache.device_state_slots,
+        static_cast<std::uint64_t>(plan.max_concurrency) + *plan.context_cache.device_state_slots +
+            stop_hold_slots(plan.context_cache, plan.max_concurrency),
         "Qwen3.5 StateImage slot count exceeds int32");
     const auto effective_prefill_chunk =
         static_cast<std::int32_t>(std::min(plan.prefill_chunk, plan.capacity));
@@ -171,6 +175,10 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         // share under position-split attention, and its GDN heads' share of every GDN layer's
         // state.
         if (parameters.text.tensor_shares.front().attention_positions) {
+            if (plan.kv_storage == KvCacheStorage::Bf16Packed) {
+                throw std::invalid_argument(
+                    "--kv-dtype bf16p does not take --tensor-attention positions");
+            }
             kv_position_ranks = static_cast<std::uint32_t>(ranks);
         } else {
             for (const auto& share : parameters.text.tensor_shares) {
@@ -256,9 +264,11 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         const auto* draft =
             parameters.model.config().draft ? &*parameters.model.config().draft : nullptr;
         if (plan.features.masked_draft()) {
+            // DSpine's ring is the narrowest attention window that sees the whole context.
             state_image_spec.dflash_local = qwen3_5::DFlashLocalStateSpec{
                 .layers   = draft->local_layer_count(),
-                .capacity = draft->sliding_window.value_or(0),
+                .capacity = draft->dspine ? dspine::ring_capacity(*draft->dspine, plan.capacity)
+                                          : draft->sliding_window.value_or(0),
                 .kv_heads = dimension(draft->attention.num_key_value_heads),
                 .head_dim = dimension(draft->attention.head_dim),
             };
@@ -356,6 +366,12 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                  static_cast<std::int32_t>(widest_verify_window(plan) + 1U),
                  static_cast<std::int32_t>(plan.max_concurrency)},
                 "DFlash pending target features");
+            if (draft->dspine) {
+                dflash.dspine_head_write = add_tensor(
+                    builder, DType::BF16,
+                    {dimension(draft->dspine->rank), dimension(draft->dspine->vocab_size)},
+                    "DSpine head-write table");
+            }
         }
     }
 
@@ -398,6 +414,12 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         out.sampling_config = add_tensor(
             builder, DType::I32, {config_words, static_cast<std::int32_t>(plan.max_concurrency)},
             "sampling config");
+        if (plan.features.mtp() && plan.gumbel_sampling) {
+            out.draft_sampling_config = add_tensor(
+                builder, DType::I32,
+                {config_words, static_cast<std::int32_t>(plan.max_concurrency)},
+                "MTP proposal sampling config");
+        }
     }
     if (plan.steering_adapters != 0 || plan.steering_vectors) {
         // Every rank edits its replica or stage residual itself, so each holds its own copy.
@@ -473,6 +495,9 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     }
     const auto chunk  = static_cast<std::int32_t>(chunk_u32);
     const auto drafts = static_cast<std::int32_t>(plan.draft_window);
+    // The masked drafter's widest proposal (a copy round of several rows runs it at its width).
+    const auto proposal_drafts = static_cast<std::int32_t>(
+        masked_proposal_window(plan.draft_window, plan.ngram_draft_window, plan.max_concurrency));
     // A copy round verifies up to the widest window; the neural drafter still proposes drafts.
     const auto verify_drafts = static_cast<std::int32_t>(widest_verify_window(plan));
     const auto verify        = verify_drafts + 1;
@@ -690,19 +715,35 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         matrix(layout, DType::BF16, dimension(config.hidden_size), last);
         scratch(layout, share);
     };
+    // A proposal's logits and the head's scratch; with --gumbel-sampling also the sampler's, after
+    // a subset head's logits are spread over the vocabulary beside the sampled rows' draws
+    // (TextContext::proposal_argmax).
     const auto proposal_scratch = [&](WorkspaceLayoutBuilder& layout, std::int32_t columns) {
+        const auto vocabulary = dimension(parameters.model.resources().public_token_count);
         if (plan.proposal_head == ProposalHead::Optimized) {
             const auto& head  = parameters.proposal->head;
             const DType dtype = execution::fp32_proposal_logits(head) ? DType::FP32 : DType::BF16;
             matrix(layout, dtype, dimension(parameters.proposal->rows), columns);
             linear_scratch(layout, head, columns, columns);
             divided_head_scratch(layout, parameters.proposal->head_shares, dtype, columns, columns);
+            if (plan.gumbel_sampling) {
+                if (parameters.proposal->token_ids) {
+                    matrix(layout, DType::FP32, vocabulary, columns);
+                    (void)layout.alloc(DType::I32, {columns});
+                }
+                scratch(layout,
+                        ops::sampling_workspace_capacity_bytes(vocabulary, columns, columns));
+            }
         } else {
             const bool fp32 = execution::fp32_proposal_logits(parameters.mtp->output_head);
             if (fp32) { matrix(layout, DType::FP32, dimension(config.vocab_size), columns); }
             linear_scratch(layout, parameters.mtp->output_head, columns, columns);
             divided_head_scratch(layout, parameters.mtp->output_head_shares,
                                  fp32 ? DType::FP32 : DType::BF16, columns, columns);
+            if (plan.gumbel_sampling) {
+                scratch(layout,
+                        ops::sampling_workspace_capacity_bytes(vocabulary, columns, columns));
+            }
         }
     };
     const auto mtp_stem = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens,
@@ -1036,7 +1077,38 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
 
     if (plan.features.masked_draft()) {
         {
-            const auto* draft                  = &*parameters.model.config().draft;
+            const auto* draft = &*parameters.model.config().draft;
+            // DSpine: its Drafter's own workspace at the ring the state images hold, and the
+            // target head's at each call's columns.
+            const std::uint32_t dspine_ring =
+                draft->dspine ? dspine::ring_capacity(*draft->dspine, plan.capacity) : 0U;
+            if (draft->dspine && parameters.dspine == nullptr) {
+                throw std::logic_error("--spec dspine plans without its drafter");
+            }
+            const auto head_bytes = [&](std::int32_t columns) {
+                WorkspaceLayoutBuilder head;
+                linear_scratch(head, parameters.text.output_head, 1, columns);
+                std::size_t bytes = finish(head);
+                // A proposal ranks its candidates in one pass where the Op takes the head.
+                if (const auto* ranked =
+                        execution::dspine_ranked_head(parameters, plan.proposal_head)) {
+                    const Weight& w = ranked->weight;
+                    bytes           = std::max(
+                        bytes, execution::rotated_workspace_bytes(
+                                   ranked->hadamard_signs, static_cast<std::int32_t>(w.k), columns,
+                                   ops::linear_topk_workspace_capacity_bytes(w.qtype, w.n, w.k, 1,
+                                                                             columns)));
+                } else if (plan.proposal_head == ProposalHead::Optimized) {
+                    // A proposal head of another form: its dense logits, ranked.
+                    const auto& proposal = parameters.proposal->head;
+                    WorkspaceLayoutBuilder dense;
+                    matrix(dense, DType::BF16, proposal.weight.n, columns);
+                    linear_scratch(dense, proposal, 1, columns);
+                    scratch(dense, ops::candidate_topk_workspace_capacity_bytes(columns));
+                    bytes = std::max(bytes, finish(dense));
+                }
+                return bytes;
+            };
             const auto dflash_context_capacity = [&](std::int32_t width, std::int32_t batch,
                                                      bool compact_input) {
                 const auto tokens = width * batch;
@@ -1047,14 +1119,26 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                      std::uint64_t(draft->target_layer_ids.size())),
                            tokens);
                 }
+                if (draft->dspine.has_value()) {
+                    scratch(layout, dspine::Drafter::context_workspace_bytes(
+                                        *parameters.dspine, dspine_ring, width, batch));
+                    return finish(layout);
+                }
                 if (draft->dflash2.has_value()) {
                     const auto local_width =
                         std::min(width, dimension(draft->sliding_window.value_or(0)));
                     (void)workspace::dflash_context(layout, config, *draft, local_width * batch);
                     linear_scratch(layout, parameters.draft->feature_projection,
                                    local_width * batch, local_width * batch);
-                    scratch(layout, ops::context_kv_materialize_workspace_capacity_bytes(
-                                        batch, local_width, local_width));
+                    if (draft->fused_dflash2(config.hidden_size)) {
+                        scratch(layout, ops::context_kv_materialize_workspace_capacity_bytes(
+                                            batch, local_width, local_width));
+                    } else {
+                        // The composed route appends layer by layer, as DFlash does.
+                        auto layer = layout.scope();
+                        (void)workspace::dflash_context_layer(layout, config, *draft,
+                                                              local_width * batch);
+                    }
                     return finish(layout);
                 }
                 (void)workspace::dflash_context(layout, config, *draft, tokens);
@@ -1069,17 +1153,61 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 WorkspaceLayoutBuilder layout;
                 const std::int32_t tokens          = width * batch;
                 const std::int32_t proposal_drafts = width - 1;
+                if (draft->dspine.has_value()) {
+                    scratch(layout, dspine::Drafter::proposal_workspace_bytes(
+                                        *parameters.dspine, logits_dtype, dspine_ring,
+                                        plan.capacity, width, batch,
+                                        head_bytes(proposal_drafts * batch)));
+                    return finish(layout);
+                }
                 matrix(layout, DType::BF16, dimension(config.hidden_size), tokens);
                 if (draft->dflash2.has_value()) {
-                    const auto prepare = [&] {
+                    const bool fused = draft->fused_dflash2(config.hidden_size);
+                    // The composed route (execution/draft.cpp) keeps a branch's coefficients beside
+                    // its prepared input and projects through Linear on both sides.
+                    const auto prepare = [&](bool attention_branch) {
                         (void)workspace::dflash2_branch(layout, config, *draft, width, batch);
-                        scratch(layout,
+                        if (fused) {
+                            scratch(
+                                layout,
                                 ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
                                     width, width, batch, batch));
+                            return;
+                        }
+                        matrix(layout, DType::FP32,
+                               dimension(2ULL * draft->dflash2->conv_kernel_size *
+                                         config.hidden_size / draft->dflash2->conv_group_size),
+                               tokens);
+                        auto inner = layout.scope();
+                        matrix(layout, DType::BF16, dimension(config.hidden_size), tokens);
+                        for (const auto& block : parameters.draft->layers) {
+                            linear_scratch(layout,
+                                           (attention_branch ? block.attention_conv
+                                                             : block.mlp_conv)
+                                               ->kernel_projection,
+                                           tokens, tokens);
+                        }
+                    };
+                    const auto finish_branch = [&](bool attention_branch) {
+                        if (fused) {
+                            scratch(layout,
+                                    ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
+                                        dimension(attention_branch
+                                                      ? draft->attention.query_width()
+                                                      : draft->intermediate_size),
+                                        width, width, batch, batch));
+                            return;
+                        }
+                        auto inner = layout.scope();
+                        matrix(layout, DType::BF16, dimension(config.hidden_size), tokens);
+                        for (const auto& block : parameters.draft->layers) {
+                            linear_scratch(layout, attention_branch ? block.output : block.mlp.down,
+                                           tokens, tokens);
+                        }
                     };
                     {
                         auto attention = layout.scope();
-                        prepare();
+                        prepare(true);
                         matrix(layout, DType::BF16, dimension(draft->attention.query_width()),
                                tokens);
                         matrix(layout, DType::BF16, dimension(draft->attention.key_width()),
@@ -1094,14 +1222,11 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                              dimension(draft->attention.num_key_value_heads)},
                                             dimension(draft->sliding_window.value_or(0)),
                                             {0, plan.capacity}, width, width, batch));
-                        scratch(layout,
-                                ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
-                                    dimension(draft->attention.query_width()), width, width, batch,
-                                    batch));
+                        finish_branch(true);
                     }
                     {
                         auto mlp = layout.scope();
-                        prepare();
+                        prepare(false);
                         matrix(layout, DType::BF16, dimension(draft->intermediate_size), tokens);
                         for (const auto& block : parameters.draft->layers) {
                             const auto& p = block.mlp.gate_up;
@@ -1111,10 +1236,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                                     p.weight.qtype, p.weight.n, p.weight.k,
                                                     p.policy, tokens, tokens)));
                         }
-                        scratch(
-                            layout,
-                            ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
-                                dimension(draft->intermediate_size), width, width, batch, batch));
+                        finish_branch(false);
                     }
                     const auto mask_columns = proposal_drafts * batch;
                     matrix(layout, DType::BF16, dimension(config.hidden_size), mask_columns);
@@ -1123,12 +1245,23 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     const auto& head = plan.proposal_head == ProposalHead::Optimized
                                            ? parameters.proposal->head
                                            : parameters.draft->output_head;
-                    if (execution::rotated(head.hadamard_signs)) {
-                        matrix(layout, DType::BF16, dimension(config.hidden_size), mask_columns);
+                    if (fused) {
+                        if (execution::rotated(head.hadamard_signs)) {
+                            matrix(layout, DType::BF16, dimension(config.hidden_size),
+                                   mask_columns);
+                        }
+                        scratch(layout, ops::linear_topk_workspace_capacity_bytes(
+                                            head.weight.qtype, head.weight.n, head.weight.k,
+                                            mask_columns, mask_columns));
+                    } else {
+                        // The packed mask columns before the final norm, then the dense logits
+                        // with the head's scratch or the top-k's.
+                        scratch(layout, std::size_t(config.hidden_size) * mask_columns * 2);
+                        auto dense = layout.scope();
+                        matrix(layout, DType::BF16, head.weight.n, mask_columns);
+                        linear_scratch(layout, head, mask_columns, mask_columns);
+                        scratch(layout, ops::candidate_topk_workspace_capacity_bytes(mask_columns));
                     }
-                    scratch(layout, ops::linear_topk_workspace_capacity_bytes(
-                                        head.weight.qtype, head.weight.n, head.weight.k,
-                                        mask_columns, mask_columns));
                     matrix(layout, DType::BF16, dimension(draft->dflash2->selector_rank),
                            mask_columns);
                     linear_scratch(layout, parameters.draft->selector->hidden_projection,
@@ -1136,15 +1269,6 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     scratch(layout, ops::candidate_selector_path_workspace_capacity_bytes(
                                         proposal_drafts, proposal_drafts, batch, batch));
                     return finish(layout);
-                }
-                // DSpine (draft.cpp): the last bridge write's stash lives through the proposal.
-                const bool dspine = draft->dspine.has_value();
-                const std::int32_t dspine_rank =
-                    dspine ? static_cast<std::int32_t>(draft->dspine->rank) : 0;
-                if (dspine) {
-                    matrix(layout, DType::BF16, dimension(config.hidden_size), tokens);
-                    matrix(layout, DType::FP32, 1, tokens);
-                    matrix(layout, DType::BF16, dspine_rank, tokens);
                 }
                 {
                     auto attention = layout.scope();
@@ -1162,28 +1286,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                           dimension(draft->attention.num_key_value_heads)},
                                          {0, plan.capacity}, width, width, batch)));
                     for (const auto& block : parameters.draft->layers) {
-                        if (dspine) {
-                            // o_proj as a plain projection into a temporary, then residual_add.
-                            auto projected = layout.scope();
-                            matrix(layout, DType::BF16, dimension(config.hidden_size), tokens);
-                            linear_scratch(layout, block.output, tokens, tokens);
-                        } else {
-                            add_scratch(layout, block.output, tokens, tokens);
-                        }
+                        add_scratch(layout, block.output, tokens, tokens);
                     }
-                }
-                if (dspine) {
-                    // ops::dspine::bridge_write scratch.
-                    auto bridge = layout.scope();
-                    const auto code = static_cast<std::int32_t>(draft->dspine->code_size);
-                    matrix(layout, DType::BF16, dimension(config.hidden_size), tokens);
-                    matrix(layout, DType::FP32, 1, tokens);
-                    matrix(layout, DType::BF16, code, tokens);
-                    matrix(layout, DType::BF16, code, tokens);
-                    for (int i = 0; i < 4; ++i) {
-                        matrix(layout, DType::BF16, dspine_rank, tokens);
-                    }
-                    matrix(layout, DType::BF16, dimension(config.hidden_size), tokens);
                 }
                 {
                     auto mlp = layout.scope();
@@ -1213,25 +1317,20 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                        ? parameters.proposal->head
                                        : parameters.draft->output_head;
                 linear_scratch(layout, head, proposal_drafts * batch, proposal_drafts * batch);
-                if (dspine) {
-                    // The refinement: raw rows, their norm-scaled copy, candidate logits, top-k
-                    // ids and base logits (FP32 covers either logits dtype), each head projection
-                    // with its scratch.
-                    const auto rows = proposal_drafts * batch;
-                    const auto& full = parameters.text.output_head;
-                    matrix(layout, DType::BF16, dimension(config.hidden_size), rows);
-                    matrix(layout, DType::BF16, dimension(config.hidden_size), rows);
-                    matrix(layout, DType::FP32, dimension(config.vocab_size), rows);
-                    linear_scratch(layout, full, rows, rows);
-                    matrix(layout, DType::I32, static_cast<std::int32_t>(draft->dspine->head_topk),
-                           rows);
-                    matrix(layout, DType::FP32, dimension(config.vocab_size), rows);
-                    linear_scratch(layout, full, rows, rows);
-                }
                 return finish(layout);
             };
 
             out.dflash_context = dflash_context_capacity(chunk, 1, false);
+            if (draft->dspine.has_value()) {
+                // The head-write table's derivation at startup.
+                const auto concurrency = static_cast<std::int32_t>(plan.max_concurrency);
+                out.dflash_context = std::max(
+                    out.dflash_context,
+                    dspine::Drafter::prepare_workspace_bytes(
+                        *parameters.dspine, logits_dtype, concurrency, proposal_drafts + 1,
+                        head_bytes(dspine::Drafter::prepare_columns(
+                            *parameters.dspine, concurrency, proposal_drafts + 1))));
+            }
             for (std::int32_t batch = 1; batch <= static_cast<std::int32_t>(plan.max_concurrency);
                  ++batch) {
                 std::size_t target_bytes = 0;
@@ -1245,16 +1344,17 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     target_bytes = std::max(target_bytes, finish(target));
                 }
                 const std::size_t accept =
-                    draft->dflash2.has_value()
+                    draft->dflash2.has_value() || draft->dspine.has_value()
                         ? ops::speculative_accept_sparse_drafts_workspace_capacity_bytes(
                               dimension(parameters.model.resources().public_token_count), {false},
                               narrowest_drafts, verify_drafts, batch, batch)
                         : ops::speculative_accept_coupled_drafts_workspace_capacity_bytes(
                               dimension(parameters.model.resources().public_token_count),
                               narrowest_drafts, verify_drafts, batch, batch);
-                // A copy round above batch one also runs the drafter at its own window, and a
+                // A copy round above batch one also runs the drafter, at the copy window, and a
                 // round after a copy round appends up to the widest window of target features.
-                const std::size_t proposal = dflash_proposal_capacity(drafts + 1, batch);
+                const std::size_t proposal =
+                    dflash_proposal_capacity((batch > 1 ? proposal_drafts : drafts) + 1, batch);
                 const std::size_t gather   = ops::logprob_topk_workspace_capacity_bytes(
                     dimension(parameters.model.resources().public_token_count), batch * verify);
                 out.dflash_round =
@@ -1336,7 +1436,7 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     // Past the native window positions run unscaled RoPE or YaRN, to four times the window: the
     // extension Qwen documents for these models (1,048,576 tokens on a 262,144-token window).
     constexpr std::uint64_t kPositionExtension = 4;
-    if (parameters.draft &&
+    if ((parameters.draft || parameters.dspine) &&
         options.max_context >
             kPositionExtension * parameters.model.config().draft->max_position_embeddings) {
         throw std::invalid_argument("max_context exceeds the selected draft position capacity");
@@ -1392,6 +1492,12 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         options.speculative.backend != SpeculativeBackend::Mtp) {
         throw std::invalid_argument("an MTP attention window requires the MTP backend");
     }
+    if (options.speculative.mtp_policy == MtpDraftPolicy::Adaptive &&
+        options.speculative.backend != SpeculativeBackend::Mtp &&
+        !is_masked_draft_backend(options.speculative.backend)) {
+        throw std::invalid_argument(
+            "--adaptive-mtp requires --spec mtp, dflash, dflash2 or dspine");
+    }
     switch (options.speculative.backend) {
     case SpeculativeBackend::None:
         if (options.speculative.draft_tokens != 0 ||
@@ -1423,6 +1529,29 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
             throw std::invalid_argument("masked draft window must be in [1,15]");
         }
         break;
+    case SpeculativeBackend::DSpine: {
+        const auto& draft = parameters.model.config().draft;
+        if (parameters.dspine == nullptr || !draft || !draft->dspine) {
+            throw std::invalid_argument("--spec dspine needs its drafter artifact (--draft-model)");
+        }
+        if (options.speculative.draft_tokens == 0 ||
+            options.speculative.draft_tokens + 1 > draft->dspine->block_size ||
+            options.speculative.draft_tokens > 15) {
+            throw std::invalid_argument(
+                "the DSpine draft window must be in [1, min(15, block_size - 1)]");
+        }
+        // Copy rounds of several requests run the drafter at the copy window.
+        if (masked_proposal_window(options.speculative.draft_tokens,
+                                   options.speculative.ngram_draft_tokens,
+                                   options.max_concurrency) +
+                1 >
+            draft->dspine->block_size) {
+            throw std::invalid_argument(
+                "above one request, --ngram-draft-tokens with DSpine must be at most its "
+                "block_size - 1, the widest proposal its drafter makes");
+        }
+        break;
+    }
     case SpeculativeBackend::DSpark:
         throw std::invalid_argument("--spec dspark drafts for DeepSeek-V4.1 only");
     }
@@ -1454,14 +1583,24 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     if (options.speculative.ngram_draft_tokens != 0 &&
         ((options.speculative.backend != SpeculativeBackend::DFlash2 &&
           options.speculative.backend != SpeculativeBackend::DFlash &&
+          options.speculative.backend != SpeculativeBackend::DSpine &&
           options.speculative.backend != SpeculativeBackend::Mtp) ||
          options.speculative.ngram_draft_tokens > 63 || options.speculative.ngram_min_match < 4 ||
          options.speculative.ngram_min_match > 64 ||
          (options.speculative.ngram_draft_tokens > 15 && options.max_concurrency != 1))) {
         throw std::invalid_argument(
-            "ngram requires MTP/DFlash/DFlash2, K1..63 and match 4..64; the GDN conv-record "
+            "ngram requires MTP/DFlash/DFlash2/DSpine, K1..63 and match 4..64; the GDN conv-record "
             "workspace admits at most 16 verification columns for a multi-request batch, so K "
             "above 15 requires concurrency one");
+    }
+    // A copy round of a masked drafter verifies the drafter's proposal inside its own width
+    // (execution/draft.cpp), so its width is at least the draft window.
+    if (options.speculative.ngram_draft_tokens != 0 &&
+        options.speculative.backend != SpeculativeBackend::Mtp &&
+        options.speculative.ngram_draft_tokens < options.speculative.draft_tokens) {
+        throw std::invalid_argument(
+            "--ngram-draft-tokens must be at least --draft-tokens with a masked drafter: a copy "
+            "round verifies the drafter's proposal inside its own width");
     }
 }
 
@@ -1495,6 +1634,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->use_cuda_graph      = inputs.use_cuda_graph;
     impl->causal_scoring      = inputs.causal_scoring;
     impl->structured_output   = inputs.structured_output;
+    impl->gumbel_sampling     = inputs.gumbel_sampling;
     impl->device              = inputs.device;
     impl->context_cache       = inputs.context_cache;
     impl->kv_storage          = inputs.kv_storage;
@@ -1615,10 +1755,15 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                     },
                     "DFlash graph allowance");
             };
+            // Under adaptive MTP the neural rounds capture one set per width they may select.
+            const auto neural_windows = masked_neural_windows(
+                impl->draft_window, impl->mtp_policy == MtpDraftPolicy::Adaptive);
             for (std::uint32_t batch_size = 1; batch_size <= impl->max_concurrency; ++batch_size) {
-                impl->graph_allowance_bytes = checked_add(
-                    impl->graph_allowance_bytes, class_allowance(batch_size, impl->draft_window),
-                    "DFlash exact-b graph allowance");
+                for (const std::uint32_t window : neural_windows) {
+                    impl->graph_allowance_bytes =
+                        checked_add(impl->graph_allowance_bytes, class_allowance(batch_size, window),
+                                    "DFlash exact-b graph allowance");
+                }
                 if (impl->ngram_draft_window != 0) {
                     impl->graph_allowance_bytes =
                         checked_add(impl->graph_allowance_bytes,
@@ -1646,7 +1791,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             ? TensorParallelExchange::device_bytes(
                   tensor_parallel_slot_bytes(*impl), text.rank_count, inputs.peer_access,
                   inputs.features.tensor_parallel_transport,
-                  inputs.features.tensor_parallel_prompt_partials == TensorParallelPartials::Bf16)
+                  inputs.features.tensor_parallel_prompt_partials != TensorParallelPartials::Fp32)
             : 0U;
     impl->device_reservation_bytes =
         checked_add(impl->device_reservation_bytes, exchange_bytes, "tensor-parallel exchange");
@@ -1837,6 +1982,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .cuda_graph_allowance_bytes = options.cuda_graph_allowance_bytes,
         .causal_scoring             = options.purpose == EnginePurpose::CausalScoring,
         .structured_output          = options.structured_output,
+        .gumbel_sampling            = options.gumbel_sampling,
         .device                     = options.device,
         .context_cache              = options.context_cache,
         .resident_main_pages        = resident_main_pages,
@@ -1871,6 +2017,48 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
     };
     for (const std::size_t bytes : planner->minimum->extra_rank_reservation_bytes) {
         planner->curve.extra_ranks.push_back({.minimum_device_reservation_bytes = bytes});
+    }
+    // The Device state slots beyond one per lane: the hybrid cache's snapshot slots (at least one;
+    // a default count yields to the capacity asked for) or the catalog's checkpoint slots that
+    // --device-state-slots sets, beside the ones direct grafts hold for good. A plan with one slot
+    // fewer prices each.
+    const ContextCacheOptions& cache = inputs.context_cache;
+    if (cache.enabled && cache.device_state_slots) {
+        const bool hybrid          = cache.mode == ContextCacheMode::Hybrid;
+        const std::uint32_t slots  = *cache.device_state_slots;
+        const std::uint32_t pinned = hybrid ? 0U : count_direct_grafts(options.grafts);
+        const std::uint32_t fewest = hybrid ? 1U : 0U;
+        if (slots < pinned + fewest) {
+            throw std::logic_error("Qwen3.5 context cache options are not normalized");
+        }
+        runtime::SequenceCapacityCurve& curve = planner->curve;
+        curve.state_slots           = slots - pinned;
+        curve.minimum_state_slots   = fewest;
+        curve.state_slots_automatic = hybrid && cache.hybrid.fit_device_snapshot_slots;
+        curve.state_slot_option     = hybrid ? "--device-snapshot-slots" : "--device-state-slots";
+        if (curve.state_slots > fewest) {
+            SequencePlanningInputs fewer           = inputs;
+            fewer.context_cache.device_state_slots = slots - 1U;
+            if (hybrid) { fewer.context_cache.hybrid.device_snapshot_slots = slots - 1U; }
+            const auto smaller = build_sequence_candidate(fewer, minimum_pages);
+            const auto& larger = *planner->minimum;
+            if (smaller->device_reservation_bytes >= larger.device_reservation_bytes) {
+                throw std::logic_error("Qwen3.5 sequence layout has a nonpositive state slot stride");
+            }
+            curve.bytes_per_state_slot =
+                larger.device_reservation_bytes - smaller->device_reservation_bytes;
+            for (std::size_t rank = 0; rank < curve.extra_ranks.size(); ++rank) {
+                if (smaller->extra_rank_reservation_bytes[rank] >
+                    larger.extra_rank_reservation_bytes[rank]) {
+                    throw std::logic_error(
+                        "Qwen3.5 sequence layout has a negative state slot stride on a further "
+                        "device");
+                }
+                curve.extra_ranks[rank].bytes_per_state_slot =
+                    larger.extra_rank_reservation_bytes[rank] -
+                    smaller->extra_rank_reservation_bytes[rank];
+            }
+        }
     }
     if (minimum_pages < maximum_pages) {
         auto adjacent = build_sequence_candidate(inputs, minimum_pages + 1U);

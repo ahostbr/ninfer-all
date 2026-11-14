@@ -226,14 +226,64 @@ def quantize_q8_0(values: np.ndarray) -> np.ndarray:
     return out.reshape(rows, -1)
 
 
-def _dequantize(gguf: GGUFFile, tensor: str, first: int, last: int) -> torch.Tensor:
-    blocks = gguf.read_blocks(tensor, first, last)
-    local = {GGML_Q2_0: dequantize_q2_0, GGML_Q8_0: dequantize_q8_0}.get(
-        gguf.info(tensor).type_id
-    )
+def dequantize_q4_0(blocks: np.ndarray) -> np.ndarray:
+    """ggml Q4_0 rows: 32 values per 18-byte block, a binary16 d then 16 code bytes; value j is
+    d * (c - 8), c the low nibble of byte j for j < 16 and the high nibble of byte j - 16 after."""
+
+    rows = blocks.shape[0]
+    b = np.ascontiguousarray(blocks).reshape(rows, -1, 18)
+    d = b[..., :2].copy().view("<f2").astype(np.float32)
+    q = b[..., 2:]
+    codes = np.concatenate([q & 15, q >> 4], axis=-1).astype(np.float32) - np.float32(8.0)
+    return (codes * d).reshape(rows, -1)
+
+
+# ggml's E2M1 code values, doubled (kvalues_mxfp4), and UE4M3 scale bytes halved to match.
+_NVFP4_VALUES = np.array([0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12],
+                         dtype=np.float32)
+
+
+def ue4m3_half(words: np.ndarray) -> np.ndarray:
+    """ggml_ue4m3_to_fp32: half the unsigned E4M3 value (bias 7) of each byte, which reads bits
+    0-6 only; 0x00 and 0x7F are zero."""
+
+    x = np.asarray(words, dtype=np.uint8)
+    exponent = ((x >> 3) & 15).astype(np.int32)
+    mantissa = (x & 7).astype(np.float32)
+    raw = np.where(exponent == 0, np.ldexp(mantissa, -9),
+                   np.ldexp(np.float32(1.0) + mantissa / np.float32(8.0), exponent - 7))
+    return np.where((x == 0) | (x == 0x7F), np.float32(0.0),
+                    raw.astype(np.float32) * np.float32(0.5))
+
+
+def dequantize_nvfp4(blocks: np.ndarray) -> np.ndarray:
+    """ggml NVFP4 rows: 64 values per 36-byte block, four UE4M3 scale bytes (one per 16 values)
+    then 32 code bytes; value j of sub-block s is kvalues[c] * ue4m3_half(d[s]), c the low nibble of
+    byte 8 s + j for j < 8 and the high nibble of byte 8 s + j - 8 after. Exact in FP32."""
+
+    rows = blocks.shape[0]
+    b = np.ascontiguousarray(blocks).reshape(rows, -1, 36)
+    scale = ue4m3_half(b[..., :4])[..., None]
+    q = b[..., 4:].reshape(rows, b.shape[1], 4, 8)
+    codes = np.concatenate([q & 15, q >> 4], axis=-1)
+    return (_NVFP4_VALUES[codes] * scale).reshape(rows, -1)
+
+
+GGML_Q4_0 = 2
+GGML_NVFP4 = 40
+_LOCAL_DECODERS = {GGML_Q2_0: dequantize_q2_0, GGML_Q4_0: dequantize_q4_0,
+                   GGML_Q8_0: dequantize_q8_0, GGML_NVFP4: dequantize_nvfp4}
+
+
+def dequantize_blocks(type_id: int, blocks: np.ndarray) -> torch.Tensor:
+    """FP32 values ``[rows, columns]`` of encoded ggml rows ``blocks`` (``uint8 [rows, row
+    bytes]``) of block type `type_id`: local decoders for Q2_0, Q4_0, Q8_0 and NVFP4, gguf-py's
+    for the others."""
+
+    rows = blocks.shape[0]
+    local = _LOCAL_DECODERS.get(type_id)
     if local is not None:
-        values = local(blocks)
-        return torch.from_numpy(np.ascontiguousarray(values)).reshape(last - first, -1)
+        return torch.from_numpy(np.ascontiguousarray(local(blocks))).reshape(rows, -1)
     try:
         from gguf import GGMLQuantizationType
         from gguf.quants import dequantize
@@ -242,11 +292,18 @@ def _dequantize(gguf: GGUFFile, tensor: str, first: int, last: int) -> torch.Ten
             "reading the values of a GGUF block matrix needs the `gguf` package; "
             "storing its blocks does not"
         ) from error
-    kind = GGMLQuantizationType(gguf.info(tensor).type_id)
-    values = dequantize(np.ascontiguousarray(blocks), kind)
-    return torch.from_numpy(np.ascontiguousarray(values, dtype=np.float32)).reshape(
-        last - first, -1
-    )
+    values = dequantize(np.ascontiguousarray(blocks), GGMLQuantizationType(type_id))
+    return torch.from_numpy(np.ascontiguousarray(values, dtype=np.float32)).reshape(rows, -1)
+
+
+def _dequantize(gguf: GGUFFile, tensor: str, first: int, last: int) -> torch.Tensor:
+    return _dequantize_rows(gguf, tensor, gguf.read_blocks(tensor, first, last))
+
+
+def _dequantize_rows(gguf: GGUFFile, tensor: str, blocks: np.ndarray) -> torch.Tensor:
+    """Values of encoded rows ``blocks`` (``uint8 [rows, row bytes]``) of a stored block matrix."""
+
+    return dequantize_blocks(gguf.info(tensor).type_id, blocks)
 
 
 def block_source(
@@ -276,19 +333,11 @@ def block_source(
         logical = torch.from_numpy(np.argsort(columns))
 
     def encoded(begin: int, end: int) -> EncodedRows:
-        index = select(begin, end)
-        blocks = gguf.read_block_rows(tensor, index)
-        return EncodedRows(
-            format,
-            torch.from_numpy(blocks),
-            empty,
-            input_columns=gather,
-        )
+        blocks = gguf.read_rows(tensor, select(begin, end))
+        return EncodedRows(format, torch.from_numpy(blocks), empty, input_columns=gather)
 
     def values(first: int, last: int) -> torch.Tensor:
-        index = select(first, last)
-        low, high = int(index.min()), int(index.max()) + 1
-        stored = _dequantize(gguf, tensor, low, high)[torch.from_numpy(index - low)]
+        stored = _dequantize_rows(gguf, tensor, gguf.read_rows(tensor, select(first, last)))
         return stored if logical is None else stored[:, logical]
 
     return LogicalSource(
@@ -297,10 +346,10 @@ def block_source(
 
 
 def bf16_source(gguf: GGUFFile, tensor: str, shape: tuple[int, int]) -> LogicalSource:
-    """A stored BF16 matrix as its exact words, read a run of rows at a time from the file."""
+    """A stored BF16 matrix as its exact words, read a run of rows at a time."""
 
     def values(first: int, last: int) -> torch.Tensor:
-        words = np.array(gguf.read_bf16_words(tensor, first, last), copy=True)
+        words = gguf.read_bf16_words(tensor, first, last)
         return torch.from_numpy(words.view(np.int16)).view(torch.bfloat16)
 
     return LogicalSource(shape, f"{tensor}[BF16]{list(shape)}", _flat(values, shape[1]))
@@ -349,8 +398,7 @@ def q2_native_source(
     groups, padded_groups = k // 64, ((k + 127) // 128) * 2
 
     def encoded(begin: int, end: int) -> EncodedRows:
-        index = select(begin, end)
-        blocks = gguf.read_block_rows(tensor, index).reshape(end - begin, groups, 18)
+        blocks = gguf.read_rows(tensor, select(begin, end)).reshape(end - begin, groups, 18)
         scale_words = np.zeros((end - begin, padded_groups), dtype="<u2")
         scale_words[:, :groups] = np.ascontiguousarray(blocks[..., :2]).view("<u2").squeeze(-1)
         scales = scale_words.view("<f2")
@@ -381,8 +429,7 @@ def q8_native_source(
     groups, padded_groups = shape[1] // 32, ((shape[1] + 127) // 128) * 4
 
     def encoded(begin: int, end: int) -> EncodedRows:
-        index = select(begin, end)
-        blocks = gguf.read_block_rows(tensor, index).reshape(end - begin, groups, 34)
+        blocks = gguf.read_rows(tensor, select(begin, end)).reshape(end - begin, groups, 34)
         raw_words = np.ascontiguousarray(blocks[..., :2]).view("<u2").squeeze(-1)
         raw_scales = raw_words.view("<f2")
         raw_codes = blocks[..., 2:]
@@ -577,13 +624,6 @@ def _companions(model, recipe, sources) -> None:
                     source=source,
                 )
         elif name.startswith(("dflash/", "dflash2/")) and parameter.projection:
-            dspine = name.startswith("dflash/") and "dspine" in model.components["dflash"][
-                "config"
-            ].get("dflash_config", {})
-            if dspine and (name.startswith("dflash/dspine/") or name.endswith("/attention/output")):
-                # BF16, as official_recipes keeps them: the DSpine bridge's exact rounding, and an
-                # o_proj (5120x4096) no linear_add registers.
-                continue
             if name.endswith(
                 (
                     "/attention_conv/kernel_projection",

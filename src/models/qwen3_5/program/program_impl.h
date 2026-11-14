@@ -5,6 +5,7 @@
 
 #include "core/arena.h"
 #include "core/device_snapshot.h"
+#include "core/pinned_memory.h"
 #include "core/vmm.h"
 #include "core/disk_kv_bridge.h"
 #include "core/gdn_replay_records.h"
@@ -20,6 +21,7 @@
 
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/program/storage/draft_context.h"
+#include "models/dspine/drafter.h"
 #include "models/qwen3_5/program/storage/host_kv_store.h"
 #include "models/qwen3_5/program/storage/kv_store.h"
 #include "models/qwen3_5/program/storage/state_store.h"
@@ -56,6 +58,8 @@
 
 namespace ninfer::models::qwen3_5::detail {
 
+using runtime::MaskedWidthController;
+using runtime::MaskedWidthSignal;
 using runtime::MtpAdaptiveBatchController;
 using runtime::MtpAdaptiveSignal;
 using PreparedPromptData    = qwen3_5::PreparedPromptData;
@@ -354,6 +358,8 @@ struct HybridPendingTap {
     StateImageHandle image;
     std::uint32_t slot = 0; // staging device snapshot slot
     bool boundary      = false;
+    // A stop string's hold checkpoint published as the turn's endpoint.
+    bool endpoint = false;
 };
 
 // Per-lane hybrid bookkeeping for the active sequence.
@@ -379,20 +385,38 @@ struct HybridLaneState {
     // Deepest snapshot frontier known on this path (reused or created by this sequence).
     std::uint32_t deepest_snapshot = 0;
     // The snapshot this sequence resumed from (invalid: root). Once the sequence publishes a
-    // deeper snapshot, its lineage resumes from that one and this one is superseded.
+    // deeper tap, its lineage resumes from that one and this one is superseded; its endpoint
+    // supersedes only an endpoint it resumed from.
     runtime::prefix_cache::SnapshotRef resume_snapshot;
     std::uint32_t resume_frontier = 0;
+    // Hits the superseded resume snapshot still counted: the snapshots this sequence publishes
+    // next start with them (§9.3).
+    std::uint32_t lineage_hits = 0;
     // The newest Tap (not Boundary) this sequence published. A deeper tap of the same prompt
     // supersedes it: the lineage resumes from the deeper one, and it only serves a request
     // diverging between them. The endpoint does not, since a next turn whose template re-renders
     // the reply resumes from the prompt-end tap.
     runtime::prefix_cache::SnapshotRef tap_snapshot;
     std::uint32_t tap_frontier = 0;
+    // The newest tap a deeper tap of the same prompt superseded. This sequence's Host writes
+    // (its snapshot images and the block write-through at release) do not evict it (§9.3): a
+    // request diverging later in this prompt (the next question about the same document) resumes
+    // from it, and the blocks written are its own.
+    runtime::prefix_cache::SnapshotRef superseded_tap;
+    // Snapshots this sequence published (taps and endpoint). The block write-through at release
+    // displaces no retained snapshot worth more than the most valuable of them still retained.
+    std::vector<runtime::prefix_cache::SnapshotRef> published;
     // The Host restore this sequence was admitted from (0 without one). Its first prefill pass
     // queues behind the restore's per-layer events; releasing the lane queues behind the whole
     // restore if it may still be landing.
     std::uint64_t restore_ticket = 0;
     bool restore_layers_pending  = false;
+    // The state after the last generated token that no stop string can cut any more, kept while
+    // a stop string's match prefix is held back (runtime::CommitDecision::stop_hold_after). A
+    // turn that ends at the stop string publishes it in place of its endpoint, whose state has
+    // read tokens the visible text does not have.
+    std::optional<HybridPendingTap> hold;
+    bool stop_cut = false;
 };
 
 } // namespace ninfer::models::qwen3_5::detail
@@ -513,6 +537,8 @@ struct SequenceState {
     std::uint32_t dflash_context_frontier = 0;
     std::array<TokenId, qwen3_5::kMtpDecodeMaximumDrafts> mtp_drafts{};
     std::uint32_t mtp_draft_count = 0;
+    // runtime::lookup_draft's copy source, as its distance from the end of `ledger`.
+    std::size_t lookup_lag = 0;
     // The initial drafts are still on their way from the device (settle_initial_drafts).
     bool mtp_drafts_pending       = false;
     bool tail_hidden_valid        = false;
@@ -567,6 +593,8 @@ struct RequestControl {
     Lifecycle lifecycle             = Lifecycle::Empty;
     PendingCandidate pending;
     ops::SamplingConfig sampling_host;
+    // runtime::draft_sampling(sampling_host): the request's MTP proposal sampler.
+    ops::SamplingConfig draft_sampling_host;
     std::shared_ptr<text::GrammarState> grammar;
     // With a grammar: whether its masks are cheap enough for its rounds to verify drafts, and
     // while they are not, the mask of its next token computing ahead of its next round, started
@@ -585,6 +613,8 @@ struct RequestControl {
     SpeculativeStats speculative_stats;
     // Adaptive MTP: how far this request's drafts survive.
     MtpAdaptiveSignal mtp_signal;
+    // Adaptive MTP with a masked drafter: what this request's rounds commit at either width.
+    MaskedWidthSignal masked_signal;
     detail::PhysicalResources active_resources;
     detail::PhysicalResources optional_resources;
     bool publish_continuation = true;
@@ -947,6 +977,9 @@ public:
     const bool vision_enabled;
     const bool use_cuda_graph;
     const bool causal_scoring;
+    // EngineOptions::gumbel_sampling: a sampling row's MTP proposals draw at the keys of the
+    // columns they fill.
+    const bool gumbel_sampling;
     const std::size_t kv_payload_bytes;
     const std::size_t graph_allowance_bytes;
     // Free device memory CUDA Graph preparation consumed at startup (instantiate, upload and one
@@ -1012,10 +1045,15 @@ public:
     std::vector<std::unique_ptr<GdnReplayRecords>> extra_replay_records;
     std::vector<std::unique_ptr<ops::GdnReplayFoldPlan>> extra_replay_fold;
     std::optional<DFlashPersistentState> dflash;
+    // --spec dspine: the standalone drafter over this Program's target, its ring the state
+    // images' local cache and its table dflash->dspine_head_write.
+    std::optional<dspine::Drafter> dspine_drafter;
     qwen3_5::RoundState io;
     Tensor prefill_hidden;
     std::optional<Tensor> score_hidden;
     Tensor sampling_config;
+    // Each lane's MTP proposal sampler; unbound without MTP or --gumbel-sampling.
+    Tensor draft_sampling_config;
     Tensor token_counts;
     std::unique_ptr<qwen3_5::StructuredRound> structured_round;
 
@@ -1054,6 +1092,9 @@ public:
     std::optional<PinnedHostBuffer> score_logprobs_host;
     // Present under adaptive MTP: picks each round's verification width.
     std::optional<MtpAdaptiveBatchController> mtp_controller;
+    // Present under adaptive MTP with a masked drafter: picks the width of each round without a
+    // copy, the draft window or its half.
+    std::optional<MaskedWidthController> masked_controller;
     TokenId* host_tokens = nullptr;
     // The round's logprob records, [row, column]; a returned round's span points here until the
     // Engine commits it. The host copy of the device gather lands in logprobs_host, and
@@ -1463,6 +1504,12 @@ private:
     // Snapshots the lane's committed state at the prefill frontier `frontier`; a boundary tap is
     // published as SnapshotKind::Boundary.
     void hybrid_capture_tap(SequenceState& sequence, std::uint32_t frontier, bool boundary);
+    // An exact tap taken inside a prefill pass: the image and staging slot the pass writes, kept
+    // as a pending tap once the chunk ran (keep) or given back (release).
+    [[nodiscard]] std::optional<HybridPendingTap>
+    hybrid_in_pass_reserve(SequenceState& sequence, std::uint32_t frontier, bool boundary);
+    void hybrid_in_pass_keep(SequenceState& sequence, const HybridPendingTap& tap);
+    void hybrid_in_pass_release(const HybridPendingTap& tap) noexcept;
     // Realizes the planned taps a completed prefill chunk reached.
     void hybrid_after_prefill_chunk(SequenceState& sequence, std::uint32_t cursor,
                                     std::uint32_t prompt_tokens);
@@ -1480,9 +1527,46 @@ private:
     // Drops the lane's index pins. Safe on any lane state.
     void hybrid_release_lane(std::uint32_t lane) noexcept;
     // Supersedes the snapshot the sequence resumed from once it snapshots past it at
-    // `frontier`, before the new snapshot takes a slot or slabs (spec §9.2, §9.3).
-    void hybrid_supersede_resume(HybridLaneState& lane, std::uint32_t frontier);
+    // `frontier`, before the new snapshot takes a slot or slabs (spec §9.2, §9.3), and keeps the
+    // hits it still counted for the snapshots the lane publishes next. `cause` is Resumed for a
+    // tap and Endpoint for the endpoint.
+    void hybrid_supersede_resume(HybridLaneState& lane, std::uint32_t frontier,
+                                 runtime::prefix_cache::Supersession cause);
     void hybrid_supersede_tap(HybridLaneState& lane, std::uint32_t frontier);
+    // Stop-string hold checkpoint (HybridLaneState::hold). reserve drops the one the lane held and
+    // returns the Device image a checkpoint at `frontier` is written to, when the lane publishes
+    // and a snapshot there could be reused; keep makes the written image the lane's checkpoint;
+    // copy takes the sequence's committed state as it is.
+    [[nodiscard]] std::optional<HybridPendingTap> hybrid_hold_reserve(SequenceState& sequence,
+                                                                     std::uint32_t frontier);
+    void hybrid_hold_keep(SequenceState& sequence, const HybridPendingTap& hold);
+    void hybrid_hold_drop(HybridLaneState& lane) noexcept;
+
+    // Stop-string hold of a catalog Program (models::stop_hold_slots): the state where a stop
+    // string's match began, in the lane's own image past the catalog's slots. A turn that ends at
+    // that stop string returns to it before it is published, so its endpoint is the state a turn
+    // that ended there leaves, and the next turn resumes from it like from any endpoint.
+    struct StopHold {
+        std::uint32_t frontier = 0;
+        // A masked-draft backend: the frontier the image's draft context reaches.
+        std::uint32_t draft_context_frontier = 0;
+        runtime::PrefillWork rebuild_work;
+        std::uint32_t rebuild_tail_begin = 0;
+        bool tail_hidden_valid           = false;
+    };
+    std::uint32_t stop_hold_slots_ = 0;
+    std::array<std::optional<StopHold>, kMaximumConcurrency> stop_holds_;
+    // Drops the lane's hold and returns the pool slot a hold at `frontier` is written to, when
+    // the lane keeps one.
+    [[nodiscard]] std::optional<std::int32_t> stop_hold_slot(SequenceState& sequence,
+                                                             std::uint32_t frontier);
+    void stop_hold_keep(SequenceState& sequence, std::uint32_t frontier, bool tail_hidden_valid,
+                        std::uint32_t draft_context_frontier = 0);
+    // The sequence's committed state as it is, to the hybrid cache's checkpoint or the catalog
+    // lane's image.
+    void stop_hold_copy(SequenceState& sequence);
+    // A finishable catalog sequence returns to its hold: state, ledger, identity and KV extents.
+    void stop_hold_rewind(std::uint32_t lane);
 
     [[nodiscard]] std::optional<AdmissionCandidate>
     inspect_lane(std::uint32_t lane, const PreparedPromptData& prompt, const RequestBasePlan& base,
@@ -1532,6 +1616,7 @@ private:
         std::span<const std::uint32_t> lanes, std::span<const std::uint32_t> accepted_tokens,
         std::span<const std::uint8_t> terminal, std::span<const std::uint8_t> cancelled,
         std::span<const std::optional<std::uint32_t>> prefix_execution_splits,
+        std::span<const std::optional<std::uint32_t>> stop_holds,
         runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] bool valid_sequence(SequenceHandle handle) const noexcept;
     [[nodiscard]] bool valid_continuation(const ContinuationHandle& handle) const noexcept;
@@ -1774,6 +1859,8 @@ private:
     void release_sequence_state_strict(SequenceState& sequence) noexcept;
     void release_sequence_state(SequenceState& sequence) noexcept;
     void prepare_graphs();
+    // Writes the request's sampler and its MTP proposal sampler to the lane's device records.
+    void upload_sampling(std::uint32_t lane, RequestControl& request);
     void install_sampling(SequenceState& sequence, RequestControl& request,
                           const ops::SamplingConfig& config);
     void set_device_i32(Tensor& tensor, std::int32_t value);
@@ -1810,6 +1897,7 @@ private:
     resolve_non_speculative_pending(SequenceState& sequence, RequestControl& request,
                                     std::uint32_t accepted_tokens, bool terminal,
                                     std::optional<std::uint32_t> prefix_execution_split_after,
+                                    std::optional<std::uint32_t> stop_hold_after,
                                     runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] runtime::PrefillStepResult
     advance_prefill(SequenceState& sequence, RequestControl& request,
@@ -1832,10 +1920,21 @@ private:
                           std::uint32_t processed_prompt_tokens,
                           std::span<const TokenId> initial_drafts, bool drafts_pending,
                           runtime::ExecutionTimingRecorder& timing);
+    // `destinations`: the state slots whose draft context receives the rows, in place of each
+    // lane's own (a stop-string hold image, which holds a copy of the lane's context).
     void enqueue_dflash_context_append(std::span<const std::uint32_t> lanes,
                                        std::span<const std::uint32_t> starts,
-                                       std::span<const std::uint32_t> counts);
-    void validate_licensed_tokens(std::span<const TokenId> tokens) const;
+                                       std::span<const std::uint32_t> counts,
+                                       std::span<const std::int32_t> destinations = {});
+    // Whether every token lies inside the public domain. A token outside it (the sampler's
+    // non-finite marker, or an id past the vocabulary) becomes 0, so nothing downstream reads an
+    // out-of-range id; a decode round marks the row in numerical_faults, a prompt's first token
+    // throws runtime::NumericalFault.
+    [[nodiscard]] bool license_tokens(std::span<TokenId> tokens) const noexcept;
+    // Rows of the decode round whose sampled or licensed tokens left the public domain, in the
+    // round's row order. wrap_pending reports them on the PendingBatch: the Engine ends those
+    // requests and commits the other rows.
+    std::array<bool, kMaximumConcurrency> numerical_faults{};
     // The drafts a lane's round may verify: none for a structured lane whose masks cost more than
     // a verification hides, so its round computes one mask for it.
     [[nodiscard]] static std::uint32_t speculative_extent(const RequestControl& request) noexcept;

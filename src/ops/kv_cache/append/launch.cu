@@ -1,6 +1,6 @@
 #include "ops/kv_cache/append/launch.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/common/math.h"
 #include "ops/kv_cache/append/kernel.cuh"
 #include "ops/kv_cache/plane_types.h"
@@ -191,7 +191,7 @@ void launch_cyclic(const Tensor& k, const Tensor& v, const Tensor& positions, co
     case 4096:
         launch_cyclic_profile<4096>(k, v, positions, counts, lanes, cache, plan, stream);
         return;
-    case 8192: // the DSpine draft's sliding window
+    case 8192:
         launch_cyclic_profile<8192>(k, v, positions, counts, lanes, cache, plan, stream);
         return;
     default:
@@ -203,6 +203,10 @@ void launch_cyclic(const Tensor& k, const Tensor& v, const Tensor& positions, co
 
 void kv_cache_append_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
                             PagedKVLayerView cache, cudaStream_t stream) {
+    if (cache.storage == KvCacheStorage::Bf16Packed) {
+        kv_cache_append_bf16p_launch(k, v, positions, cache, stream);
+        return;
+    }
     if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
         kv_cache_append_k8v4_launch(k, v, positions, cache, stream);
         return;
@@ -221,6 +225,11 @@ void kv_cache_append_launch(const Tensor& k, const Tensor& v, const Tensor& posi
 void kv_cache_append_batch_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
                                   const Tensor& valid_columns, const Tensor& table_rows,
                                   PagedKVBatchLayerView cache, cudaStream_t stream) {
+    if (cache.storage == KvCacheStorage::Bf16Packed) {
+        kv_cache_append_bf16p_batch_launch(k, v, positions, valid_columns, table_rows, cache,
+                                           stream);
+        return;
+    }
     if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
         kv_cache_append_k8v4_batch_launch(k, v, positions, valid_columns, table_rows, cache,
                                           stream);

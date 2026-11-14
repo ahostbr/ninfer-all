@@ -1,10 +1,13 @@
 #include "models/qwen3_5/program/prefix/hybrid_cache.h"
 
 #include "core/device.h"
-#include "core/paged_kv_cache.h"
+#include "core/device_wait.h"
+#include "core/paged_kv_view.h"
 
 #include <algorithm>
+#include <array>
 #include <exception>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -32,6 +35,15 @@ std::span<const std::byte* const> const_records(const std::vector<std::byte*>& r
     return {reinterpret_cast<const std::byte* const*>(records.data()), records.size()};
 }
 
+// One stream for every rank's part of a state image. A copy may run on another device's stream,
+// so a snapshot's write or restore stays one ordered sequence that one event marks, also when
+// pipeline stages or tensor parallelism shard the image across devices.
+RankStreams on_every_rank(cudaStream_t stream) {
+    std::array<cudaStream_t, kMaxRanks> streams;
+    streams.fill(stream);
+    return RankStreams(std::span<const cudaStream_t>(streams));
+}
+
 } // namespace
 
 HybridPrefixCache::HybridPrefixCache(const PrefixIndexConfig& config, TapPlannerConfig taps,
@@ -54,9 +66,17 @@ HybridPrefixCache::HybridPrefixCache(const PrefixIndexConfig& config, TapPlanner
         throw std::invalid_argument("hybrid restore layers do not match the text KV planes");
     }
     planes_per_attention_layer_ = text_planes / attention_layers;
+    // Pipeline stages shard the layers and tensor parallelism the heads, so the image's layers
+    // end where its last shard's do.
+    std::uint32_t linear_layers = 0;
+    for (std::size_t shard = 0; shard < state_pool.shard_count(); ++shard) {
+        linear_layers = std::max(linear_layers,
+                                 state_pool.shard(shard).first_layer +
+                                     static_cast<std::uint32_t>(state_pool.linear(shard).layer_count()));
+    }
     for (const HybridRestoreLayer& layer : layers_) {
         if ((layer.attention && layer.index >= attention_layers) ||
-            (!layer.attention && layer.index >= state_pool.linear().layer_count())) {
+            (!layer.attention && layer.index >= linear_layers)) {
             throw std::invalid_argument("hybrid restore layer index is out of range");
         }
     }
@@ -93,12 +113,12 @@ HybridPrefixCache::HybridPrefixCache(const PrefixIndexConfig& config, TapPlanner
 HybridPrefixCache::~HybridPrefixCache() {
     // Stores referenced by the cache may already be gone; only CUDA objects are released here.
     if (restore_stream_ != nullptr) {
-        (void)cudaStreamSynchronize(restore_stream_);
+        (void)ninfer::wait_for_stream(restore_stream_);
         (void)cudaStreamDestroy(restore_stream_);
     }
     for (PendingWrite& write : pending_) {
         if (write.done != nullptr) {
-            (void)cudaEventSynchronize(write.done);
+            (void)ninfer::wait_for_event(write.done);
             (void)cudaEventDestroy(write.done);
         }
     }
@@ -285,12 +305,13 @@ void HybridPrefixCache::add_copies(PageCopies& copies, const HybridBlockPages& p
 void HybridPrefixCache::enqueue_to_host(const PageCopies& copies, cudaStream_t stream) const {
     if (!copies.text_pages.empty()) {
         text_pages_->physical_pool().copy_to_host_records(
-            copies.text_pages, copies.text_records, copies.text_groups, host_layout_.text, stream);
+            copies.text_pages, copies.text_records, copies.text_groups, host_layout_.text,
+            on_every_rank(stream));
     }
     if (!copies.backend_pages.empty()) {
         backend_pages_->physical_pool().copy_to_host_records(
             copies.backend_pages, copies.backend_records, copies.backend_groups,
-            *host_layout_.backend, stream);
+            *host_layout_.backend, on_every_rank(stream));
     }
 }
 
@@ -298,12 +319,13 @@ void HybridPrefixCache::enqueue_from_host(const PageCopies& copies, cudaStream_t
     if (!copies.text_pages.empty()) {
         text_pages_->physical_pool().copy_from_host_records(const_records(copies.text_records),
                                                             copies.text_groups, copies.text_pages,
-                                                            host_layout_.text, stream);
+                                                            host_layout_.text,
+                                                            on_every_rank(stream));
     }
     if (!copies.backend_pages.empty()) {
         backend_pages_->physical_pool().copy_from_host_records(
             const_records(copies.backend_records), copies.backend_groups, copies.backend_pages,
-            *host_layout_.backend, stream);
+            *host_layout_.backend, on_every_rank(stream));
     }
 }
 
@@ -333,8 +355,8 @@ void HybridPrefixCache::order_after(cudaStream_t producer, cudaStream_t consumer
 
 // ---- Host write-through ------------------------------------------------------------------------
 
-bool HybridPrefixCache::start_snapshot_host_write(SnapshotRef snapshot, cudaStream_t producer,
-                                                  cudaStream_t transfer) {
+bool HybridPrefixCache::start_snapshot_host_write(SnapshotRef snapshot, SnapshotRef keep,
+                                                  cudaStream_t producer, cudaStream_t transfer) {
     if (!host_tier() || !index_->valid(snapshot) || !images_[snapshot.index].valid()) {
         return false;
     }
@@ -346,7 +368,7 @@ bool HybridPrefixCache::start_snapshot_host_write(SnapshotRef snapshot, cudaStre
         }
     }
     index_->pin_snapshot(snapshot);
-    if (!index_->begin_snapshot_host_fill(snapshot)) {
+    if (!index_->begin_snapshot_host_fill(snapshot, keep)) {
         index_->unpin_snapshot(snapshot);
         return false;
     }
@@ -359,7 +381,8 @@ bool HybridPrefixCache::start_snapshot_host_write(SnapshotRef snapshot, cudaStre
         }
         order_after(producer, transfer);
         state_pool_->copy_to_host_segments(states_->physical_slot(images_[snapshot.index]),
-                                           segments, host_layout_.slab_bytes, transfer);
+                                           segments, host_layout_.slab_bytes,
+                                           on_every_rank(transfer));
         std::uint64_t bytes = host_layout_.image_bytes;
         if (view.tail_len != 0) {
             write_scratch_.clear();
@@ -377,7 +400,7 @@ bool HybridPrefixCache::start_snapshot_host_write(SnapshotRef snapshot, cudaStre
         counters_.host_write_bytes += bytes;
     } catch (...) {
         // Copies may be in flight into the slabs; they return to the index only once idle.
-        (void)cudaStreamSynchronize(transfer);
+        (void)ninfer::wait_for_stream(transfer);
         if (!pending_.empty() && pending_.back().snapshot == snapshot) {
             if (pending_.back().done != nullptr) { spare_events_.push_back(pending_.back().done); }
             pending_.pop_back();
@@ -389,8 +412,9 @@ bool HybridPrefixCache::start_snapshot_host_write(SnapshotRef snapshot, cudaStre
     return true;
 }
 
-void HybridPrefixCache::start_block_host_writes(std::span<const NodeRef> nodes,
-                                                cudaStream_t producer, cudaStream_t transfer) {
+void HybridPrefixCache::start_block_host_writes(std::span<const NodeRef> nodes, SnapshotRef keep,
+                                                double claim, cudaStream_t producer,
+                                                cudaStream_t transfer) {
     if (!host_tier()) { return; }
     PendingWrite write;
     write_scratch_.clear();
@@ -406,7 +430,7 @@ void HybridPrefixCache::start_block_host_writes(std::span<const NodeRef> nodes,
             const NodeView view = index_->node(node);
             if (view.device != CopyState::Resident || view.host != CopyState::Absent) { continue; }
             index_->pin_node(node);
-            const std::optional<std::uint32_t> slab_id = index_->begin_host_fill(node);
+            const std::optional<std::uint32_t> slab_id = index_->begin_host_fill(node, keep, claim);
             if (!slab_id) {
                 // Everything left on the Host tier is pinned or filling; retry at a later release.
                 index_->unpin_node(node);
@@ -426,7 +450,7 @@ void HybridPrefixCache::start_block_host_writes(std::span<const NodeRef> nodes,
         write.done = take_event();
         CUDA_CHECK(cudaEventRecord(write.done, transfer));
     } catch (...) {
-        (void)cudaStreamSynchronize(transfer);
+        (void)ninfer::wait_for_stream(transfer);
         if (write.done != nullptr) { spare_events_.push_back(write.done); }
         abort_batch();
         throw;
@@ -470,12 +494,12 @@ void HybridPrefixCache::poll() {
 
 void HybridPrefixCache::drain() {
     while (!pending_.empty()) {
-        CUDA_CHECK(cudaEventSynchronize(pending_.front().done));
+        CUDA_CHECK(ninfer::wait_for_event(pending_.front().done));
         publish_write(pending_.front());
         pending_.pop_front();
     }
     while (!landing_.empty()) {
-        CUDA_CHECK(cudaEventSynchronize(landing_.front().layers.back()));
+        CUDA_CHECK(ninfer::wait_for_event(landing_.front().layers.back()));
         finish_landing(landing_.front());
         landing_.pop_front();
     }
@@ -576,12 +600,13 @@ void HybridPrefixCache::submit_restore() {
     if (!restore_.copies.backend_pages.empty()) {
         backend_pages_->physical_pool().copy_from_host_records(
             const_records(restore_.copies.backend_records), restore_.copies.backend_groups,
-            restore_.copies.backend_pages, *host_layout_.backend, restore_stream_);
+            restore_.copies.backend_pages, *host_layout_.backend, on_every_rank(restore_stream_));
     }
     if (restore_.image) {
         state_pool_->copy_from_host_segments(
             segments, host_layout_.slab_bytes, restore_.image_slot,
-            qwen3_5::StateImagePart{.kind = qwen3_5::StateImagePart::Kind::Rest}, restore_stream_);
+            qwen3_5::StateImagePart{.kind = qwen3_5::StateImagePart::Kind::Rest},
+            on_every_rank(restore_stream_));
     }
     restore_.prelude = record();
     // Then each layer's own state, in forward order, so a pass can start on the first layers
@@ -594,14 +619,14 @@ void HybridPrefixCache::submit_restore() {
                 text_pages_->physical_pool().copy_from_host_records(
                     const_records(restore_.copies.text_records), restore_.copies.text_groups,
                     restore_.copies.text_pages, host_layout_.text, begin,
-                    begin + planes_per_attention_layer_, restore_stream_);
+                    begin + planes_per_attention_layer_, on_every_rank(restore_stream_));
             }
         } else if (restore_.image) {
             state_pool_->copy_from_host_segments(
                 segments, host_layout_.slab_bytes, restore_.image_slot,
                 qwen3_5::StateImagePart{.kind  = qwen3_5::StateImagePart::Kind::LinearLayer,
                                         .layer = layer.index},
-                restore_stream_);
+                on_every_rank(restore_stream_));
         }
         restore_.layers.push_back(record());
     }
@@ -653,7 +678,7 @@ void HybridPrefixCache::settle_prefetch() {
     // event covers every batch submitted before it.
     for (auto batch = landing_.rbegin(); batch != landing_.rend(); ++batch) {
         if (batch->prefetch) {
-            CUDA_CHECK(cudaEventSynchronize(batch->layers.back()));
+            CUDA_CHECK(ninfer::wait_for_event(batch->layers.back()));
             break;
         }
     }
@@ -702,7 +727,7 @@ void HybridPrefixCache::recycle_events(RestoreBatch& batch) noexcept {
 
 void HybridPrefixCache::abort_restore() noexcept {
     if (!restore_.open) { return; }
-    if (restore_stream_ != nullptr) { (void)cudaStreamSynchronize(restore_stream_); }
+    if (restore_stream_ != nullptr) { (void)ninfer::wait_for_stream(restore_stream_); }
     try {
         for (const NodeRef node : restore_.nodes) {
             if (index_->valid(node) && index_->node(node).device == CopyState::Filling) {
@@ -727,10 +752,10 @@ void HybridPrefixCache::reset_restore() noexcept {
 void HybridPrefixCache::clear() noexcept {
     // Engine-wide recovery: wait for every copy touching cache memory, then release every
     // reference so the stores end empty of cache ownership.
-    if (restore_stream_ != nullptr) { (void)cudaStreamSynchronize(restore_stream_); }
+    if (restore_stream_ != nullptr) { (void)ninfer::wait_for_stream(restore_stream_); }
     for (PendingWrite& write : pending_) {
         if (write.done != nullptr) {
-            (void)cudaEventSynchronize(write.done);
+            (void)ninfer::wait_for_event(write.done);
             spare_events_.push_back(write.done);
         }
     }

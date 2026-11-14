@@ -49,6 +49,11 @@ ninfer_add_test(ninfer_expert_profile_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_expert_profile.cpp"
   LIBRARIES ninfer_model_runtime)
 
+ninfer_add_test(ninfer_divided_head_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_divided_head.cu"
+  LIBRARIES ninfer_model_runtime)
+set_tests_properties(ninfer_divided_head_test PROPERTIES SKIP_RETURN_CODE 77)
+
 ninfer_add_test(ninfer_qwen4_exp_ngram_draft_prefetch_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_draft_prefetch.cpp"
   LIBRARIES ninfer_model_runtime)
@@ -75,6 +80,12 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
       $<TARGET_FILE:ninfer_tests> ninfer_qwen4_exp_expert_cache_test)
   set_tests_properties(ninfer_qwen4_exp_expert_cache_visibility_test PROPERTIES SKIP_RETURN_CODE 77)
 endif()
+
+ninfer_add_test(ninfer_qwen4_exp_expert_misses_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_expert_misses.cu"
+  LIBRARIES ninfer_model_runtime)
+set_tests_properties(ninfer_qwen4_exp_expert_misses_test PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 120)
 
 ninfer_add_test(ninfer_qwen4_exp_expert_stream_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_expert_stream.cpp"

@@ -1,10 +1,17 @@
+#include "core/device_wait.h"
 #include "models/qwen3_5/program/structured_round.h"
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
 #include "models/qwen3_5/execution/linear.h"
+#include "models/qwen3_5/execution/dspine_head.h"
+#include "models/qwen3_5/program/planning/graph_profiles.h"
+#include "ninfer/ops/candidate_selector.h"
+#include "ninfer/ops/linear_topk.h"
+#include "ninfer/ops/speculative_round.h"
 #include "core/evictable_kv_pool.h"
 #include "core/host_kv_clamp.h"
+#include "core/pinned_memory.h"
 #include "core/startup.h"
 #include "core/device.h"
 #include <cuda_runtime.h>
@@ -176,10 +183,10 @@ make_stage_runtime(DeviceContext& device, const execution::Parameters& parameter
         }
         tp.prompt_partials = plan.features.tensor_parallel_prompt_partials;
         tp.exchange        = std::make_unique<TensorParallelExchange>(
-            device, TensorParallelExchangeOptions{
-                        .slot_bytes    = tensor_parallel_slot_bytes(plan),
-                        .transport     = plan.features.tensor_parallel_transport,
-                        .bf16_partials = tp.prompt_partials == TensorParallelPartials::Bf16});
+            device,
+            TensorParallelExchangeOptions{.slot_bytes = tensor_parallel_slot_bytes(plan),
+                                          .transport  = plan.features.tensor_parallel_transport,
+                                          .rounded_partials = tp.prompt_partials});
         for (std::size_t rank = 1; rank < stages; ++rank) { tp.joined.emplace_back(device.rank(rank)); }
         // A divided head's rows come back to rank 0, each rank's logits over its own link.
         if (const std::size_t head_bytes = divided_head_link_bytes(plan); head_bytes != 0) {
@@ -272,6 +279,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       proposal_head(plan.proposal_head), rope_yarn(plan.rope_yarn),
       mtp_attention_window(plan.mtp_attention_window), vision_enabled(plan.features.vision),
       use_cuda_graph(plan.use_cuda_graph), causal_scoring(plan.causal_scoring),
+      gumbel_sampling(plan.gumbel_sampling),
       kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
       kv_arena(make_kv_arena(device_in, parameters_in, plan,
@@ -441,13 +449,22 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             state_images->host_layout(), context_cache.host_state_slots);
         host_state_phase.complete(host_state_bytes, host_state_bytes);
     }
+    // The pool's last slots are the lanes' stop-string hold images, outside the catalog.
+    stop_hold_slots_ = stop_hold_slots(context_cache, max_concurrency);
+    if (state_images->slot_count() <= 0 ||
+        stop_hold_slots_ >= static_cast<std::uint32_t>(state_images->slot_count())) {
+        throw std::logic_error("Qwen3.5 StateImage pool does not cover its stop-string holds");
+    }
+    const std::uint32_t catalog_state_slots =
+        static_cast<std::uint32_t>(state_images->slot_count()) - stop_hold_slots_;
     const std::uint64_t logical_state_capacity =
-        static_cast<std::uint64_t>(state_images->slot_count()) + context_cache.host_state_slots;
+        static_cast<std::uint64_t>(catalog_state_slots) + context_cache.host_state_slots;
     if (logical_state_capacity > std::numeric_limits<std::uint32_t>::max()) {
         throw std::overflow_error("Qwen3.5 logical StateImage capacity exceeds uint32");
     }
     state_store = std::make_unique<StateImageStore>(
-        *state_images, host_state_images.get(), static_cast<std::uint32_t>(logical_state_capacity));
+        *state_images, host_state_images.get(), static_cast<std::uint32_t>(logical_state_capacity),
+        catalog_state_slots);
     pressure_private_owner_scratch_.resize(continuation_capacity);
     pressure_shared_owner_scratch_.resize(shared_prefix_capacity);
     pressure_private_drop_scratch_.resize(continuation_capacity);
@@ -488,6 +505,78 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             throw std::logic_error("DFlash StateImage has no local fixed state");
         }
         dflash.emplace(backing, *plan.persistent.dflash, *local);
+        if (const dspine::Model* drafter = parameters.dspine) {
+            const auto& text   = parameters.text;
+            const auto& config = parameters.model.config().text;
+            dspine::Target target{
+                .hidden = config.hidden_size,
+                .vocab  = config.vocab_size,
+                .layers = config.num_hidden_layers,
+                .domain = static_cast<std::int32_t>(
+                    parameters.model.resources().public_token_count),
+                .logits = execution::target_logits_dtype(text.output_head),
+                .embed  = [&text](const Tensor& ids, Tensor& rows, cudaStream_t stream) {
+                    execution::embed_tokens(ids, text.token_embedding, text.token_embedding_signs,
+                                            rows, stream);
+                },
+                .head = [&text](const Tensor& hidden, Tensor& logits, WorkspaceArena& arena,
+                                cudaStream_t stream) {
+                    execution::project(hidden, text.output_head, logits, arena, stream);
+                }};
+            // Candidates in one pass where linear_topk takes the head. The proposal head of another
+            // form projects dense logits, ranks them and maps its rows to token ids, as DFlash2's.
+            const auto* ranked   = execution::dspine_ranked_head(parameters, proposal_head);
+            const bool shortlist = proposal_head == ProposalHead::Optimized;
+            if (ranked != nullptr || shortlist) {
+                const execution::LinearParameters& head =
+                    shortlist ? parameters.proposal->head : text.output_head;
+                const Tensor* rows =
+                    shortlist && parameters.proposal->token_ids ? &*parameters.proposal->token_ids
+                                                                : nullptr;
+                const auto valid = static_cast<std::int32_t>(
+                    parameters.model.resources().public_token_count);
+                target.head_topk = [ranked, &head, rows, valid](const Tensor& hidden, Tensor& ids,
+                                                                Tensor& scores,
+                                                                WorkspaceArena& arena,
+                                                                cudaStream_t stream) {
+                    auto scope = arena.scope();
+                    if (ranked != nullptr) {
+                        const Tensor input = execution::rotated_input(
+                            hidden, ranked->hadamard_signs, arena, stream);
+                        if (rows != nullptr) {
+                            ops::linear_topk(input, ranked->weight, *rows, ids, scores, arena,
+                                             stream);
+                        } else {
+                            ops::linear_topk(input, ranked->weight, valid, ids, scores, arena,
+                                             stream);
+                        }
+                        return;
+                    }
+                    Tensor logits = arena.alloc(DType::BF16, {head.weight.n, hidden.ne[1]});
+                    execution::project(hidden, head, logits, arena, stream);
+                    ops::candidate_topk(logits, rows != nullptr ? head.weight.n : valid, ids,
+                                        scores, arena, stream);
+                    if (rows != nullptr) {
+                        Tensor every = ids.view({ids.ne[0] * ids.ne[1]});
+                        ops::proposal_remap_token_ids(
+                            every, static_cast<const std::int32_t*>(rows->data), head.weight.n,
+                            stream);
+                    }
+                };
+            }
+            // Its widest proposal: a copy round of several rows runs it at the copy window.
+            const std::uint32_t proposal =
+                masked_proposal_window(draft_window, ngram_draft_window, max_concurrency);
+            dspine_drafter.emplace(*drafter, std::move(target), dflash->dspine_head_write,
+                                   local->capacity(), capacity,
+                                   static_cast<std::int32_t>(max_concurrency),
+                                   static_cast<std::int32_t>(proposal + 1U));
+            RankBinding bind(device, 0);
+            work.reset();
+            dspine_drafter->prepare(work, device.stream);
+            work.reset();
+            dflash->dspine = &*dspine_drafter;
+        }
     }
     if (dflash.has_value() != plan.features.masked_draft()) {
         throw std::logic_error("DFlash state does not match the frozen sequence plan");
@@ -636,13 +725,14 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     if (plan.persistent.sampling_config) {
         sampling_config = plan.persistent.sampling_config->bind(backing);
     }
+    if (plan.persistent.draft_sampling_config) {
+        draft_sampling_config = plan.persistent.draft_sampling_config->bind(backing);
+    }
     if (plan.persistent.grammar_masks) {
         structured_round = std::make_unique<qwen3_5::StructuredRound>(
             plan.persistent.grammar_masks->bind(backing),
             parameters.model.resources().public_token_count, widest_verify_window() + 1U,
-            max_concurrency,
-            speculative_backend == SpeculativeBackend::DFlash ||
-                speculative_backend == SpeculativeBackend::DFlash2);
+            max_concurrency, is_masked_draft_backend(speculative_backend));
         io.structured = structured_round.get();
     }
     active_continuations.fill(continuation_capacity);
@@ -701,11 +791,22 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         CUDA_CHECK(cudaMemsetAsync(token_counts.data, 0, token_counts.bytes(), device.stream));
         CUDA_CHECK(
             cudaMemsetAsync(sampling_config.data, 0, sampling_config.bytes(), device.stream));
+        if (draft_sampling_config.data != nullptr) {
+            CUDA_CHECK(cudaMemsetAsync(draft_sampling_config.data, 0,
+                                       draft_sampling_config.bytes(), device.stream));
+        }
     }
     device.synchronize();
     if (speculative_backend == SpeculativeBackend::Mtp && mtp_policy == MtpDraftPolicy::Adaptive) {
         mtp_controller.emplace();
         mtp_controller->reset(draft_window);
+    }
+    if (is_masked_draft_backend(speculative_backend) && mtp_policy == MtpDraftPolicy::Adaptive) {
+        const auto windows = masked_neural_windows(draft_window, true);
+        if (windows.size() == 2) {
+            masked_controller.emplace();
+            masked_controller->reset(windows[1], windows[0]);
+        }
     }
     // CUDA would otherwise load an attention width's module inside the first request that reaches
     // it, behind a context synchronization.
@@ -789,8 +890,8 @@ void ProgramImpl::bind_steering(const SequencePlanImpl& plan, const Steering* so
         if (tensor.bytes() != values.size_bytes()) {
             throw std::logic_error("planned steering tensor does not match the loaded steering");
         }
-        CUDA_CHECK(cudaMemcpy(tensor.data, values.data(), values.size_bytes(),
-                              cudaMemcpyHostToDevice));
+        CUDA_CHECK(ninfer::copy_and_wait(tensor.data, values.data(), values.size_bytes(),
+                                         cudaMemcpyHostToDevice));
     };
     steering                 = std::make_unique<execution::SteeringView>();
     steering->adapters       = static_cast<std::int32_t>(count);
@@ -841,14 +942,14 @@ void ProgramImpl::lend_kv_to_experts() {
 
 void ProgramImpl::synchronize_transfer_streams() const {
     for (std::size_t rank = 0; rank < transfer_streams.size(); ++rank) {
-        (void)cudaStreamSynchronize(transfer_streams[rank]);
+        (void)ninfer::wait_for_stream(transfer_streams[rank]);
     }
 }
 
 ProgramImpl::~ProgramImpl() noexcept {
     for (std::size_t rank = 0; rank < transfer_streams.size(); ++rank) {
-        (void)cudaStreamSynchronize(transfer_streams[rank]);
-        (void)cudaStreamSynchronize(compute_streams[rank]);
+        (void)ninfer::wait_for_stream(transfer_streams[rank]);
+        (void)ninfer::wait_for_stream(compute_streams[rank]);
     }
 }
 
@@ -967,6 +1068,9 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
                 state_slot,
                 0,
                 0};
+            // A chunk before the first scored predictor only extends the context: nothing reads
+            // its final hidden rows.
+            schedule_state.last_layer_kv_only = cursor + nominal <= scored_predictor_begin;
             mark_workspace_usage(workspace_plan.text_prefill);
             const execution::PrefillChunkResult result = execution::prefill_text_chunk(
                 schedule_state, std::span<const TokenId>(prompt.token_ids), nominal, std::nullopt,
@@ -1054,8 +1158,11 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
     out.kv_capacity     = kv_capacity;
     out.kv_cache        = kv_storage;
     const auto& weights = parameters.model.storage_stats();
-    out.weights = ArenaMemorySummary{weights.device_capacity_bytes, weights.device_capacity_bytes,
-                                     weights.device_capacity_bytes};
+    // A DSpine drafter's weights load beside the model's on its first device.
+    const std::size_t model_weight_bytes =
+        weights.device_capacity_bytes +
+        (parameters.dspine != nullptr ? parameters.dspine->device_bytes() : 0U);
+    out.weights = ArenaMemorySummary{model_weight_bytes, model_weight_bytes, model_weight_bytes};
     out.sequence =
         ArenaMemorySummary{persistent.capacity(), persistent.used(), persistent.peak_used()};
     std::size_t active_handoff_bytes = 0;

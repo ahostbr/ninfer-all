@@ -5,7 +5,7 @@ NInfer builds from its source tree with CMake 3.28+ and C++/CUDA 20.
 `120a` ([several architectures](#builds-of-several-architectures)); configure refuses anything
 else. CUDA 12.8 or newer builds `75` and the `sm_8x` targets, a build with `70` needs CUDA 12.x
 ([Tesla V100](../build-linux.md#tesla-v100-sm_70)), and a build with `120a` needs CUDA 13.1 or
-newer, so `70` and `120a` cannot share a build.
+newer except 13.2.0 and 13.2.1, so `70` and `120a` cannot share a build.
 
 ## Code tiers
 
@@ -59,8 +59,8 @@ unbounded). The Turing shape set differs from the standard one where a kernel do
   stages fit 64 KiB, so V widens during QK. The small-T FP8, NVFP4 and K8V4 shapes of two and three
   16-row tiles widen K and V into one shared tile (`kCausalSmallTCompactKV`); V overwrites K after
   QK.
-- The BF16 prompt and small-T attention take their Turing kernels (`prompt_bf16_sm75.cuh`,
-  `small_t_bf16_sm75.cuh`; the prompt kernel stages K and V through one buffer), context-KV
+- The BF16 prompt and small-T attention take their Turing kernels (`bf16/prompt_sm75.cuh`,
+  `bf16/small_t_sm75.cuh`; the prompt kernel stages K and V through one buffer), context-KV
   materialization uses 64-key blocks, the rowsplit A8 GEMM runs one stage and the BF16 GEMM rings
   at most two, and the BF16 `n256_k5120` GEMV splits K eight ways at narrow widths.
 - The GGUF flash attention of Gemma 4 (`ops/linear/gguf/ggml_fattn.cu`) takes, per tier, the most
@@ -78,8 +78,8 @@ are the same on every tier:
 
 - BF16-cache attention multiplies Q, K and V as their FP16 roundings: a value from 2^-17 to below
   2^16 is unchanged, and a smaller value changes by at most 2^-25. A tile that holds a value of
-  2^16 or more is swept again on the per-output FP32 route (`prompt_bf16_sm75.cuh`,
-  `small_t_bf16_sm75.cuh`, `ops/softmax_attention/common/bf16_attention.cuh`). The fast sweep and
+  2^16 or more is swept again on the per-output FP32 route (`bf16/prompt_sm75.cuh`,
+  `bf16/small_t_sm75.cuh`, `ops/softmax_attention/common/bf16_attention.cuh`). The fast sweep and
   the FP32 sweep are separate functions, because in one loop body the FP32 route made the fast
   route spill.
 - Every attention PV product with BF16 values rounds the softmax probabilities to FP16 in the
@@ -102,7 +102,8 @@ profile does so where `ninfer-calibrate` measured it faster
 ### Volta tier (`70`)
 
 A Volta card runs its own projection routes (`ops/linear/sm70`, chosen by `sm70::enabled()`), its
-decode attention (`small_t_sm70.cuh`), its single-row prompt attention (`prompt_sm70.cu`) and its
+decode attention (`small_t_sm70_*.cuh`, in units compiled for `70-real` alone), its single-row
+prompt attention (`sm70/prompt.cu`) and its
 GGUF MoE matrix product (`ggml_bridge_sm70.cuh`, chosen in `moe_matrix_product` by the device's
 tier); those kernels' `mma.m8n8k4` bodies exist in the Volta image only. Its projection weights take the
 panel layout on the ranks whose device runs Volta's code (`apply_device_layouts`). Its route
@@ -129,10 +130,30 @@ same card in any build that runs it on the same tier. `DeviceContext` admits ran
 compute capabilities when each runs the build's code (`docs/maintainer/pipeline-stages.md`).
 Compile time and binary size grow with the number of architectures.
 
+Objects carry machine code for every listed architecture and PTX for one: 89, or the newest listed
+architecture below it. The driver compiles that PTX at load time for a card outside the list, such
+as a Hopper or data-center Blackwell card. `compute_120a` PTX would run only where the `sm_120a`
+code already runs, and older PTX only on cards that the newer PTX serves too. CMake therefore
+compiles `CMAKE_CUDA_ARCHITECTURES` as `<arch>-real` entries beside the one PTX architecture;
+`NINFER_ARCHITECTURES` keeps the listed names for `--version`, the refusal of an unsupported
+device and the portable launchers' `architectures.txt`.
+
+In a build of several architectures, a route family whose kernels only one tier launches compiles
+for that tier alone, without PTX (`ninfer_ops_route_family` in `src/ops/CMakeLists.txt`): the FP8
+A8 and NVFP4 W4A4/A4 units and the fast NVFP4 prompt kernel for `120a`, and the Volta projections
+(`src/ops/linear/sm70/`) for `70`, or for the first listed architecture in a build without 70,
+where they link and never run. Their entry points refuse, or their route predicates decline, every
+other card before a kernel launch, and the tier definitions stay those of the whole build, so every
+gate decides as in a single-architecture build. CUDA 13 gives every translation unit its own host
+stub of a template kernel (`-static-global-template-stub`). CUDA 12 merges the stubs of identical
+instantiations, and the runtime may then look a kernel up in the module that has fewer
+architectures, so under CUDA 12 (the Volta family) a kernel template that such a unit instantiates
+must not be launched on another tier's card from any other unit.
+
 `NINFER_CUDA_PRUNE_PTX=ON` runs NVIDIA `nvprune` on CUDA static archives before host linking.
 It retains all configured SASS targets and host code, and removes PTX. Object-cache entries remain
 unmodified. Windows release builds enable it to reduce image size; local and Linux builds default
-to OFF. A pruned build needs a GPU compatible with one of its SASS images, with no PTX fallback
+to OFF and keep the one PTX architecture described above. A pruned build needs a GPU compatible with one of its SASS images, with no PTX fallback
 for other targets.
 
 Windows releases also enable `NINFER_WINDOWS_KERNEL_DLL` (local default OFF). The GGML kernels
@@ -150,16 +171,17 @@ compilation target.
 The attention units form the static archive `ninfer_small_t_i8`, pruned like the other archives
 and linked whole into the DLL (`ninfer_export_archive_instantiations` in
 `cmake/NinferTargets.cmake`). `dumpbin` lists the archive's public symbols, and a
-module-definition file names only the explicit instantiations of `launch_small_t_i8`, one per
-unit; CMake merges it into the automatic exports. The archive's own link step writes that file:
+module-definition file names only the explicit instantiations of `launch_small_t_i8_tiled`,
+`launch_small_t_i8_pipelined` and `launch_small_t_i8_sm70`, one per unit; CMake merges it into the
+automatic exports. The archive's own link step writes that file:
 generated by a custom command of the DLL, it would make Ninja build the whole archive before any
 object of a target that links the DLL, and every object shard would compile all its units.
 Exporting all their symbols would name every
 kernel the units instantiate, and a DLL can name at most 65535 exports. The units' sources are the
-same in every build, so other builds keep their cache entries. The archive carries its own copy
-of the route key (`small_t_i8_route.cpp`), and the DLL links its own copy of the device layer's
-launch helpers (`core/device_launch.cpp`), which call the DLL's own CUDA runtime, the one that
-registered its kernels.
+same in every build, so other builds keep their cache entries. The units hold kernels and their
+launches only: the tier routing (`int8/small_t_dispatch.cpp`) is host code in the Ops. The DLL links
+its own copy of the device layer's launch helpers (`core/device_launch.cpp`), which call the DLL's
+own CUDA runtime, the one that registered its kernels.
 The DLL also owns the device-tier probe with its cache and the installed device route profiles,
 each compiled as a separate object library. Both the GGML bridge and static Ops call their exported
 functions, so there is one tier cache, one profile store and no circular library dependency. With
@@ -195,8 +217,12 @@ to model media decoding and remains required when apps are disabled. Curl and sp
 only for product support. A Python 3 interpreter is found when tests are configured. The larger Python
 pytest suites and conversion/evaluation scripts run separately from CMake and CTest.
 
-Python 3.11 describes the maintained environment, not a configuration version gate. The one CUDA
-version gate is 13.1 for a `120a` build: CUDA 12.8 and 12.9 miscompile `sm_120a` kernels.
+Python 3.11 describes the maintained environment, not a configuration version gate. The CUDA
+version gates refuse the releases that miscompile a target's kernels: a `120a` build refuses CUDA
+12.8 and 12.9 and CUDA 13.2.0 and 13.2.1, a build with `70` refuses CUDA 13
+([CUDA toolkits](../build-linux.md#cuda-toolkits) has the measurements). The generated
+`ninfer_build_id.h` records the compiler release and the architectures as `NINFER_TOOLCHAIN`, which
+`--version` and the startup log print.
 Windows builds find vcpkg's FFmpeg without imposing library version floors; Linux builds compile
 the release that `cmake/MediaSources.cmake` pins. Actual language/API support is exercised by
 compilation and tests. The libcurl 7.85 minimum has a concrete API basis:
@@ -253,7 +279,7 @@ project includes and the two CUDA archive policies.
 
 | Component | Targets |
 |---|---|
-| `core/` | `ninfer_core` |
+| `core/` | `ninfer_core` and its device layer `ninfer_core_device` (device binding, launches, device waits, peer preflight, tensor-parallel exchange), which the standalone tools in `tools/` link alone |
 | `artifact/` | `ninfer_artifact` |
 | `text/` | `ninfer_text`, including bundled utf8proc C source |
 | `media/` | `ninfer_media_decode` |
@@ -274,7 +300,10 @@ Small components list their sources directly. Larger components include local `s
 manifests which use `target_sources(<owner> PRIVATE ...)`. Included manifests anchor file paths
 with `CMAKE_CURRENT_LIST_DIR`; `include()` does not change `CMAKE_CURRENT_SOURCE_DIR`.
 
-- Every implementation under `src/` has one target owner and one explicit registration.
+- Every implementation under `src/` has one target owner and one explicit registration. Any
+  other target links the owner's library and never compiles the unit again: the copy would miss
+  the compile settings and link requirements the owner declares. Configure fails when a unit
+  under `src/` compiles in two targets (`ninfer_check_source_owners`, `cmake/NinferTargets.cmake`).
 - Ops register simple horizontal implementations in `basic_sources.cmake` and larger semantic
   families in their own manifests. A family also registers its files under `wrapper/`.
 - Linear includes one manifest for each of BF16, FP8, NVFP4, Q4, Q5, Q6 and Q8. Each manifest lists
@@ -291,25 +320,46 @@ dispatch remain in C++; CMake only selects translation units.
 
 ## CUDA compilation boundaries
 
-`ninfer_core` and `ninfer_ops` compile whole-program: no relocatable device code (RDC) and no
+`ninfer_core_device`, `ninfer_core` and `ninfer_ops` compile whole-program: no relocatable device code (RDC) and no
 device link. Every device symbol is defined and used in one translation unit. A change that needs a
 device symbol across translation units has to bring RDC back to its target and measure the cost:
 under RDC ptxas lowers a shuffle from a computed lane to an out-of-line call and stops pipelining
 loads across loop back edges.
 
 Without RDC each translation unit is its own CUDA module, which CUDA loads lazily, at the first
-launch of one of its kernels. The INT8-family small-T attention keeps one unit per width, geometry
-and input (`small_t_i8_w<N>_h<H>_<input>.cu`), so a request paid a module's parse whenever it first
-reached a width. A Program loads those modules at startup
+launch of one of its kernels. The INT8-family small-T attention keeps one unit per tier, width,
+geometry and input (below), so a request paid a module's parse whenever it first reached a width.
+A Program loads those modules at startup
 (`ops::causal_softmax_attention_load_modules`, from the Program constructor): every appending width
 up to its widest call and, with MTP, the drafter's cached width 1. `cudaGetKernel` on one anchor
 kernel of each unit parses the module without loading kernel code into the context, so free device
 memory after startup does not change.
 
+The causal-cache attention keeps its routing and its kernels in separate translation units, so an
+edit compiles only what it changes. Host launchers (`small_t.cpp`, `fp8/small_t.cpp`,
+`nvfp4/small_t.cpp`, `k8v4/small_t.cpp`, `int8/small_t_dispatch.cpp`, `prompt.cpp`) pick the kernel,
+shape and coding of each launch and pass plain launch arguments (`SmallTPartialLaunch`,
+`SmallTI8Launch`, `PromptLaunch`) to kernel units that CMake generates from
+`dense/causal_cache/kernel_unit.cu.in` (`src/ops/softmax_attention/sources.cmake`): one explicit
+instantiation of a launcher template each, three in a prompt unit. The small-T BF16, bf16p, FP8,
+NVFP4 and K8V4 kernels have one unit per geometry and input, the prompt kernels two per geometry and
+block-table form, and the INT8-family small-T kernel one per tier, query width, geometry and input.
+A prompt unit instantiates the fast INT8-family launch, the standard INT8-family launch over the
+codings with packed int4 values and the BF16 launch in this order: NVVM compiles a kernel
+differently after other kernels of its module, and the standard kernels of the packed codings
+compiled alone run rk4v4 and rk4v4-e8 prompts 2-6 % slower on an RTX 4090. The standard kernel over
+INT8 values runs int8-g64 prompts 1-2 % faster on an RTX 3090 and an RTX 4090 compiled alone, in
+the second prompt unit.
+Volta's kernels have units of their own, compiled for `70-real` alone in a build of several
+architectures. The split reducers (`small_t_reduce.cu`, `nvfp4/small_t_reduce.cu`,
+`k8v4/small_t_reduce.cu`) and the fast prompt merge (`int8/prompt_fast_merge.cu`) are units of their
+own. A kernel header is included only by the units that launch it; a host header that both sides
+read carries no device code.
+
 `ninfer_nvfp4_non_rdc` explicitly disables separable compilation and device-symbol resolution. It
 contains the warp-specialized Linear, LinearSwiGLU and causal-attention NVFP4 sources that depend
 on `setmaxnreg` register transfer, which RDC would discard. Their owning family manifests register
-these sources into that target; host launchers connect them to the normal Ops. All three CUDA
+these sources into that target; host launchers connect them to the normal Ops. All four CUDA
 archive targets retain `-lineinfo`.
 
 Whole-program compilation is not a speed lever on every card. On the RTX 3090 (sm_86, CUDA 12.8, 27B
@@ -350,6 +400,45 @@ domain. CUDA translation units under `src/` take only `base.h`, `model_enums.h`,
 than `engine.h` includes `ninfer/types.h`, when a `.cu` under `src/` reaches `engine.h`,
 `engine_options.h`, `request.h` or `observability/`, or when `types_fwd.h` and the definitions
 disagree; CI runs it.
+
+Kernel units do not reach the host API headers either. `src/core/device.h` (device contexts,
+streams, events), `include/ninfer/ops/linear.h`, `include/ninfer/ops/softmax_attention.h`,
+`src/core/paged_kv_cache.h` and `src/ops/common/device_route.h` (device route profiles) change
+often and most host code includes them; the types a kernel launch needs are in
+`src/core/device_launch.h` (`CUDA_CHECK`, the shared memory limit, launch facts),
+`include/ninfer/ops/linear_policy.h`, `include/ninfer/ops/softmax_attention_envelope.h` and
+`src/core/paged_kv_view.h`, which the heavy headers include, and a launch that consults the device
+profile includes `src/ops/common/device_route_lookup.h`. A change to the host API then recompiles
+host code, not the kernels: a heavy attention unit costs 66-75 minutes of one compiler on a hosted
+Linux runner. The check fails when a `.cu` under `src/ops/` reaches one of the five heavy headers,
+unless `HOST_API_UNITS` in the script lists it as a unit that implements or calls that API and
+includes the header itself.
+
+Headers that many kernels read keep apart what changes for other code:
+
+| Header | Holds | Kept out, and where it is |
+|---|---|---|
+| `src/core/weight.h` | `Weight`, `QuantLayout`, an opaque `QType` | the stored formats and ggml block shapes: `src/core/qtype.h` |
+| `src/core/arena.h` | `DeviceArena` (`WorkspaceArena`), `DeviceSpan` | `DeviceBuffer` (`device_buffer.h`), pinned host memory (`pinned_memory.h`), the WDDM budget switch (`wddm_budget.h`) |
+| `src/ops/linear/gguf/ggml_bridge_args.h` | epilogues, `MoeRouting`, the decode-call arguments, an opaque `GgmlType` | the bridge's entry points and block type values: `ggml_bridge.h` |
+
+A new storage format then recompiles the code that names formats, not every kernel that reads a
+`Weight`, and a new GGUF entry point or block type compiles the bridge's dispatch, not its 40
+kernel units; the check fails when one of those units (`ggml_vec_*.cu`, `ggml_mmq_*.cu`,
+`ggml_fattn.cu`) reaches `ggml_bridge.h`. The bridge's internals keep the vector kernel's launches
+(`ggml_bridge_vec_launch.cuh`) apart from the matrix kernel's (`ggml_bridge_mmq_launch.cuh`), so an
+edit of one family's launches compiles that family's 20 or 19 units and the dispatch, and the check
+fails when a unit of one family reaches the other's.
+
+The causal-cache attention (`src/ops/softmax_attention/dense/causal_cache`) keeps its routing and
+its kernels apart (see "CUDA compilation boundaries"). The check fails when a host launcher there
+(`*.cpp`) reaches a kernel header (`*.cuh`) other than `geometry.cuh`, or when a kernel unit's
+header (`*_launch.cuh`) or a reducer or merge unit (`*_reduce.cu`, `*_merge.cu`) reaches a routing
+header: `route.h`, `small_t_launch.h`, `small_t_invocation.h`, `int8/small_t_route.h`,
+`prompt_launch.h`, `prompt_policy.h`, `int8/prompt_fast_plan.h`, `core/paged_kv_view.h` or
+`ninfer/ops/softmax_attention_envelope.h`. A routing edit then compiles no kernel, and a kernel
+edit compiles only that kernel's units. Facts both sides read live in small headers of their own
+(`prompt_shape.h`, `small_t_policy.h`, `int8/coding.h`).
 
 ## Consumers and verification
 

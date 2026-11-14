@@ -71,6 +71,11 @@ struct ResolvedSamplingParameters {
     float presence_penalty  = 0.0F;
     float frequency_penalty = 0.0F;
     std::uint64_t seed      = 0;
+    // The sampled token is the one with the largest log probability plus a Gumbel noise keyed by
+    // its id, instead of the one whose cumulative probability first passes one keyed uniform
+    // (EngineOptions::gumbel_sampling). Both draw from the same distribution; for the same seed
+    // they give different tokens.
+    bool gumbel = false;
 };
 
 enum class OutputChannel : std::uint8_t {
@@ -502,6 +507,9 @@ enum class RequestErrorKind : std::uint8_t {
     QueueTimeout,
     Cancelled,
     Unavailable,
+    // The model's logits came out non-finite, or it selected a token outside its vocabulary: the
+    // request ends, and the Engine goes on serving.
+    NumericalFailure,
 };
 
 class RequestError final : public std::invalid_argument {

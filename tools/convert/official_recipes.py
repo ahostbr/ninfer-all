@@ -40,14 +40,6 @@ def _optional(model, recipe, *, method=grouped_absmax):
                 format = Q5
             _assign(recipe, name, format, method=method)
         elif name.startswith(("mtp/", "dflash/", "dflash2/")):
-            if name.startswith("dflash/dspine/"):
-                continue  # BF16: the DSpine refinement depends on its exact rounding
-            if name.endswith("/attention/output") and name.startswith("dflash/") and "dspine" in (
-                model.components["dflash"]["config"].get("dflash_config", {})
-            ):
-                # BF16: DSpine's o_proj is 5120x4096 (32 heads), a shape no Q8/BF16 linear_add
-                # registers; the draft runs it as a plain projection plus residual_add.
-                continue
             if name.endswith(
                 (
                     "/moe/router",

@@ -3,7 +3,10 @@
 #include "artifact/formats.h"
 #include "artifact/reader.h"
 #include "core/arena.h"
+#include "core/device_buffer.h"
+#include "core/device_wait.h"
 #include "core/host_pages.h"
+#include "core/pinned_memory.h"
 #include "core/startup.h"
 #include "core/tensor_parallel.h"
 #include "models/expert_profile.h"
@@ -15,12 +18,14 @@
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/speculative_round.h"
 #include "ninfer/ops/target_logprobs.h"
+#include "runtime/contract/draft_sampling.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/grammar_masks.h"
 #include "runtime/contract/lookup_draft.h"
 #include "runtime/contract/mtp_adaptive.h"
 #include "runtime/contract/rope_scaling.h"
 #include "runtime/engine/diagnostics.h"
+#include "runtime/engine/worker_fault.h"
 #include "runtime/engine/worker_recovery.h"
 #include "runtime/engine/effective_thinking_budget.h"
 #include "runtime/engine/generation_budget.h"
@@ -32,6 +37,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
@@ -109,22 +115,32 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
         vision_budget = models::qwen3_5::frontend::gemma_budget_at_most(
             options.vision_max_merged_tokens);
     }
+    // A speculative round verifies what the release's assistant proposes (--spec mtp) or what a
+    // standalone DSpine drafter does (--spec dspine --draft-model), where no context lookup
+    // matches (--lookup-ngram).
     const SpeculativeOptions& speculative = options.speculative;
-    const bool mtp = speculative.backend == SpeculativeBackend::Mtp;
-    if (speculative.backend != SpeculativeBackend::None && !mtp) {
-        throw std::invalid_argument("Gemma 4 drafts with its assistant only (--spec mtp)");
+    const bool mtp    = speculative.backend == SpeculativeBackend::Mtp;
+    const bool dspine = speculative.backend == SpeculativeBackend::DSpine;
+    if (speculative.backend != SpeculativeBackend::None && !mtp && !dspine) {
+        throw std::invalid_argument("Gemma 4 drafts with its assistant (--spec mtp) or a DSpine "
+                                    "drafter (--spec dspine --draft-model)");
     }
-    if (mtp && (speculative.draft_tokens == 0 || speculative.draft_tokens > 7)) {
-        throw std::invalid_argument("Gemma 4: --spec mtp requires --draft-tokens in [1,7]");
+    if ((mtp || dspine) && (speculative.draft_tokens == 0 || speculative.draft_tokens > 7)) {
+        throw std::invalid_argument(std::string("Gemma 4: --spec ") + (mtp ? "mtp" : "dspine") +
+                                    " requires --draft-tokens in [1,7]");
     }
-    if (speculative.draft_min_p.value_or(0.0F) != 0 || speculative.mtp_attention_window != 0 ||
-        speculative.ngram_archive_bytes != 0 || speculative.proposal_head != ProposalHead::Auto) {
-        throw std::invalid_argument("Gemma 4's assistant has no --draft-min-p, n-gram archive, "
-                                    "--mtp-attention-window or proposal head");
+    if ((speculative.draft_min_p.value_or(0.0F) != 0 && !dspine) ||
+        speculative.mtp_attention_window != 0 || speculative.ngram_archive_bytes != 0 ||
+        speculative.proposal_head == ProposalHead::Optimized ||
+        (speculative.proposal_head != ProposalHead::Auto && !dspine)) {
+        throw std::invalid_argument("Gemma 4 has no n-gram archive, --mtp-attention-window or "
+                                    "proposal head, and --draft-min-p only with --spec dspine");
     }
-    if (!mtp && (speculative.lookup_ngram != 0 ||
-                 speculative.mtp_policy == MtpDraftPolicy::Adaptive)) {
-        throw std::invalid_argument("--lookup-ngram and --adaptive-mtp require --spec mtp");
+    if (!mtp && !dspine && speculative.lookup_ngram != 0) {
+        throw std::invalid_argument("--lookup-ngram requires --spec mtp or --spec dspine");
+    }
+    if (!mtp && speculative.mtp_policy == MtpDraftPolicy::Adaptive) {
+        throw std::invalid_argument("--adaptive-mtp requires --spec mtp");
     }
     const auto& hybrid = options.hybrid_experts;
     if (hybrid.mapped_misses || hybrid.tail_skip_rank != 0 || hybrid.prefill_buffers != 0 ||
@@ -159,6 +175,7 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
                                      .assistant = mtp,
                                      .vision    = vision,
                                      .experts   = options.expert_residency};
+    if (dspine) { load.dspine = speculative.draft_model; }
     // Expert parallelism: the routed experts divided over the devices, everything else on the
     // first. Without --tensor-split each device takes a share of its speed that fits beside what
     // it holds.
@@ -201,11 +218,14 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
     executor.max_context   = options.max_context + 1;
     executor.sequences     = std::clamp<std::uint32_t>(options.max_concurrency, 1, 8);
     executor.cuda_graphs   = options.use_cuda_graph;
-    executor.draft_tokens  = mtp ? speculative.draft_tokens : 0;
+    executor.draft_tokens  = mtp || dspine ? speculative.draft_tokens : 0;
+    executor.dspine        = dspine;
     executor.kv_cache      = options.kv_cache;
     executor.expert_cache_bytes = options.expert_cache_bytes;
     executor.expert_dma_share   = hybrid.dma_share;
     executor.expert_cpu_threads = hybrid.cpu_threads;
+    executor.expert_disk        = {hybrid.mirror, hybrid.direct};
+    executor.sampled_drafts     = options.gumbel_sampling;
     // The rotation past the native window, as every family resolves it (rope_scaling.h): YaRN
     // for the full-attention blocks, the assistant's included; linear position interpolation is
     // refused. Google publishes no extension of this model's 262,144-token window, so YaRN here is
@@ -312,12 +332,22 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
                            "Gemma 4: assistant speculative decoding, up to %u drafts a round%s",
                            executor.draft_tokens,
                            speculative.mtp_policy == MtpDraftPolicy::Adaptive ? " (adaptive)" : "");
-        if (speculative.ngram_draft_tokens != 0) {
-            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
-                               "Gemma 4 drafts with its assistant and context lookup "
-                               "(--lookup-ngram); n-gram copy proposals (--ngram-draft-tokens) "
-                               "are not available for it");
-        }
+    }
+    if (dspine) {
+        const auto& drafter = *model->dspine();
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "Gemma 4: DSpine drafter %s, up to %u drafts a round%s, ring of %u "
+                           "positions; weights %.0f MiB, ring, table and workspace %.0f MiB",
+                           drafter.name().c_str(), executor.draft_tokens,
+                           speculative.lookup_ngram != 0 ? " where no context lookup matches" : "",
+                           models::dspine::ring_capacity(drafter.config(), executor.max_context),
+                           double(drafter.device_bytes()) / 1048576.0,
+                           double(instance->executor->memory().dspine_bytes) / 1048576.0);
+    }
+    if ((mtp || dspine) && speculative.ngram_draft_tokens != 0) {
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "Gemma 4 drafts with its drafter and context lookup (--lookup-ngram); "
+                           "n-gram copy proposals (--ngram-draft-tokens) are not available for it");
     }
 
     if (executor.rope_yarn.active()) {
@@ -467,6 +497,11 @@ struct Gemma4Core::Request {
     bool post_thinking         = false;
     std::uint32_t position     = 0;
     std::vector<TokenId> feed;
+    // The tokens its sequence had read before the token that begins a stop string's match, and
+    // whether the turn ended at that stop string inside a speculative round that still commits:
+    // the sequence goes back to that many tokens after it.
+    std::optional<std::size_t> hold_fed;
+    bool stop_rewind = false;
     std::vector<TokenId> generated;
     std::optional<GenerationBudget> budget;
     Clock::time_point admitted, prefill_start, prefill_end, first_token, last_token;
@@ -481,6 +516,8 @@ struct Gemma4Core::Impl {
         std::shared_ptr<Request> request;
         std::vector<TokenId> fed;
         std::vector<TokenId> anchor;
+        // runtime::lookup_draft's copy source, as its distance from the end of `fed`.
+        std::size_t lookup_lag = 0;
         // The media units among fed and anchor.
         std::vector<MediaMark> media, anchor_media;
         models::gemma4::SequenceSnapshot snapshot;
@@ -507,8 +544,11 @@ struct Gemma4Core::Impl {
     const std::uint32_t domain;
     const bool structured_output;
     const bool reuse_prefixes;
-    const std::uint32_t drafts;       // the assistant's drafts a round; 0 without speculation
+    const std::uint32_t drafts;       // the drafter's drafts a round; 0 without speculation
     const std::uint32_t lookup_ngram; // --lookup-ngram: tokens a context lookup matches; 0 is off
+    const bool dspine;                // --spec dspine: a DSpine drafter in the assistant's place
+    // --draft-min-p: a DSpine round verifies through its first draft at or below this probability.
+    const float draft_floor;
     const DiagnosticObserver diagnostics;
     // With --adaptive-mtp, the drafts a round proposes and verifies, 1..drafts.
     std::optional<runtime::MtpAdaptiveBatchController> mtp_controller;
@@ -588,7 +628,10 @@ struct Gemma4Core::Impl {
           domain(i.model->resources().public_token_count),
           structured_output(options.structured_output),
           reuse_prefixes(i.executor->options().checkpoints), drafts(i.executor->draft_tokens()),
-          lookup_ngram(options.speculative.lookup_ngram), diagnostics(options.diagnostic_observer),
+          lookup_ngram(options.speculative.lookup_ngram),
+          dspine(options.speculative.backend == SpeculativeBackend::DSpine),
+          draft_floor(options.speculative.draft_min_p.value_or(0.0F)),
+          diagnostics(options.diagnostic_observer),
           slots(i.executor->options().sequences),
           decode_rounds_per_prefill(
               options.decode_rounds_per_prefill != 0
@@ -651,7 +694,8 @@ struct Gemma4Core::Impl {
         host_logprobs =
             std::make_unique<PinnedHostBuffer>(top * (sizeof(std::int32_t) + sizeof(float)));
         const std::int32_t enabled = 1;
-        CUDA_CHECK(cudaMemcpy(logprob_flag.p, &enabled, sizeof(enabled), cudaMemcpyHostToDevice));
+        CUDA_CHECK(ninfer::copy_and_wait(logprob_flag.p, &enabled, sizeof(enabled),
+                                         cudaMemcpyHostToDevice));
         std::size_t workspace = std::max<std::size_t>(
             {ops::sampling_workspace_capacity_bytes(static_cast<std::int32_t>(domain), 1,
                                                     static_cast<std::int32_t>(rows)),
@@ -682,7 +726,8 @@ struct Gemma4Core::Impl {
         }
         sample_workspace = std::make_unique<WorkspaceArena>(workspace);
         load_sampling_kernels();
-        worker           = std::thread([this] {
+        worker = std::thread([this] {
+            const DeviceWaitWatch watched(device, "Gemma 4 worker");
             device.bind_to_current_thread();
             loop();
         });
@@ -706,8 +751,9 @@ struct Gemma4Core::Impl {
     void load_sampling_kernels() {
         const cudaStream_t stream = instance.executor->head_stream();
         const ops::SamplingConfig greedy{};
-        CUDA_CHECK(cudaMemcpy(sample_config.p, &greedy, sizeof(greedy), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemset(sample_position.p, 0, sizeof(std::int32_t)));
+        CUDA_CHECK(ninfer::copy_and_wait(sample_config.p, &greedy, sizeof(greedy),
+                                         cudaMemcpyHostToDevice));
+        CUDA_CHECK(ninfer::fill_and_wait(sample_position.p, 0, sizeof(std::int32_t)));
         const auto* config  = static_cast<const ops::SamplingConfig*>(sample_config.p);
         const auto vocab    = static_cast<std::int32_t>(domain);
         const Tensor flag(logprob_flag.p, DType::I32, {1});
@@ -732,7 +778,7 @@ struct Gemma4Core::Impl {
         }
         if (drafts > 0) {
             for (DeviceBuffer* plane : {&spec_drafts, &spec_extents, &spec_lengths, &spec_anchors}) {
-                CUDA_CHECK(cudaMemset(plane->p, 0, plane->bytes));
+                CUDA_CHECK(ninfer::fill_and_wait(plane->p, 0, plane->bytes));
             }
             // A round's width is its drafts and the bonus column, one draft to all of them.
             for (std::uint32_t k = 1; k <= drafts; ++k) {
@@ -755,9 +801,9 @@ struct Gemma4Core::Impl {
                     *sample_workspace, stream);
             }
         }
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(ninfer::wait_for_stream(stream));
         // Each request clears its own row of the counts; the scratch increment leaves no trace.
-        CUDA_CHECK(cudaMemset(token_counts.p, 0, token_counts.bytes));
+        CUDA_CHECK(ninfer::fill_and_wait(token_counts.p, 0, token_counts.bytes));
     }
 
     // A request that neither computes a prompt chunk nor accepts a token for this long fails with
@@ -917,6 +963,41 @@ struct Gemma4Core::Impl {
         stats.running_requests      = running;
         stats.prefilling_requests   = prefilling;
         stats.decode_ready_requests = decoding;
+    }
+
+    // Drops every stored image of a prefix of the request's prompt.
+    void drop_stored_prefixes(const Request& r) {
+        for (std::size_t i = stored.size(); i-- > 0;) {
+            const std::vector<TokenId>& tokens = stored[i].tokens;
+            if (tokens.size() > r.prompt_tokens.size() ||
+                !std::equal(tokens.begin(), tokens.end(), r.prompt_tokens.begin())) {
+                continue;
+            }
+            free_pages.insert(free_pages.end(), stored[i].pages.begin(), stored[i].pages.end());
+            host_used -= stored[i].pages.size() * kHostPageBytes;
+            stored.erase(stored.begin() + static_cast<std::ptrdiff_t>(i));
+        }
+        std::lock_guard lock(stats_mutex);
+        stats.host_kv_occupied_bytes = host_used;
+    }
+
+    // Ends one request whose logits came out non-finite, or whose sampled or licensed token lies
+    // outside the vocabulary: thrown where the request's own handler (fail) ends it alone, so the
+    // other requests and the Engine go on. Before its first token the request may have computed
+    // its prompt wrong or resumed from a wrong prefix, and no later logits have vouched for the
+    // images it stored on the way: every stored prefix of its prompt goes, so the same prompt
+    // computes again. Later the prompt's logits were finite, and its images stay.
+    [[noreturn]] void throw_numerical_failure(const Request& r) {
+        const std::string where =
+            r.generated.empty() ? std::string("at the end of the prompt")
+                                : "after " + std::to_string(r.generated.size()) + " generated tokens";
+        if (r.generated.empty()) { drop_stored_prefixes(r); }
+        publish_diagnostic(diagnostics, DiagnosticLevel::Error,
+                           "request %llu: non-finite logits or a token outside the vocabulary %s - "
+                           "ending the request",
+                           static_cast<unsigned long long>(r.id), where.c_str());
+        throw RequestError(RequestErrorKind::NumericalFailure,
+                           "the model produced non-finite logits " + where);
     }
 
     void fail(const std::shared_ptr<Request>& request, std::exception_ptr error) {
@@ -1165,7 +1246,7 @@ struct Gemma4Core::Impl {
         slot.disposable = r.disposable;
         r.reused = r.prefilled = reused;
         if (drafts > 0) {
-            r.speculative.backend      = SpeculativeBackend::Mtp;
+            r.speculative.backend      = dspine ? SpeculativeBackend::DSpine : SpeculativeBackend::Mtp;
             r.speculative.enabled      = true;
             r.speculative.draft_window = drafts;
             r.speculative.accepted_per_position.assign(drafts, 0);
@@ -1373,6 +1454,8 @@ struct Gemma4Core::Impl {
             config.presence_penalty  = row.params->presence_penalty;
             config.frequency_penalty = row.params->frequency_penalty;
             config.seed              = row.params->seed;
+            config.draw              = row.params->gumbel ? ops::kSampleDrawGumbel
+                                                          : ops::kSampleDrawInverseCdf;
             config.token_counts      = row.counts ? static_cast<std::int32_t*>(token_counts.p) +
                                                         std::size_t(row.slot) * domain
                                                   : nullptr;
@@ -1457,13 +1540,21 @@ struct Gemma4Core::Impl {
         }
         CUDA_CHECK(cudaMemcpyAsync(tokens, sample_out.p, n * sizeof(std::int32_t),
                                    cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(ninfer::wait_for_stream(stream));
         instance.executor->check_experts();
         for (std::size_t b = 0; b < n; ++b) {
-            const std::int32_t token = tokens[b];
-            if (token == ops::kSamplerNonFiniteToken || token < 0 ||
-                std::uint32_t(token) >= domain) {
-                throw std::runtime_error("Gemma 4 produced non-finite logits");
+            std::int32_t token = tokens[b];
+            if (b == 0 && runtime::consume_armed_numerical_fault(
+                              purpose == ops::kSamplePurposePrefill
+                                  ? runtime::armed_prefill_numerical_faults
+                                  : runtime::armed_decode_numerical_faults)) {
+                token = ops::kSamplerNonFiniteToken; // the verification seam of worker_fault.h
+            }
+            if (token < 0 || std::uint32_t(token) >= domain) {
+                // Non-finite logits (the sampler's marker) or an id outside the vocabulary: the
+                // row's request ends where it takes the token (throw_numerical_failure).
+                out[b] = ops::kSamplerNonFiniteToken;
+                continue;
             }
             out[b] = token;
             if (!rows[b].logprobs) { continue; }
@@ -1585,7 +1676,9 @@ struct Gemma4Core::Impl {
         const auto chunk = std::span<const TokenId>(r.prompt_tokens).subspan(r.prefilled, n);
         std::vector<std::vector<std::uint16_t>> host_embeddings;
         const auto media = chunk_media(r, r.prefilled, r.prefilled + n, host_embeddings);
-        executor.forward(r.slot, chunk, 1, media);
+        // A chunk before the prompt's end leaves no logits: its last block only writes its keys
+        // and values.
+        executor.forward(r.slot, chunk, r.prefilled + n < prompt_n ? 0U : 1U, media);
         if (!media.empty() && !instance.cpu_vision) {
             r.vision_seconds += executor.last_media_seconds();
         }
@@ -1607,7 +1700,7 @@ struct Gemma4Core::Impl {
             slot.anchor_media = slot.media;
         }
         if (r.observation.prompt_progress) {
-            CUDA_CHECK(cudaStreamSynchronize(executor.head_stream()));
+            CUDA_CHECK(ninfer::wait_for_stream(executor.head_stream()));
             executor.check_experts();
             {
                 std::lock_guard lock(r.mutex);
@@ -1670,7 +1763,7 @@ struct Gemma4Core::Impl {
         }
         const std::uint32_t n = prefill_step_tokens(r);
         const auto chunk      = std::span<const TokenId>(branch.tokens).subspan(r.branch_fed, n);
-        executor.forward(r.slot, chunk, 1);
+        executor.forward(r.slot, chunk, r.branch_fed + n < branch.tokens.size() ? 0U : 1U);
         slot.fed.insert(slot.fed.end(), chunk.begin(), chunk.end());
         r.branch_fed += n;
         r.progress = Clock::now();
@@ -1731,6 +1824,7 @@ struct Gemma4Core::Impl {
                 logits.slice(1, static_cast<std::int32_t>(at), static_cast<std::int32_t>(n));
             sample(rows, ops::kSamplePurposePrefill, sampled, records, &source);
             for (std::size_t k = 0; k < n; ++k) {
+                if (sampled[k] < 0) { throw_numerical_failure(r); }
                 if (r.branch_results.empty()) {
                     r.branch_token  = sampled[k];
                     r.branch_record = records[k];
@@ -1751,7 +1845,7 @@ struct Gemma4Core::Impl {
         Request& r          = *request;
         auto& executor      = *instance.executor;
         const auto prompt_n = static_cast<std::uint32_t>(r.prompt_tokens.size());
-        CUDA_CHECK(cudaStreamSynchronize(executor.head_stream()));
+        CUDA_CHECK(ninfer::wait_for_stream(executor.head_stream()));
         executor.check_experts();
         r.prefill_end = Clock::now();
         {
@@ -1806,10 +1900,24 @@ struct Gemma4Core::Impl {
     // finishes the request or queues what its next decode step feeds.
     void accept(const std::shared_ptr<Request>& request, TokenId token,
                 const runtime::RawTokenLogprob* logprob) {
+        if (token < 0) { throw_numerical_failure(*request); }
         (void)accept(request, std::span<const TokenId>(&token, 1),
                      logprob != nullptr ? std::span<const runtime::RawTokenLogprob>(logprob, 1)
-                                        : std::span<const runtime::RawTokenLogprob>{});
+                                        : std::span<const runtime::RawTokenLogprob>{},
+                     true);
         check_capacity(request);
+    }
+
+    // A turn that ended at a stop string: the sequence goes back to what it had read before the
+    // token that begins the match, the state the visible text continues, when its rings still
+    // hold that position's window. Otherwise it keeps its live state, which no later prompt
+    // continues.
+    void rewind_to_hold(Request& r) {
+        r.stop_rewind = false;
+        Slot& slot    = slots[r.slot];
+        if (!r.hold_fed || *r.hold_fed >= slot.fed.size()) { return; }
+        const auto tokens = static_cast<std::uint32_t>(slot.fed.size() - *r.hold_fed);
+        if (instance.executor->rewind(r.slot, tokens)) { slot.fed.resize(*r.hold_fed); }
     }
 
     // A request whose next feed would pass the context finishes.
@@ -1823,8 +1931,10 @@ struct Gemma4Core::Impl {
     // capacity check, which the caller makes once the round's position is known: returns how many
     // of them the policy accepted. The next step feeds the last accepted one (the first when none
     // was, as a single sampled token is fed whatever the policy decides).
+    // `committed`: the sequence has read what the tokens follow; a speculative round, which has
+    // yet to read its anchor, commits after the policy has decided.
     std::uint32_t accept(const std::shared_ptr<Request>& request, std::span<const TokenId> tokens,
-                         std::span<const runtime::RawTokenLogprob> logprobs) {
+                         std::span<const runtime::RawTokenLogprob> logprobs, bool committed) {
         Request& r                    = *request;
         const OutputDecision decision = r.output.preview_model(tokens, r.budget->remaining(),
                                                                r.budget->limit_reason(), logprobs);
@@ -1852,7 +1962,24 @@ struct Gemma4Core::Impl {
             std::lock_guard lock(stats_mutex);
             stats.committed_decode_tokens += accepted;
         }
+        // The match of a stop string began at accepted token `stop_hold_after`: the sequence had
+        // read, or will have once the round commits, this many tokens before it.
+        if (accepted > 0 && decision.stop_hold_after && *decision.stop_hold_after < accepted) {
+            r.hold_fed = slots[r.slot].fed.size() + (committed ? 0 : 1) + *decision.stop_hold_after;
+            // Rings no wider than the window keep the rows that the steps from here overwrite.
+            if (committed) { instance.executor->hold(r.slot); }
+        } else if (!decision.finished() && !decision.stop_hold_alive) {
+            r.hold_fed.reset();
+            instance.executor->release_hold(r.slot);
+        }
         if (decision.finished()) {
+            if (decision.stop_cut) {
+                if (committed) {
+                    rewind_to_hold(r);
+                } else {
+                    r.stop_rewind = true;
+                }
+            }
             finish(request, decision.finish_reason);
             return accepted;
         }
@@ -2071,8 +2198,9 @@ struct Gemma4Core::Impl {
             for (std::size_t j = 0; j < b; ++j) {
                 std::vector<TokenId>& ledger = slots[batch[j]->slot].fed;
                 ledger.push_back(anchors[j]);
-                const std::uint32_t found = runtime::lookup_draft(
-                    ledger, lookup_ngram, steps, all_drafts.data() + j * drafts);
+                const std::uint32_t found =
+                    runtime::lookup_draft(ledger, lookup_ngram, steps, all_drafts.data() + j * drafts,
+                                          slots[batch[j]->slot].lookup_lag);
                 ledger.pop_back();
                 if (found != 0) {
                     looked_up[j]     = 1;
@@ -2084,17 +2212,44 @@ struct Gemma4Core::Impl {
         if (lookups < b) {
             std::vector<std::uint32_t> mtp_sequences;
             std::vector<TokenId> mtp_anchors;
+            // Each row's assistant draws its drafts with the keys its verification columns draw
+            // the target's tokens with (runtime::draft_sampling).
+            std::vector<ops::SamplingConfig> mtp_configs;
+            std::vector<std::int32_t> mtp_lengths;
             for (std::size_t j = 0; j < b; ++j) {
                 if (looked_up[j]) { continue; }
                 mtp_sequences.push_back(sequences[j]);
                 mtp_anchors.push_back(anchors[j]);
+                mtp_configs.push_back(runtime::draft_sampling(*sample_row(*batch[j]).params));
+                mtp_lengths.push_back(static_cast<std::int32_t>(batch[j]->position));
             }
             std::vector<TokenId> mtp_drafts(mtp_sequences.size() * steps);
-            executor.draft(mtp_sequences, mtp_anchors, mtp_drafts, steps);
+            // A DSpine drafter's greedy drafts, each row's cut after its first draft at or below
+            // the floor (--draft-min-p).
+            std::vector<std::uint32_t> lengths(mtp_sequences.size(), steps);
+            if (dspine) {
+                std::vector<float> confidence(mtp_drafts.size());
+                executor.draft(mtp_sequences, mtp_anchors, steps, mtp_drafts, confidence);
+                for (std::size_t m = 0; m < lengths.size(); ++m) {
+                    for (std::uint32_t i = 0; i < steps; ++i) {
+                        const float p = confidence[m * steps + i];
+                        if (!std::isfinite(p)) {
+                            throw std::runtime_error("Gemma 4: non-finite DSpine draft confidence");
+                        }
+                        if (draft_floor > 0 && lengths[m] == steps && p <= draft_floor) {
+                            lengths[m] = i + 1;
+                        }
+                    }
+                }
+            } else {
+                executor.draft(mtp_sequences, mtp_anchors, mtp_drafts, steps, mtp_configs,
+                               mtp_lengths);
+            }
             for (std::size_t j = 0, m = 0; j < b; ++j) {
                 if (looked_up[j]) { continue; }
                 std::copy_n(mtp_drafts.begin() + std::ptrdiff_t(m * steps), steps,
                             all_drafts.begin() + std::ptrdiff_t(j * drafts));
+                draft_extents[j] = lengths[m];
                 ++m;
             }
         }
@@ -2172,6 +2327,8 @@ struct Gemma4Core::Impl {
             config.presence_penalty  = row.params->presence_penalty;
             config.frequency_penalty = row.params->frequency_penalty;
             config.seed              = row.params->seed;
+            config.draw              = row.params->gumbel ? ops::kSampleDrawGumbel
+                                                          : ops::kSampleDrawInverseCdf;
             config.token_counts      = row.counts ? static_cast<std::int32_t*>(token_counts.p) +
                                                         std::size_t(row.slot) * domain
                                                   : nullptr;
@@ -2274,7 +2431,7 @@ struct Gemma4Core::Impl {
             cudaMemcpyAsync(host + b * w, spec_counts.p, b * 4, cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaMemcpyAsync(host + b * w + b, spec_accepted.p, b * 4, cudaMemcpyDeviceToHost,
                                    stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(ninfer::wait_for_stream(stream));
         instance.executor->check_experts();
 
         // The output policy takes its part of each licensed run; the executor then keeps the tokens
@@ -2287,13 +2444,19 @@ struct Gemma4Core::Impl {
             const std::int32_t licensed_n = host[b * w + j];
             const std::int32_t drafts_n   = host[b * w + b + j];
             const std::int32_t* run       = host + j * w;
-            if (licensed_n < 1 || licensed_n > columns || run[0] == ops::kSamplerNonFiniteToken) {
-                throw std::runtime_error("Gemma 4 produced non-finite logits");
+            if (licensed_n < 1 || licensed_n > columns) {
+                throw std::runtime_error("Gemma 4 verification returned an invalid licensed run");
             }
-            for (std::int32_t i = 0; i < licensed_n; ++i) {
-                if (run[i] < 0 || std::uint32_t(run[i]) >= domain) {
-                    throw std::runtime_error("Gemma 4 licensed a token outside the vocabulary");
-                }
+            // Non-finite logits (the sampler's marker) or an id outside the vocabulary in the run:
+            // this request ends, the round's other rows commit.
+            if (std::any_of(run, run + licensed_n, [&](std::int32_t token) {
+                    return token < 0 || std::uint32_t(token) >= domain;
+                })) {
+                try {
+                    throw_numerical_failure(r);
+                } catch (...) { fail(request, std::current_exception()); }
+                failed[j] = 1;
+                continue;
             }
             std::vector<runtime::RawTokenLogprob> records;
             if (rows[j].logprobs) {
@@ -2332,7 +2495,7 @@ struct Gemma4Core::Impl {
                 failed[j] = 1;
             } else {
                 try {
-                    taken = accept(request, run_tokens, records);
+                    taken = accept(request, run_tokens, records, false);
                 } catch (...) {
                     fail(request, std::current_exception());
                     failed[j] = 1;
@@ -2374,6 +2537,7 @@ struct Gemma4Core::Impl {
             slot.fed.insert(slot.fed.end(), tokens.begin() + starts[j],
                             tokens.begin() + starts[j] + std::ptrdiff_t(kept[j]));
             r.position += kept[j];
+            if (r.stop_rewind) { rewind_to_hold(r); }
             try {
                 check_capacity(batch[j]);
             } catch (...) { fail(batch[j], std::current_exception()); }
@@ -2407,7 +2571,9 @@ struct Gemma4Core::Impl {
         out.reserve(n - first_target);
         for (std::uint32_t at = 0; at + 1 < n; at += chunk) {
             const std::uint32_t count = std::min(chunk, n - 1 - at);
-            executor.forward(0, std::span<const TokenId>(tokens).subspan(at, count), count);
+            // A chunk before the first target only extends the context.
+            executor.forward(0, std::span<const TokenId>(tokens).subspan(at, count),
+                             first_target > at + count ? 0U : count);
             const std::uint32_t first_row = first_target > at + 1 ? first_target - at - 1 : 0;
             if (first_row >= count) { continue; }
             const std::uint32_t rows = count - first_row;
@@ -2429,7 +2595,7 @@ struct Gemma4Core::Impl {
             std::vector<float> host(rows);
             CUDA_CHECK(cudaMemcpyAsync(host.data(), score_out.p, rows * 4, cudaMemcpyDeviceToHost,
                                        stream));
-            CUDA_CHECK(cudaStreamSynchronize(stream));
+            CUDA_CHECK(ninfer::wait_for_stream(stream));
             instance.executor->check_experts();
             out.insert(out.end(), host.begin(), host.end());
         }
@@ -2731,6 +2897,8 @@ std::vector<float> Gemma4Core::score(models::qwen3_5::PreparedPrompt prompt,
             --impl.outstanding;
         }
     } release{*impl_};
+
+    const DeviceWaitWatch watched(impl_->device, "Gemma 4 scoring caller");
     impl_->device.bind_to_current_thread();
     return impl_->score(tokens, first_target);
 }
@@ -2749,14 +2917,20 @@ MemorySummary Gemma4Core::memory_summary() const {
         std::lock_guard lock(impl_->stats_mutex);
         out.host_kv_occupied_bytes = impl_->stats.host_kv_occupied_bytes;
     }
-    out.weights   = arena(stats.device_capacity_by_rank.empty() ? 0 : stats.device_capacity_by_rank[0]);
+    // A DSpine drafter's weights load beside the model's on its first device.
+    const auto* drafter = impl_->instance.model->dspine();
+    const std::uint64_t drafter_weights = drafter != nullptr ? drafter->device_bytes() : 0U;
+    const std::uint64_t model_weights =
+        stats.device_capacity_by_rank.empty() ? 0 : stats.device_capacity_by_rank[0];
+    out.weights   = arena(model_weights + drafter_weights);
     out.sequence  = {memory.kv_bytes, memory.kv_backed_bytes, memory.kv_backed_bytes};
     out.workspace = arena(memory.workspace_bytes + memory.experts.bank_bytes +
                           memory.experts.metadata_bytes);
     out.kv_payload_bytes              = memory.kv_bytes;
     out.expert_cache_bytes = memory.experts.cache_bytes;
     out.runtime_reservation_bytes = memory.kv_bytes + memory.workspace_bytes +
-        memory.experts.cache_bytes + memory.experts.bank_bytes + memory.experts.metadata_bytes;
+        memory.experts.cache_bytes + memory.experts.bank_bytes + memory.experts.metadata_bytes +
+        memory.dspine_bytes;
     out.available_after_weights_bytes = impl_->instance.free_after_weights;
     out.available_after_startup_bytes = impl_->instance.free_after_startup;
     if (impl_->instance.vision_budget > 0) {

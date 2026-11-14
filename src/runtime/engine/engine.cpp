@@ -530,7 +530,8 @@ public:
                 "Qwen3.8-Flash-Next host or disk experts");
         }
         if (options.hybrid_experts.expert_host_bytes != 0) {
-            throw std::invalid_argument("--expert-host-mib requires DeepSeek-V4.1");
+            throw std::invalid_argument(
+                "--expert-host-mib requires DeepSeek-V4.1 or Qwen3.8-Flash-Next / Edge0 disk experts");
         }
         if ((options.hybrid_experts.dma_share || options.hybrid_experts.cpu_threads != 0) &&
             options.expert_residency == ExpertResidency::Device) {

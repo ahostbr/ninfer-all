@@ -2718,9 +2718,23 @@ struct Executor::Impl {
                     .widest_call = i >= layers.size() ? widest_draft : widest_call,
                     .own_pool    = i >= layers.size()});
             }
+            // --expert-host-mib (fork T1310): the experts the routing profile ranks highest, while
+            // they fit, read once into pinned host memory; misses on them are copies, not reads.
+            const std::uint64_t tier_bytes = options.hybrid_experts.expert_host_bytes;
+            std::optional<ExpertRouteCounts> tier_profile;
+            if (tier_bytes != 0) {
+                std::vector<std::size_t> widths;
+                for (const auto& layer : stream_layers) { widths.push_back(layer.experts[0].size()); }
+                tier_profile = !options.hybrid_experts.routing_profile.empty()
+                    ? std::optional<ExpertRouteCounts>(read_expert_profile(
+                          options.hybrid_experts.routing_profile, model.info().artifact_id, widths))
+                    : builtin_expert_profile(
+                          config.latent_moe ? kLatentProfileFamily : kExpertProfileFamily, widths);
+            }
             stream = std::make_unique<ExpertStream>(
                 device, model.files(), std::move(stream_layers), bytes, grows,
-                ExpertDiskReads{options.hybrid_experts.mirror, options.hybrid_experts.direct});
+                ExpertDiskReads{options.hybrid_experts.mirror, options.hybrid_experts.direct},
+                ExpertHostTierRequest{tier_bytes, tier_profile ? &*tier_profile : nullptr});
             for (std::size_t r = 0; r < bytes.size(); ++r) {
                 memory.ranks[r].expert_cache_bytes += stream->pool_bytes(r);
             }
@@ -7671,6 +7685,10 @@ void Executor::snapshot(std::uint32_t sequence, SequenceSnapshot& out) {
 }
 
 std::uint64_t Executor::graph_bytes() const { return impl_->graph_bytes; }
+
+ExpertHostTierStats Executor::expert_host_tier() const {
+    return impl_->stream ? impl_->stream->host_tier() : ExpertHostTierStats{};
+}
 
 void Executor::size_snapshot(SequenceSnapshot& out) {
     impl_->size_snapshot(impl_->sequences.at(0), out);

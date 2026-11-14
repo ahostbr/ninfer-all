@@ -253,11 +253,10 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
             expert_profile = models::read_expert_profile(hybrid.routing_profile,
                                                          reader.artifact_id(), widths);
             publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
-                               "DeepSeek-V4.1: expert profile %s read for artifact %s: %zu layers "
-                               "of %u experts (counts by position in the artifact's kept experts)",
-                               hybrid.routing_profile.string().c_str(),
-                               models::expert_profile_artifact_id(reader.artifact_id()).c_str(),
-                               widths.size(), unsigned(text.num_experts));
+                               "DeepSeek-V4.1: expert profile %s read: %zu layers of %u experts "
+                               "(counts by position in the artifact's kept experts)",
+                               hybrid.routing_profile.string().c_str(), widths.size(),
+                               unsigned(text.num_experts));
         } else {
             expert_profile = models::builtin_expert_profile("deepseek-v4.1", widths);
         }

@@ -27,6 +27,7 @@
 #include "ninfer/kv_cache_storage.h"
 #include "ninfer/observability/resources.h"
 #include "models/qwen4_exp/expert_cache.h"
+#include "models/qwen4_exp/expert_host_tier.h"
 #include "models/qwen4_exp/hybrid_experts.h"
 #include "models/qwen4_exp/model.h"
 #include "models/qwen4_exp/ngram_component.h"
@@ -213,6 +214,8 @@ public:
     // Device bytes, on the rank that took the most, of the CUDA Graphs the warm-up captured
     // (zero without CUDA Graphs).
     [[nodiscard]] std::uint64_t graph_bytes() const;
+    // Disk experts with --expert-host-mib: what the pinned host tier holds (zero otherwise).
+    [[nodiscard]] ExpertHostTierStats expert_host_tier() const;
     // Gives `out` the device buffers snapshot() fills for a sequence, unless it has them.
     void size_snapshot(SequenceSnapshot& out);
     [[nodiscard]] std::uint32_t position(std::uint32_t sequence) const;

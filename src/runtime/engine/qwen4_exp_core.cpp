@@ -355,6 +355,10 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         options.use_cuda_graph &&
         runtime::host_waits_need_eager(options.expert_residency, serialized_copy_queue());
     executor.cuda_graphs = options.use_cuda_graph && !eager_host_waits;
+    if (options.hybrid_experts.expert_host_bytes != 0 &&
+        options.expert_residency != ExpertResidency::Disk) {
+        throw std::invalid_argument("--expert-host-mib requires --expert-residency disk");
+    }
     if (eager_host_waits) {
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
                            "Qwen3.8-Flash-Next: CUDA graphs off with %s experts on this driver model "
@@ -443,6 +447,16 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                        double(instance->executor->memory().workspace_bytes) / 1048576.0,
                        double(instance->executor->memory().expert_cache_bytes) / 1048576.0,
                        double(instance->executor->graph_bytes()) / 1048576.0);
+    if (const auto tier = instance->executor->expert_host_tier(); tier.experts != 0) {
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "Qwen3.8-Flash-Next: %u of %u experts (%.0f MiB, %s) kept in pinned host "
+                           "memory (--expert-host-mib), the rest read from the artifact's files",
+                           tier.experts, tier.of, double(tier.bytes) / 1048576.0,
+                           tier.ranked ? ("the profile's highest, " +
+                                          std::to_string(int(tier.profile_share * 100.0 + 0.5)) +
+                                          "% of its routes").c_str()
+                                       : "an even share of every layer, no profile");
+    }
     if (model->tensor_parallel()) {
         std::string keys, kv, experts, shared, head;
         const auto range = [](std::string& out, std::size_t rank, std::uint64_t begin,

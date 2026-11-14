@@ -357,6 +357,33 @@ int run(int devices, bool direct, bool mirror) {
         std::cout << "two ranks skipped: one CUDA device\n";
     }
     owner.reset();
+    {
+        // Fork T1310, --expert-host-mib: a tier of the profile's three highest experts (layer 0's 3
+        // and 7, layer 1's straddling 20: 2 * (3072 + 3072 + 1536) + 1280 + 2560 + 1024 bytes at
+        // the stream's 256-byte alignment) is read at construction; misses on them are copies, a
+        // miss on any other expert a file read, and every slot holds the expert's bytes.
+        ninfer::models::ExpertRouteCounts profile(3, std::vector<std::uint64_t>(kExperts, 0));
+        profile[0][3] = 100;
+        profile[0][7] = 90;
+        profile[1][20] = 80;
+        const ExpertHostTierRequest tier{2 * (3072 + 3072 + 1536) + 1280 + 2560 + 1024, &profile};
+        auto tiered = std::make_unique<ExpertStream>(device, paths, stream_layers(), budget, false,
+                                                     reads, tier);
+        const auto held = tiered->host_tier();
+        require(held.experts == 3 && held.of == 3 * kExperts && held.ranked &&
+                    held.profile_share > 0.999,
+                "the tier holds the profile's three highest experts");
+        checked = tiered.get();
+        check(0, {3, 7}, "tier: two tier experts");
+        check(1, {20}, "tier: a straddling tier expert");
+        require(tiered->stats().tier_misses == 3 && tiered->stats().read_bytes == 0,
+                "tier misses are copies, not reads");
+        check(0, {5}, "tier: a file expert beside the tier");
+        require(tiered->stats().tier_misses == 3 &&
+                    tiered->stats().read_bytes == 3000 + 3000 + 1500,
+                "an expert outside the tier is read from the files");
+        checked = &stream;
+    }
     for (const auto& path : paths) { std::filesystem::remove(path); }
     if (mirror) { std::filesystem::remove_all(reads.mirror); }
     return 0;

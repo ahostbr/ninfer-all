@@ -121,3 +121,7 @@ ninfer_add_test(ninfer_http_transport_test
 # Fork change W5: CUDA Graphs stay off for host and disk experts where copies queue in one line.
 ninfer_add_test(ninfer_host_wait_graphs_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_host_wait_graphs.cpp")
+
+# Fork T1310: the --expert-host-mib tier selection of Flash-Next / Edge0 disk experts.
+ninfer_add_test(ninfer_expert_host_tier_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_expert_host_tier.cpp")

@@ -14,6 +14,7 @@
 
 #include "core/device.h"
 #include "core/expert_disk.h"
+#include "models/qwen4_exp/expert_host_tier.h"
 #include "models/qwen4_exp/model.h"
 
 #include <array>
@@ -45,6 +46,9 @@ struct ExpertStreamStats {
     std::uint64_t read_bytes = 0;
     std::uint32_t slots      = 0;
     double read_seconds      = 0.0;
+    // Of the misses, those the host tier served (--expert-host-mib): a copy, no file read.
+    std::uint64_t tier_misses = 0;
+    std::uint64_t tier_bytes  = 0;
 };
 
 class ExpertStream {
@@ -52,11 +56,13 @@ public:
     // With `grows` (the automatic cache) the pools are laid out as `bytes_by_rank` lays them, but
     // start at half of it, or at the widest call of their layers if that is more; grow() adds to
     // them once startup is done. `disk`: a drive mirror whose copies the reads of odd stripes go
-    // to, and the direct path (core/expert_disk.h).
+    // to, and the direct path (core/expert_disk.h). `tier`: up to tier.bytes of the experts its
+    // profile ranks highest are read once into page-locked host memory (expert_host_tier.h), and a
+    // miss on one of them is copied from there instead of read from the files.
     ExpertStream(DeviceContext& device, const std::vector<std::filesystem::path>& files,
                  std::vector<ExpertStreamLayer> layers,
                  std::span<const std::uint64_t> bytes_by_rank, bool grows = false,
-                 const ExpertDiskReads& disk = {});
+                 const ExpertDiskReads& disk = {}, const ExpertHostTierRequest& tier = {});
     ~ExpertStream();
     ExpertStream(const ExpertStream&)            = delete;
     ExpertStream& operator=(const ExpertStream&) = delete;
@@ -69,6 +75,8 @@ public:
     // their last chunk's experts while the later layers of the span read theirs.
     void prepare(std::size_t layer, std::span<const std::int32_t> ids, bool release_others);
     [[nodiscard]] ExpertStreamStats stats() const noexcept;
+    // What the host tier holds (all zero without one).
+    [[nodiscard]] ExpertHostTierStats host_tier() const noexcept;
     // The device memory of `layer`'s slots, its pool's own block and grow's (empty until then):
     // a table entry inside either is a resident expert.
     using Ranges = std::array<std::pair<std::uintptr_t, std::uintptr_t>, 2>;

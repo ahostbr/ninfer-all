@@ -156,6 +156,8 @@ struct ExpertStream::Impl {
         std::vector<std::int32_t> slot_of;
         std::array<std::vector<const void*>, 3> mirror;
         std::unique_ptr<PinnedHostBuffer> table_staging;
+        // Each expert's gate, up and down in the host tier, or null: read from the files.
+        std::array<std::vector<const std::byte*>, 3> tier;
     };
 
     DeviceContext& device;
@@ -174,6 +176,9 @@ struct ExpertStream::Impl {
     bool grew                = false;
     ExpertStreamStats stats;
     ReadPool reads{kReadThreads - 1}; // the caller reads too
+    // The host tier's page-locked blocks (--expert-host-mib) and what they hold.
+    std::vector<std::unique_ptr<PinnedHostBuffer>> tier_blocks;
+    ExpertHostTierStats tier_stats;
 
     // The batch being staged in the current half: its reads, then the copies out of the half (a
     // copy without a source zeroes its target).
@@ -193,7 +198,7 @@ struct ExpertStream::Impl {
 
     Impl(DeviceContext& d, const std::vector<std::filesystem::path>& paths,
          std::vector<ExpertStreamLayer> specs, std::span<const std::uint64_t> bytes_by_rank,
-         bool grows, const ExpertDiskReads& disk)
+         bool grows, const ExpertDiskReads& disk, const ExpertHostTierRequest& tier)
         : device(d) {
         for (const auto& path : paths) { files.push_back(std::make_unique<File>(path)); }
         for (const auto& path : expert_mirror_files(paths, disk.mirror)) {
@@ -280,6 +285,66 @@ struct ExpertStream::Impl {
                 CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
             }
         }
+        fill_tier(tier);
+    }
+
+    // The host tier: selects its experts (select_host_tier) and reads them, each expert's gate, up
+    // and down one after another, into page-locked blocks of at most kTierBlock bytes, through the
+    // same parallel reads a miss takes. Every expert's tier entry is null without one.
+    void fill_tier(const ExpertHostTierRequest& request) {
+        for (auto& layer : layers) {
+            for (auto& entry : layer.tier) { entry.assign(layer.slot_of.size(), nullptr); }
+        }
+        if (request.bytes == 0) { return; }
+        constexpr std::uint64_t kTierBlock = 1ULL << 30;
+        std::vector<std::vector<std::uint64_t>> sizes(layers.size());
+        for (std::size_t l = 0; l < layers.size(); ++l) {
+            sizes[l].assign(layers[l].slot_of.size(), 0);
+            for (std::size_t e = 0; e < sizes[l].size(); ++e) {
+                for (int k = 0; k < 3; ++k) {
+                    sizes[l][e] += aligned(layers[l].spec.experts[k][e].bytes);
+                }
+            }
+        }
+        const auto kept = select_host_tier(sizes, request, &tier_stats);
+        struct Placed { std::size_t layer, expert, block; std::uint64_t at; };
+        std::vector<Placed> placed;
+        std::vector<std::uint64_t> block_bytes;
+        for (std::size_t l = 0; l < kept.size(); ++l) {
+            for (std::size_t e = 0; e < kept[l].size(); ++e) {
+                if (!kept[l][e]) { continue; }
+                if (block_bytes.empty() ||
+                    block_bytes.back() + sizes[l][e] > std::max(kTierBlock, sizes[l][e])) {
+                    block_bytes.push_back(0);
+                }
+                placed.push_back({l, e, block_bytes.size() - 1, block_bytes.back()});
+                block_bytes.back() += sizes[l][e];
+            }
+        }
+        for (const std::uint64_t bytes : block_bytes) {
+            tier_blocks.push_back(std::make_unique<PinnedHostBuffer>(static_cast<std::size_t>(bytes)));
+        }
+        std::vector<Read> tier_reads;
+        for (const Placed& p : placed) {
+            Layer& layer = layers[p.layer];
+            auto* at = static_cast<std::byte*>(tier_blocks[p.block]->data()) + p.at;
+            for (int k = 0; k < 3; ++k) {
+                const ExpertLocation& location = layer.spec.experts[k][p.expert];
+                layer.tier[k][p.expert]        = at;
+                std::uint64_t within           = 0;
+                for (const auto& run : location.runs) {
+                    if (run.bytes == 0) { continue; }
+                    tier_reads.push_back({files.at(run.file).get(), run.offset, at + within,
+                                          static_cast<std::size_t>(run.bytes)});
+                    within += run.bytes;
+                }
+                at += aligned(location.bytes);
+            }
+        }
+        reads.run(tier_reads.size(), [&](std::size_t i) {
+            const Read& read = tier_reads[i];
+            read.file->read(read.offset, read.destination, read.bytes);
+        });
     }
 
     // The most experts one call of layer `i` routes to.
@@ -538,7 +603,12 @@ struct ExpertStream::Impl {
             for (int k = 0; k < 3; ++k) {
                 const ExpertLocation& location = layer.spec.experts[k][expert];
                 std::byte* target              = base + pool.offset[k];
-                if (!windows.empty()) {
+                if (const std::byte* host = layer.tier[k][expert]) {
+                    // The host tier holds it: a copy, no read.
+                    batch_copies.push_back({target, host, static_cast<std::size_t>(location.bytes)});
+                    if (k == 0) { ++stats.tier_misses; }
+                    stats.tier_bytes += location.bytes;
+                } else if (!windows.empty()) {
                     // Each run's cover in the rank's window, and its copy out of it.
                     const DirectExpertWindow& window = *windows.at(layer.spec.rank);
                     std::uint64_t at                 = 0;
@@ -580,7 +650,7 @@ struct ExpertStream::Impl {
                     slot.down_written = std::max(slot.down_written, location.bytes);
                 }
                 layer.mirror[k][expert] = target;
-                stats.read_bytes += location.bytes;
+                if (layer.tier[k][expert] == nullptr) { stats.read_bytes += location.bytes; }
             }
             slot.layer            = static_cast<std::int32_t>(index);
             slot.expert           = expert;
@@ -604,8 +674,9 @@ struct ExpertStream::Impl {
 ExpertStream::ExpertStream(DeviceContext& device, const std::vector<std::filesystem::path>& files,
                            std::vector<ExpertStreamLayer> layers,
                            std::span<const std::uint64_t> bytes_by_rank, bool grows,
-                           const ExpertDiskReads& disk)
-    : impl_(std::make_unique<Impl>(device, files, std::move(layers), bytes_by_rank, grows, disk)) {}
+                           const ExpertDiskReads& disk, const ExpertHostTierRequest& tier)
+    : impl_(std::make_unique<Impl>(device, files, std::move(layers), bytes_by_rank, grows, disk,
+                                   tier)) {}
 
 ExpertStream::~ExpertStream() = default;
 
@@ -615,6 +686,8 @@ void ExpertStream::prepare(std::size_t layer, std::span<const std::int32_t> ids,
 }
 
 ExpertStreamStats ExpertStream::stats() const noexcept { return impl_->stats; }
+
+ExpertHostTierStats ExpertStream::host_tier() const noexcept { return impl_->tier_stats; }
 
 ExpertStream::Ranges ExpertStream::storage(std::size_t layer) const {
     const auto& pool  = impl_->pools.at(impl_->layers.at(layer).pool);

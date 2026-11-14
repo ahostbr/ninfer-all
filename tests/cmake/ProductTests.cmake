@@ -117,3 +117,7 @@ ninfer_add_test(ninfer_http_routes_test
 ninfer_add_test(ninfer_http_transport_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_transport.cpp"
   LIBRARIES ninfer_serve)
+
+# Fork change W5: CUDA Graphs stay off for host and disk experts where copies queue in one line.
+ninfer_add_test(ninfer_host_wait_graphs_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_host_wait_graphs.cpp")

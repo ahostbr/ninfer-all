@@ -6,6 +6,7 @@
 #include "core/device_buffer.h"
 #include "core/device_wait.h"
 #include "core/host_pages.h"
+#include "core/mapped_host_copy.h"
 #include "core/file_read_error.h"
 #include "core/pinned_memory.h"
 #include "core/startup.h"
@@ -27,6 +28,7 @@
 #include "runtime/contract/mtp_adaptive.h"
 #include "runtime/contract/rope_scaling.h"
 #include "runtime/engine/diagnostics.h"
+#include "runtime/engine/host_wait_graphs.h"
 #include "runtime/engine/worker_fault.h"
 #include "runtime/engine/worker_recovery.h"
 #include "runtime/engine/effective_thinking_budget.h"
@@ -347,7 +349,19 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     executor.iq1m_matrix     = options.iq1m_expert_matrix;
     executor.expert_cache_bytes =
         options.expert_cache_bytes.value_or(models::qwen4_exp::ExecutorOptions::kAutoExpertCache);
-    executor.cuda_graphs = options.use_cuda_graph;
+    // Fork change W5 (runtime/engine/host_wait_graphs.h): host and disk experts run eager where
+    // copies queue in one line (Windows WDDM, WSL2); a captured graph's wait for the host hung there.
+    const bool eager_host_waits =
+        options.use_cuda_graph &&
+        runtime::host_waits_need_eager(options.expert_residency, serialized_copy_queue());
+    executor.cuda_graphs = options.use_cuda_graph && !eager_host_waits;
+    if (eager_host_waits) {
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "Qwen3.8-Flash-Next: CUDA graphs off with %s experts on this driver model "
+                           "(copies queue in one line, so a graph's wait for the host would not "
+                           "return); decoding runs eager",
+                           options.expert_residency == ExpertResidency::Disk ? "disk" : "host");
+    }
     executor.sampled_drafts = options.gumbel_sampling;
     executor.hybrid_experts = options.hybrid_experts;
     executor.vision_max_merged_tokens = options.vision_max_merged_tokens;

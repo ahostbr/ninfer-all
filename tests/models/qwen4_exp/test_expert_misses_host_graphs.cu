@@ -18,6 +18,13 @@
 // each launch is followed by the executor's submit_now() flush (cudaStreamQuery), and every replay
 // must return within a second of the device's busy time: its time is printed.
 //
+// The experts sit where the engine keeps GGUF host experts: a HostPages block registered with
+// CUDA, mapped for the device (LoadOptions::mapped_host_experts), and each call's second stage
+// reads every GPU expert through the call's tables. A registered block's host address is not the
+// device's on every platform: the 21f562be build gave the kernels the host address, and on Windows
+// the first warm-up pass faulted (cudaErrorIllegalAddress). This test's experts were then in
+// cudaHostAlloc memory, which the device reads at its host address, and nothing read them.
+//
 // NINFER_HOST_GRAPHS_CONTROL=1 runs only the control: the staged service (no in-place answers)
 // under the same replay. On a native Linux driver it returns; where copies serialize, a deadlock
 // there is the cause T1313 removes, and the watchdog ends the process with exit code 3 instead of
@@ -27,6 +34,7 @@
 
 #include "core/device.h"
 #include "core/device_buffer.h"
+#include "core/host_pages.h"
 #include "core/mapped_host_copy.h"
 #include "core/pinned_memory.h"
 #include "core/qtype.h"
@@ -91,6 +99,24 @@ __global__ void read_pairs(const std::int32_t* missing, std::int32_t* out, int p
     for (int p = threadIdx.x; p < pairs; p += blockDim.x) { out[p] = missing[p]; }
 }
 
+// Reads every GPU expert's bytes through the call's tables ([3][512]), as its second stage does:
+// an entry the device may not dereference faults here. `out[p]` is the sum of the first bytes of
+// pair p's expert's projections (0: the experts are zero), -1 for a pair the GPU does not take.
+__global__ void read_experts(const void* const* tables, const std::int32_t* missing,
+                             std::int32_t* out, int pairs) {
+    for (int p = threadIdx.x; p < pairs; p += blockDim.x) {
+        const int e = missing[p];
+        int sum     = -1;
+        if (e >= 0) {
+            sum = 0;
+            for (int k = 0; k < 3; ++k) {
+                sum += *static_cast<const unsigned char*>(tables[k * 512 + e]);
+            }
+        }
+        out[p] = sum;
+    }
+}
+
 __global__ void touch(std::int32_t* word) { *word += 1; }
 
 // Ends the process when a step does not return in time: a deadlocked wait never returns.
@@ -128,12 +154,14 @@ private:
     std::thread thread_; // last: the members it reads exist before it starts
 };
 
-// One layer of 16 Q8_0 experts at Flash-Next's shapes in pinned host memory, every byte zero, one
-// matrix per projection that every expert shares. Uncached: the gate table names no cached
-// storage. Cached: every expert's gate entry lies in the layer's resident range.
+// One layer of 16 Q8_0 experts at Flash-Next's shapes in registered, device-mapped host pages
+// (as the engine's pinned block under --expert-host-graphs), every byte zero, one matrix per
+// projection that every expert shares. Uncached: the gate table names no cached storage. Cached:
+// every expert's gate entry lies in the layer's resident range.
 struct Fixture {
-    std::array<std::unique_ptr<PinnedHostBuffer>, 3> matrices;
-    DeviceBuffer gate_table, storage, ids, input, pairs_read;
+    std::array<std::unique_ptr<HostPages>, 3> matrices;
+    std::array<const void*, 3> device_matrices{}; // each matrix's device address
+    DeviceBuffer gate_table, storage, ids, input, pairs_read, experts_read;
     std::unique_ptr<ExpertMisses> misses;
 
     Fixture(DeviceContext& device, double cpu_share, bool in_place, bool cached) {
@@ -148,9 +176,13 @@ struct Fixture {
             projection.rows         = rows[p];
             projection.k            = ks[p];
             projection.expert_bytes = projection.row_bytes * rows[p];
-            matrices[p] = std::make_unique<PinnedHostBuffer>(std::size_t(projection.expert_bytes));
-            std::memset(matrices[p]->data(), 0, matrices[p]->size());
+            matrices[p] = std::make_unique<HostPages>(std::size_t(projection.expert_bytes));
+            matrices[p]->pin(true);
+            void* alias = nullptr;
+            CUDA_CHECK(cudaHostGetDevicePointer(&alias, matrices[p]->data(), 0));
+            device_matrices[p] = alias;
             projection.host.assign(kExperts, matrices[p]->data());
+            if (in_place) { projection.device.assign(kExperts, alias); }
         }
         gate_table = DeviceBuffer(kExperts * sizeof(void*));
         if (cached) {
@@ -174,6 +206,8 @@ struct Fixture {
         input.fill(0);
         pairs_read = DeviceBuffer(kTop * sizeof(std::int32_t));
         pairs_read.fill(0);
+        experts_read = DeviceBuffer(kTop * sizeof(std::int32_t));
+        experts_read.fill(0);
         MissOptions options;
         options.cpu_share   = cpu_share;
         options.cpu_threads = 2;
@@ -194,6 +228,9 @@ struct Fixture {
         misses->await(0, stream);
         read_pairs<<<1, 32, 0, stream>>>(static_cast<const std::int32_t*>(call.missing_ids.data),
                                          static_cast<std::int32_t*>(pairs_read.p), kTop);
+        read_experts<<<1, 32, 0, stream>>>(call.missing_banks.gate.experts,
+                                           static_cast<const std::int32_t*>(call.missing_ids.data),
+                                           static_cast<std::int32_t*>(experts_read.p), kTop);
         CUDA_CHECK(cudaGetLastError());
         return call;
     }
@@ -218,19 +255,23 @@ void check_served(const Fixture& f, const ExpertMisses::Call& call, const MissSt
         expect(where.type == cudaMemoryTypeHost,
                label + ": in place, the missing pairs live in host memory");
     }
-    std::array<std::int32_t, kTop> pairs{};
+    std::array<std::int32_t, kTop> pairs{}, read{};
     CUDA_CHECK(cudaMemcpy(pairs.data(), f.pairs_read.p, sizeof(pairs), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(read.data(), f.experts_read.p, sizeof(read), cudaMemcpyDeviceToHost));
     std::uint64_t on_gpu = 0;
     for (int p = 0; p < kTop; ++p) {
         const std::int32_t id = pairs[std::size_t(p)];
         expect(id == -1 || id == p, label + ": a missing pair keeps its expert");
+        expect(read[std::size_t(p)] == (id == p ? 0 : -1),
+               label + ": the device read each GPU expert's bytes");
         on_gpu += id == p;
         if (in_place && id == p) {
-            // The second stage reads the expert where it is: its host bytes.
+            // The second stage reads the expert where it is: the device's mapping of its host
+            // pages, not their host address.
             for (int k = 0; k < 3; ++k) {
                 const void* entry = call.missing_banks.gate.experts[std::size_t(k) * 512 + std::size_t(p)];
-                expect(entry == f.matrices[std::size_t(k)]->data(),
-                       label + ": in place, a GPU expert is read from host memory");
+                expect(entry == f.device_matrices[std::size_t(k)],
+                       label + ": in place, a GPU expert is read through its device address");
             }
         }
     }

@@ -396,6 +396,12 @@ struct ExpertMisses::Impl {
                 throw std::invalid_argument(
                     "expert misses: in-place answers serve host experts and admit none");
             }
+            for (const auto& p : layer.projections) {
+                if ((options.in_place || !p.device.empty()) && p.device.size() != p.host.size()) {
+                    throw std::invalid_argument("expert misses: in-place answers need every host "
+                                                "expert's device address");
+                }
+            }
         }
         for (const auto& layer : layers) {
             RankBinding bind(device, layer.rank);
@@ -1077,7 +1083,10 @@ struct ExpertMisses::Impl {
                             where = file_staging + file_used;
                             file_used += aligned(std::uint64_t(p.expert_bytes));
                         } else {
-                            where = p.host[std::size_t(e)];
+                            // The device's address of the host expert where one is given (fork
+                            // T1313): a registered block's host address may not be the device's.
+                            where = p.device.empty() ? p.host[std::size_t(e)]
+                                                     : p.device[std::size_t(e)];
                         }
                         tables[std::size_t(k) * kMaxExperts + std::size_t(e)] = where;
                     }

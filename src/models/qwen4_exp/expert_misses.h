@@ -55,6 +55,9 @@ struct MissLayer {
         std::int32_t k            = 0;
         std::int64_t expert_bytes = 0;
         std::vector<const void*> host;           // host experts: each expert's bytes in RAM
+        // Fork T1313: the device's address of each `host` entry, which a kernel reading the
+        // expert in place uses (required by MissOptions::in_place); empty: the host address.
+        std::vector<const void*> device;
         std::span<const ExpertLocation> located; // disk experts: where each expert's bytes are
     };
     std::array<Projection, 3> projections;   // gate, up, down

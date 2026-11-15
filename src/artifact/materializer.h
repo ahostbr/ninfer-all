@@ -119,6 +119,11 @@ struct MaterializeOptions {
     // if a path is replaced meanwhile.
     bool suspendable = false;
     std::shared_ptr<const Reader> retained_reader;
+    // Fork T1313: also maps the pinned Host block (Residency::Pinned) into the device address
+    // space, for kernels that read its objects in place; pinned_device_block() is then the address
+    // they use. A registered block's host address need not be one the device may dereference
+    // (Windows: a registered host pointer may differ from its device-visible alias).
+    bool map_pinned = false;
 };
 
 class MaterializedArtifact {
@@ -136,6 +141,9 @@ public:
     [[nodiscard]] bool has_device(ObjectHandle handle) const noexcept;
     [[nodiscard]] const WeightParent& pinned_parent(ObjectHandle handle) const;
     [[nodiscard]] std::span<const std::byte> pinned_block() const noexcept;
+    // With MaterializeOptions::map_pinned: the primary device's address of pinned_block()'s first
+    // byte, which only device code may dereference; nullptr otherwise.
+    [[nodiscard]] const std::byte* pinned_device_block() const noexcept { return pinned_device_; }
     // A Residency::Mapped object: its data addresses the primary device's mapping of the mapped
     // Host block, which only device code may dereference.
     [[nodiscard]] const WeightParent& mapped_parent(ObjectHandle handle) const;
@@ -197,6 +205,7 @@ private:
     // ever touches.
     std::vector<std::unique_ptr<DeviceArena>> arenas_;
     std::unique_ptr<HostPages> pinned_;
+    const std::byte* pinned_device_ = nullptr; // MaterializeOptions::map_pinned
     // Never released by a model suspend: a captured graph keeps reading it at the same address.
     std::unique_ptr<HostPages> mapped_;
     std::vector<ObjectStorage> objects_;

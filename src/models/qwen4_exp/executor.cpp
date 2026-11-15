@@ -2810,6 +2810,11 @@ struct Executor::Impl {
         // narrow call with no CUDA call (MissOptions::in_place), so it admits nothing; the cache
         // keeps its own policy for every layer, its swaps between passes.
         const bool in_place = options.hybrid_experts.host_graphs && serialized_copy_queue();
+        // In place the kernels read the experts through the device's mapping of the pinned host
+        // block (LoadOptions::mapped_host_experts), which is the primary device's.
+        if (in_place && device.size() != 1) {
+            throw std::invalid_argument("--expert-host-graphs takes one device");
+        }
         for (std::size_t i = 0; i < expert.size(); ++i) {
             const auto& [plan, moe] = expert[i];
             MissLayer layer;
@@ -2832,6 +2837,17 @@ struct Executor::Impl {
                     p.located = located[k];
                 } else {
                     p.host = tables[k]->pointers;
+                }
+                // The host address of a registered block is not the device's on every platform
+                // (an in-place read of it faulted on Windows: cudaErrorIllegalAddress at warm-up).
+                for (std::size_t e = 0; in_place && e < p.host.size(); ++e) {
+                    const void* at     = p.host[e];
+                    const void* mapped = at != nullptr ? model.pinned_device_address(at) : nullptr;
+                    if (at != nullptr && mapped == nullptr) {
+                        throw std::logic_error("--expert-host-graphs: a host expert lies outside "
+                                               "the device-mapped pinned host block");
+                    }
+                    p.device.push_back(mapped);
                 }
             }
             if (const auto& latent = plan->moe.latent) {

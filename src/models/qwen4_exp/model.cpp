@@ -1214,7 +1214,10 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
     }
     auto pending         = std::move(b.weights);
     auto materialization = std::move(binder).finish();
-    auto backing = artifact::materialize(reader, std::move(materialization), device, observer);
+    auto backing = artifact::materialize(
+        reader, std::move(materialization), device, observer, nullptr,
+        artifact::MaterializeOptions{.map_pinned = options.mapped_host_experts &&
+                                                   options.experts == ExpertResidency::Host});
     auto bound   = qwen3_5::loading::resolve_weights(std::move(pending), backing);
     auto model           = std::unique_ptr<Model>(
         new Model(std::move(config), options, std::move(weights), std::move(stages),

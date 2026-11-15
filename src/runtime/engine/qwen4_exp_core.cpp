@@ -283,6 +283,9 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     load.ranks        = device.size();
     load.stage_layers = options.stage_layers;
     load.experts      = options.expert_residency;
+    // Fork T1313: --expert-host-graphs reads missing host experts in place (MissOptions::in_place)
+    // through the device's mapping of the pinned host block.
+    load.mapped_host_experts = options.hybrid_experts.host_graphs && serialized_copy_queue();
     load.vision       = options.enable_vision;
     load.mtp          = mtp;
     load.dflash2      = dflash2;

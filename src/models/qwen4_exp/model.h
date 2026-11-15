@@ -181,6 +181,10 @@ struct LoadOptions {
     // the PLE layer, a run of each shared expert and of the head's rows; rank 0 also the MTP block
     // and the Vision tower. One stage; the experts must be device resident.
     std::vector<double> tensor_split;
+    // Fork T1313 (--expert-host-graphs where copies queue in one line): the pinned host block that
+    // holds the GGUF host experts is mapped for the device too, whose kernels then read missing
+    // experts in place (Model::pinned_device_address, MissOptions::in_place).
+    bool mapped_host_experts = false;
 };
 
 class Model {
@@ -264,6 +268,20 @@ public:
 
     [[nodiscard]] const artifact::MaterializationStats& storage_stats() const noexcept {
         return backing_.stats();
+    }
+
+    // With LoadOptions::mapped_host_experts: the device's address of `host`, a byte of the pinned
+    // host block (a GGUF host expert's); nullptr when the block is not mapped or `host` lies
+    // outside it.
+    [[nodiscard]] const void* pinned_device_address(const void* host) const noexcept {
+        const auto block      = backing_.pinned_block();
+        const std::byte* base = backing_.pinned_device_block();
+        const auto at         = reinterpret_cast<std::uintptr_t>(host);
+        const auto begin      = reinterpret_cast<std::uintptr_t>(block.data());
+        if (base == nullptr || block.empty() || at < begin || at - begin >= block.size()) {
+            return nullptr;
+        }
+        return base + (at - begin);
     }
 
 private:

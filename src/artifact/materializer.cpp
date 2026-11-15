@@ -874,7 +874,14 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
             checked_add(out.stats_.pinned_bytes, plan.mapped_capacity_bytes, "mapped Host bytes");
     }
     if (out.pinned_) {
-        out.pinned_->pin();
+        out.pinned_->pin(options.map_pinned);
+        if (options.map_pinned) {
+            // As the mapped block's alias above: only the runtime may say where the device reads it.
+            void* alias = nullptr;
+            check_cuda(cudaHostGetDevicePointer(&alias, out.pinned_->data(), 0),
+                       "resolve the pinned Host block's device address");
+            out.pinned_device_ = static_cast<const std::byte*>(alias);
+        }
         for (const auto& placement : plan.pinned_objects) {
             const auto& geometry = reader.geometry(placement.object);
             const std::span<std::byte> destination(out.pinned_->data() + placement.offset,

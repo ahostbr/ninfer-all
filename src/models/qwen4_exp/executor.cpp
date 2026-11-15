@@ -5236,6 +5236,7 @@ struct Executor::Impl {
             if (replay) {
                 if (tensor()) { fence_uploads(segment.rank); }
                 shape->graphs[i].launch(ranks[segment.rank].stream);
+                submit_now(ranks[segment.rank].stream);
             } else {
                 run_segment(parts, segment, t, logit_rows);
             }
@@ -5286,6 +5287,22 @@ struct Executor::Impl {
             RankBinding bind(device, launcher);
             CUDA_CHECK(cudaStreamWaitEvent(ranks[launcher].stream, ranks[r].uploaded, 0));
         }
+    }
+
+    // Fork T1313, --expert-host-graphs where copies queue in one line (WDDM): a launch can wait in
+    // the driver's submission batch until the process next enters the driver, and the expert-miss
+    // service answering in place (MissOptions::in_place) never enters it. A replayed graph that
+    // waits for the service is therefore handed to the device at once, as Edge0 does after its
+    // token graph's launch (edge0-strata/src/core/session.cpp:933). The query enqueues nothing:
+    // it cannot put a copy behind a waiting graph. Elsewhere nothing changes.
+    void submit_now(cudaStream_t stream) const {
+        if (!options.hybrid_experts.host_graphs || !serialized_copy_queue()) { return; }
+        const cudaError_t state = cudaStreamQuery(stream);
+        if (state == cudaErrorNotReady) {
+            (void)cudaGetLastError(); // the replay is still running, as expected
+            return;
+        }
+        CUDA_CHECK(state);
     }
 
     void synchronize_ranks() {
@@ -7072,6 +7089,7 @@ struct Executor::Impl {
             }
             if (run) {
                 shape.graphs.front().launch(rank.stream);
+                submit_now(rank.stream);
             } else {
                 body();
             }

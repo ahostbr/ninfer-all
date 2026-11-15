@@ -14,7 +14,9 @@
 // device-to-host copy, all on the call's stream. In place, the call must return within kHang and
 // be served: its GPU experts read where they are in host memory, nothing staged or admitted, the
 // second stage's missing pairs in mapped host memory. A call whose experts are all cached posts no
-// request and returns at once (the early return). An eager call is served the same way.
+// request and returns at once (the early return). An eager call is served the same way. In place,
+// each launch is followed by the executor's submit_now() flush (cudaStreamQuery), and every replay
+// must return within a second of the device's busy time: its time is printed.
 //
 // NINFER_HOST_GRAPHS_CONTROL=1 runs only the control: the staged service (no in-place answers)
 // under the same replay. On a native Linux driver it returns; where copies serialize, a deadlock
@@ -300,12 +302,29 @@ void replay_with_queued_work(Fixture& f, cudaStream_t stream, bool cpu, bool in_
         const std::string step = label + ", replay " + std::to_string(replay + 1);
         const MissStats before = f.misses->stats();
         f.misses->keep_alive(); // as a pass does before it launches its graphs
+        const auto started = Clock::now();
         CUDA_CHECK(cudaGraphLaunch(exec, stream));
+        if (in_place) {
+            // As the executor's submit_now() under --expert-host-graphs: hand the replay to the
+            // device now, before the host goes on (the service answering in place never enters
+            // the driver). The control runs as the executor did before T1313, without it.
+            const cudaError_t state = cudaStreamQuery(stream);
+            if (state == cudaErrorNotReady) {
+                (void)cudaGetLastError();
+            } else {
+                CUDA_CHECK(state);
+            }
+        }
         behind.enqueue(stream); // returns while the graph is still busy: all of it waits behind
         {
             Watchdog guard(step + ": a replayed wait with work queued behind it", exit_code);
             CUDA_CHECK(cudaStreamSynchronize(stream));
         }
+        const auto waited = Clock::now() - started;
+        std::cout << step << ": returned in "
+                  << std::chrono::duration<double, std::milli>(waited).count() << " ms\n";
+        // The device is busy kBusy first; a service that saw the request late shows here.
+        expect(waited < kBusy + 1s, step + ": the request was answered at once");
         if (served) {
             check_served(f, call, before, cpu, in_place, step);
         } else {

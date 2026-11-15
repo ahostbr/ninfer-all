@@ -22,6 +22,7 @@
 #include <exception>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -390,6 +391,10 @@ struct ExpertMisses::Impl {
             ranks[layer.rank].used = true;
             if (layer.admit && (cache == nullptr || !layer.projections[0].located.empty())) {
                 throw std::invalid_argument("expert misses: admission needs a cache of host experts");
+            }
+            if (options.in_place && (layer.admit || !layer.projections[0].located.empty())) {
+                throw std::invalid_argument(
+                    "expert misses: in-place answers serve host experts and admit none");
             }
         }
         for (const auto& layer : layers) {
@@ -991,7 +996,9 @@ struct ExpertMisses::Impl {
         const std::uint32_t tokens      = box.tokens;
         const std::uint32_t missing     = box.missing;
         const MissLayer& layer          = layers.at(layer_index);
-        RankBinding bind(device, layer.rank);
+        // In place the answer makes no CUDA call at all, not even this binding's cudaGetDevice.
+        std::optional<RankBinding> bind;
+        if (!options.in_place) { bind.emplace(device, layer.rank); }
         const auto* ids        = static_cast<const std::int32_t*>(rank.host_ids->data());
         const auto* list       = static_cast<const std::int32_t*>(rank.host_missing->data());
         auto* tables           = static_cast<const void**>(rank.tables->data());
@@ -1033,23 +1040,25 @@ struct ExpertMisses::Impl {
         for (std::uint32_t p = 0; p < pairs; ++p) {
             if (ids[p] >= 0 && ids[p] < kMaxExperts) { in_use[std::size_t(ids[p])] = 1; }
         }
-        // The GPU's share: admissions, staged copies and the second stage's missing pairs.
+        // The GPU's share: admissions, staged copies and the second stage's missing pairs. In
+        // place (MissOptions::in_place), only host writes: the GPU reads every one where it is.
+        const bool in_place = options.in_place;
         const auto issue = [&] {
-            if (rank.copying && gpu_count > 0) {
+            if (rank.copying && gpu_count > 0 && !in_place) {
                 CUDA_CHECK(cudaEventRecord(rank.copying, rank.copies));
             }
             for (std::size_t i = 0; i < gpu_count; ++i) {
                 const std::int32_t e   = order[i].second;
                 on_gpu[std::size_t(e)] = true;
-                if (admit_expert(layer, layer_index, rank, e, order[i].first, in_use, tables,
-                                 patches, patch_count, staged_bytes)) {
+                if (!in_place && admit_expert(layer, layer_index, rank, e, order[i].first, in_use,
+                                              tables, patches, patch_count, staged_bytes)) {
                     copies = true;
                     ++staged;
                     ++admitted_count;
                     continue;
                 }
                 const std::uint64_t need = staged_size(layer);
-                if (used + need <= half_bytes) {
+                if (!in_place && used + need <= half_bytes) {
                     stage_expert(layer, rank, e, staging + used, file_staging, file_used, tables,
                                  staged_bytes);
                     used += need;
@@ -1088,8 +1097,8 @@ struct ExpertMisses::Impl {
                 missing_ids[p] = (e >= 0 && e < kMaxExperts && on_gpu[std::size_t(e)]) ? e : -1;
             }
             // The second stage reads the missing pairs from device memory, which the split kernel
-            // filled with -1.
-            if (gpu_count > 0) {
+            // filled with -1; in place, from the host memory just written, filled the same way.
+            if (gpu_count > 0 && !in_place) {
                 CUDA_CHECK(cudaMemcpyAsync(rank.missing_device.p, missing_ids,
                                            std::size_t(pairs) * 4, cudaMemcpyHostToDevice,
                                            rank.copies));
@@ -1255,13 +1264,17 @@ struct ExpertMisses::Impl {
                           reinterpret_cast<std::uintptr_t>(m.data) % 16 != 0)) {
             throw std::invalid_argument("expert misses: the CPU's input is not whole 16-byte words");
         }
+        // The second stage's missing pairs: device memory the service copies them to, or, a narrow
+        // call answered in place, the pinned host memory it writes them into (read across the bus).
+        auto* missing_pairs = !wide && options.in_place
+                                  ? static_cast<std::int32_t*>(rank.missing_ids->data())
+                                  : static_cast<std::int32_t*>(rank.missing_device.p);
         split_kernel<<<1, kSplitThreads, 0, stream>>>(
             static_cast<const std::int32_t*>(ids.data), pairs, int(layer.experts), layer.gate_table,
             static_cast<const std::uintptr_t*>(ranges.at(index).p),
             static_cast<std::int32_t*>(rank.cached_ids.p),
             static_cast<std::int32_t*>(rank.host_ids->data()),
-            static_cast<std::int32_t*>(rank.host_missing->data()),
-            static_cast<std::int32_t*>(rank.missing_device.p),
+            static_cast<std::int32_t*>(rank.host_missing->data()), missing_pairs,
             static_cast<std::int32_t*>(rank.product_count->data()),
             static_cast<const uint4*>(m.data),
             cpu_input ? static_cast<uint4*>(rank.host_m->data()) : nullptr,
@@ -1275,7 +1288,7 @@ struct ExpertMisses::Impl {
         }
         Call call;
         call.cached_ids  = Tensor(rank.cached_ids.p, DType::I32, {kTop, tokens});
-        call.missing_ids = Tensor(rank.missing_device.p, DType::I32, {kTop, tokens});
+        call.missing_ids = Tensor(missing_pairs, DType::I32, {kTop, tokens});
         call.missing_banks = banks;
         auto* tables       = static_cast<const void* const*>(rank.tables->data());
         call.missing_banks.gate.experts = tables;

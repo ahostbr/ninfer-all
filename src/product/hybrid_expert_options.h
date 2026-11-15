@@ -41,6 +41,9 @@ inline constexpr const char* kHybridExpertHelp =
     "  --expert-misses staged|mapped GGUF experts: copy misses into device staging while the\n"
     "                                cached experts run (default), or read host experts across\n"
     "                                the bus inside the expert kernels\n"
+    "  --expert-host-graphs          GGUF host experts on Windows/WSL2: keep CUDA Graphs (off\n"
+    "                                there by default); decode and verification misses are\n"
+    "                                read across the bus instead of copied (experimental)\n"
     "  --expert-tail-skip N          GGUF host experts: leave out of a decode or verification\n"
     "                                call each uncached expert that all its tokens rank past\n"
     "                                place N (1..9) of their top ten; changes results\n"
@@ -114,6 +117,8 @@ bool parse_hybrid_expert_option(std::string_view option, HybridExpertOptions& ou
         }
     } else if (switch_option(option, "expert-cache-adaptive",
                              [&](bool on) { out.adaptive_cache = on; })) {
+    } else if (switch_option(option, "expert-host-graphs",
+                             [&](bool on) { out.host_graphs = on; })) {
     } else if (option == "--expert-host-mib") {
         const std::string text(value());
         std::uint32_t mib = 0;

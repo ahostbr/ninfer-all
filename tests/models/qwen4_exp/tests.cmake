@@ -87,6 +87,14 @@ ninfer_add_test(ninfer_qwen4_exp_expert_misses_test
 set_tests_properties(ninfer_qwen4_exp_expert_misses_test PROPERTIES
   SKIP_RETURN_CODE 77 TIMEOUT 120)
 
+# Fork T1313: replayed calls answered in place (--expert-host-graphs) with a pass's copies queued
+# behind the waiting graph, as on Windows WDDM. NINFER_HOST_GRAPHS_CONTROL=1 runs the staged control.
+ninfer_add_test(ninfer_qwen4_exp_host_graphs_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_expert_misses_host_graphs.cu"
+  LIBRARIES ninfer_model_runtime)
+set_tests_properties(ninfer_qwen4_exp_host_graphs_test PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 60)
+
 ninfer_add_test(ninfer_qwen4_exp_expert_stream_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_expert_stream.cpp"
   LIBRARIES ninfer_model_runtime)

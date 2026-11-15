@@ -332,6 +332,18 @@ int run_tests() {
                               fixed_after.hybrid_experts.dma_share == 0.5F,
                           "CLI did not preserve an automatic hybrid DMA share");
     }
+    {
+        // Fork T1313: --expert-host-graphs is off by default, a switch with its --no- form.
+        const auto plain = parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+            "--expert-residency", "host"});
+        const auto on = parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+            "--expert-residency", "host", "--expert-host-graphs"});
+        const auto off_after = parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+            "--expert-host-graphs", "--no-expert-host-graphs"});
+        failures += check(!plain.hybrid_experts.host_graphs && on.hybrid_experts.host_graphs &&
+                              !off_after.hybrid_experts.host_graphs,
+                          "CLI did not parse --expert-host-graphs as an opt-in switch");
+    }
     for (const auto* share : {"-0.1", "1.1", "nan", "inf", "0.5x", "Auto"}) {
         failures += check(rejects([&] {
             (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--expert-dma-share", share});

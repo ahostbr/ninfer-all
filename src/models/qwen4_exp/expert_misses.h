@@ -102,6 +102,13 @@ struct MissOptions {
     std::uint32_t tail_skip_rank = 0;
     // Disk experts: a drive mirror and the direct path (core/expert_disk.h).
     ExpertDiskReads disk{};
+    // Fork T1313, host experts only: the service answers a narrow call without any CUDA call. The
+    // GPU's share of the missing experts is read in place from host memory (as when the staging
+    // is full), nothing is staged or admitted, and the second stage reads the call's missing pairs
+    // from mapped host memory the service writes. Where a device's copies queue behind one another
+    // (serialized_copy_queue), a copy queued behind a replayed call's wait would otherwise hold
+    // back the service's own copies, which the wait needs: the two waited for each other.
+    bool in_place = false;
 };
 
 struct MissStats {

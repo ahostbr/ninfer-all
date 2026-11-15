@@ -428,6 +428,13 @@ struct HybridExpertOptions {
     // GGUF banks: copy missing experts into device staging while the cached ones run (staged), or
     // let the expert kernels read host experts across the bus (mapped; host experts only).
     bool mapped_misses = false;
+    // Fork T1313: Qwen3.8-Flash-Next / Edge0 GGUF host experts keep CUDA Graphs where a device's
+    // copies queue behind one another (serialized_copy_queue: Windows WDDM, WSL2), which fork
+    // change W5 otherwise turns off. A replayed decode or verification call's missing experts are
+    // then answered without any CUDA call: the GPU reads them in place from host memory, and the
+    // second stage's missing pairs too, so the graph's wait never depends on a queued copy.
+    // Elsewhere it changes nothing.
+    bool host_graphs = false;
     // GGUF host experts with staged misses: 1..9 leaves out of a decode or verification call each
     // uncached expert that all its tokens rank past this many places of their top ten, without
     // giving its router weight to the others (lossy); 0 (default) serves every miss.

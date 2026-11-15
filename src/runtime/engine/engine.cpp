@@ -524,10 +524,11 @@ public:
         // Native Qwen3.5 MoE host or disk experts: the CPU computes a share of a call's misses,
         // the GPU's products bit for bit. Routing profiles fill and record their cache.
         if (options.hybrid_experts.mapped_misses || options.hybrid_experts.tail_skip_rank != 0 ||
-            options.hybrid_experts.prefill_buffers != 0 || options.hybrid_experts.adaptive_cache) {
+            options.hybrid_experts.prefill_buffers != 0 || options.hybrid_experts.adaptive_cache ||
+            options.hybrid_experts.host_graphs) {
             throw std::invalid_argument(
-                "mapped misses, tail skip, prefill buffers and the adaptive expert cache require "
-                "Qwen3.8-Flash-Next host or disk experts");
+                "mapped misses, tail skip, prefill buffers, host graphs and the adaptive expert "
+                "cache require Qwen3.8-Flash-Next host or disk experts");
         }
         if (options.hybrid_experts.expert_host_bytes != 0) {
             throw std::invalid_argument(

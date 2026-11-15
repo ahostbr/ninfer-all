@@ -351,9 +351,14 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         options.expert_cache_bytes.value_or(models::qwen4_exp::ExecutorOptions::kAutoExpertCache);
     // Fork change W5 (runtime/engine/host_wait_graphs.h): host and disk experts run eager where
     // copies queue in one line (Windows WDDM, WSL2); a captured graph's wait for the host hung there.
+    // Fork T1313: --expert-host-graphs keeps the graphs of host experts there.
+    if (options.hybrid_experts.host_graphs && options.expert_residency != ExpertResidency::Host) {
+        throw std::invalid_argument("--expert-host-graphs requires --expert-residency host");
+    }
     const bool eager_host_waits =
         options.use_cuda_graph &&
-        runtime::host_waits_need_eager(options.expert_residency, serialized_copy_queue());
+        runtime::host_waits_need_eager(options.expert_residency, serialized_copy_queue(),
+                                       options.hybrid_experts.host_graphs);
     executor.cuda_graphs = options.use_cuda_graph && !eager_host_waits;
     if (options.hybrid_experts.expert_host_bytes != 0 &&
         options.expert_residency != ExpertResidency::Disk) {
@@ -365,6 +370,12 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                            "(copies queue in one line, so a graph's wait for the host would not "
                            "return); decoding runs eager",
                            options.expert_residency == ExpertResidency::Disk ? "disk" : "host");
+    } else if (options.use_cuda_graph && options.hybrid_experts.host_graphs &&
+               serialized_copy_queue()) {
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "Qwen3.8-Flash-Next: CUDA graphs on with host experts on this driver "
+                           "model (--expert-host-graphs, experimental): decode and verification "
+                           "misses are read across the bus, not copied");
     }
     executor.sampled_drafts = options.gumbel_sampling;
     executor.hybrid_experts = options.hybrid_experts;

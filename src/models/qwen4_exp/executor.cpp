@@ -9,6 +9,7 @@
 #include "core/host_worker_pool.h"
 #include "core/layout.h"
 #include "core/linear_attention_state.h"
+#include "core/mapped_host_copy.h"
 #include "core/paged_kv_view.h"
 #include "core/paged_kv_storage.h"
 #include "core/pinned_memory.h"
@@ -1277,6 +1278,12 @@ struct Executor::Impl {
         }
         if (!native_host && options.hybrid_experts.adaptive_cache) {
             throw std::invalid_argument("--expert-cache-adaptive requires native host experts");
+        }
+        // Fork T1313: only GGUF host experts' miss service answers a replayed call in place; the
+        // native experts' captured handshake would still wait for the service's copies.
+        if (native_host && options.hybrid_experts.host_graphs && serialized_copy_queue()) {
+            throw std::invalid_argument("--expert-host-graphs requires GGUF host experts; native "
+                                        "host experts run eager on this driver model");
         }
         if (!native_host && model.options().experts != ExpertResidency::Host &&
             (!options.hybrid_experts.routing_profile.empty() ||
@@ -2799,6 +2806,10 @@ struct Executor::Impl {
     void allocate_misses() {
         std::vector<MissLayer> out;
         const auto expert = expert_layers();
+        // Fork T1313 (--expert-host-graphs where copies queue in one line): the service answers a
+        // narrow call with no CUDA call (MissOptions::in_place), so it admits nothing; the cache
+        // keeps its own policy for every layer, its swaps between passes.
+        const bool in_place = options.hybrid_experts.host_graphs && serialized_copy_queue();
         for (std::size_t i = 0; i < expert.size(); ++i) {
             const auto& [plan, moe] = expert[i];
             MissLayer layer;
@@ -2836,7 +2847,7 @@ struct Executor::Impl {
             layer.gate_table = static_cast<const void* const*>(plan->moe.gate.table.p);
             // The text layers' slots follow their misses; the MTP block's keep the cache's own
             // policy.
-            if (cache && !stream && i < layers.size()) {
+            if (cache && !stream && i < layers.size() && !in_place) {
                 cache->hand_over(i);
                 layer.admit = true;
             }
@@ -2856,6 +2867,7 @@ struct Executor::Impl {
         miss.cpu_threads    = options.hybrid_experts.cpu_threads;
         miss.staging_bytes  = kStagingBytes;
         miss.tail_skip_rank = options.hybrid_experts.tail_skip_rank;
+        miss.in_place       = in_place;
         miss.disk = ExpertDiskReads{options.hybrid_experts.mirror, options.hybrid_experts.direct};
         const std::uint32_t joint = verify_width * options.sequences;
         const bool pooled = std::all_of(layers.begin(), layers.end(), [&](const auto& plan) {

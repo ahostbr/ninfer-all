@@ -125,9 +125,9 @@ ConstructedFlint construct_flint(const EngineOptions& options, DeviceContext& de
     }
     const auto& hybrid = options.hybrid_experts;
     if (hybrid.mapped_misses || hybrid.tail_skip_rank != 0 || hybrid.prefill_buffers != 0 ||
-        hybrid.adaptive_cache) {
-        throw std::invalid_argument("Flint has no mapped misses, tail skip, prefill buffers or "
-                                    "adaptive expert cache (Qwen3.8-Flash-Next options)");
+        hybrid.adaptive_cache || hybrid.host_graphs) {
+        throw std::invalid_argument("Flint has no mapped misses, tail skip, prefill buffers, host "
+                                    "graphs or adaptive expert cache (Qwen3.8-Flash-Next options)");
     }
     if (options.expert_residency == ExpertResidency::Device &&
         (hybrid.dma_share || hybrid.cpu_threads != 0 || !hybrid.routing_profile.empty() ||

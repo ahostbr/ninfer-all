@@ -524,7 +524,11 @@ struct ExpertMisses::Impl {
             // products read the experts at memory speed and a core's two threads share its loads.
             const std::uint32_t threads =
                 options.cpu_threads != 0 ? options.cpu_threads : pool_cpu_count();
-            pool        = std::make_unique<CpuSpinPool>(threads, true);
+            const PoolHostCore host =
+                options.host_core == ExpertHostCore::Last      ? PoolHostCore::Last
+                : options.host_core == ExpertHostCore::Sibling ? PoolHostCore::Sibling
+                                                               : PoolHostCore::First;
+            pool        = std::make_unique<CpuSpinPool>(threads, true, host);
             backend     = ops::gguf_cpu_backend_selected(ops::GgufCpuBackend::Automatic);
             cpu_threads = threads;
         }
@@ -1578,9 +1582,13 @@ MissStats ExpertMisses::stats() const {
 bool ExpertMisses::cpu_enabled() const noexcept { return impl_->pool != nullptr; }
 std::string ExpertMisses::cpu_description() const {
     if (!impl_->pool) { return {}; }
+    // Fork T1320: where the pool's own thread sits, so a run's log shows the --expert-host-core
+    // placement it got.
+    const int host = impl_->pool->caller_cpu();
     return std::to_string(impl_->cpu_threads) +
            (impl_->pool->pinned() ? " pinned threads, " : " threads, ") +
-           ops::gguf_cpu_backend_name(impl_->backend);
+           ops::gguf_cpu_backend_name(impl_->backend) +
+           (host >= 0 ? ", the service thread on CPU " + std::to_string(host) : std::string());
 }
 
 } // namespace ninfer::models::qwen4_exp

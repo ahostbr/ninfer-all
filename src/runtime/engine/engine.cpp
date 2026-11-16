@@ -530,6 +530,11 @@ public:
                 "mapped misses, tail skip, prefill buffers, host graphs and the adaptive expert "
                 "cache require Qwen3.8-Flash-Next host or disk experts");
         }
+        if (options.hybrid_experts.cache_free_nvml ||
+            options.hybrid_experts.host_core != ExpertHostCore::First) {
+            throw std::invalid_argument("--expert-cache-free and --expert-host-core require "
+                                        "Qwen3.8-Flash-Next / Edge0 host or disk experts");
+        }
         if (options.hybrid_experts.expert_host_bytes != 0) {
             throw std::invalid_argument(
                 "--expert-host-mib requires DeepSeek-V4.1 or Qwen3.8-Flash-Next / Edge0 disk experts");

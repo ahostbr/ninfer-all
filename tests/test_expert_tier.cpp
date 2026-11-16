@@ -408,6 +408,49 @@ void pool() {
     require(!physical_core_cpus().empty(), "every machine has a core");
 }
 
+// Fork T1320 (--expert-host-core): where a pinned pool puts its calling thread (element 0) and
+// its workers. First is the placement before T1320; Last and Sibling move the caller and keep one
+// worker per physical core of the rest.
+void placement() {
+    const std::vector<int> cores = {0, 2, 4, 6}; // Windows numbers a core's two threads side by side
+    const auto expect = [](const std::vector<int>& got, const std::vector<int>& want,
+                           const std::string& what) {
+        require(got == want, what);
+    };
+    expect(pool_placement(4, PoolHostCore::First, cores, 1), {0, 2, 4, 6}, "first: as before");
+    expect(pool_placement(6, PoolHostCore::First, cores, 1), {0, 2, 4, 6, -1, -1},
+           "first: threads past the cores go unpinned");
+    expect(pool_placement(4, PoolHostCore::Last, cores, 1), {6, 0, 2, 4},
+           "last: the caller on the last core, the workers before it");
+    expect(pool_placement(5, PoolHostCore::Last, cores, 1), {6, 0, 2, 4, -1},
+           "last: no worker shares the caller's core");
+    expect(pool_placement(4, PoolHostCore::Sibling, cores, 1), {1, 0, 2, 4},
+           "sibling: the caller on the first core's second thread, the workers from the first core");
+    expect(pool_placement(6, PoolHostCore::Sibling, cores, 1), {1, 0, 2, 4, 6, -1},
+           "sibling: every core gets a worker before any goes unpinned");
+    expect(pool_placement(4, PoolHostCore::Sibling, cores, -1), {0, 2, 4, 6},
+           "sibling without a second thread: first's placement");
+    expect(pool_placement(3, PoolHostCore::Last, std::vector<int>{0}, -1), {0, -1, -1},
+           "last on one core: first's placement");
+    expect(pool_placement(0, PoolHostCore::Last, cores, 1), {6}, "a pool of 0 threads is its caller");
+    // This machine: a sibling is another CPU of the same core, never the CPU itself.
+    const std::vector<int> here = physical_core_cpus();
+    const int sibling           = smt_sibling(here.front());
+    require(sibling != here.front(), "a CPU is not its own sibling");
+    require(std::find(here.begin(), here.end(), sibling) == here.end(),
+            "a sibling is not another core's first CPU");
+    for (const PoolHostCore host : {PoolHostCore::First, PoolHostCore::Last, PoolHostCore::Sibling}) {
+        CpuSpinPool workers(3, true, host);
+        const std::vector<int> want = pool_placement(3, host, here, smt_sibling(here.front()));
+        require(workers.caller_cpu() == want.front(), "the pool's caller sits where planned");
+        std::atomic<int> ran{0};
+        workers.run(64, [&](std::size_t) { ran.fetch_add(1); });
+        require(ran.load() == 64, "a placed pool runs every index");
+    }
+    require(CpuSpinPool(3, false, PoolHostCore::Last).caller_cpu() == -1,
+            "an unpinned pool's caller stays where it runs");
+}
+
 // Row tasks cover every row of every part once, stay in their part, start at a multiple of the
 // quantum and give a phase of one or two experts about three tasks per thread.
 void rows() {
@@ -454,6 +497,7 @@ int main() {
         tier_matches_whole_sort();
         split();
         pool();
+        placement();
         rows();
         std::cout << "PASS expert tier, split and pool\n";
         return 0;

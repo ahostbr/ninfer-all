@@ -81,16 +81,34 @@ struct RowTask {
 [[nodiscard]] std::vector<RowTask> row_tasks(std::span<const RowPart> parts, std::uint32_t threads,
                                              int quantum);
 
+// Fork T1320: which logical CPU a pinned pool's calling thread takes (edge0-strata's
+// STRATA_HOST_CORE, docs/DETAILS.md:1042). First: the first physical core, the workers the next
+// ones (the placement before T1320). Last: the last physical core, the workers the ones before
+// it. Sibling: the first core's other hardware thread, the workers every physical core from the
+// first (First's placement where the first core has no second thread).
+enum class PoolHostCore : std::uint8_t { First, Last, Sibling };
+
+// Another logical CPU of `cpu`'s physical core, or -1 (no second hardware thread, or no topology).
+[[nodiscard]] int smt_sibling(int cpu);
+
+// The logical CPUs a pinned pool of `threads` puts its calling thread (element 0) and its workers
+// (the rest, in order) on; -1 leaves a thread unpinned (more threads than physical cores).
+[[nodiscard]] std::vector<int> pool_placement(std::uint32_t threads, PoolHostCore host,
+                                              std::span<const int> cores, int first_sibling);
+
 class CpuSpinPool {
 public:
-    // `threads` counts the calling thread: threads - 1 workers. `pin`: one physical core each.
-    CpuSpinPool(std::uint32_t threads, bool pin);
+    // `threads` counts the calling thread: threads - 1 workers. `pin`: one physical core each,
+    // the calling thread placed by `host`.
+    CpuSpinPool(std::uint32_t threads, bool pin, PoolHostCore host = PoolHostCore::First);
     ~CpuSpinPool();
     CpuSpinPool(const CpuSpinPool&)            = delete;
     CpuSpinPool& operator=(const CpuSpinPool&) = delete;
 
     [[nodiscard]] std::uint32_t threads() const noexcept { return std::uint32_t(workers_.size()) + 1; }
     [[nodiscard]] bool pinned() const noexcept { return pinned_; }
+    // The logical CPU the calling thread pins itself to, or -1 (unpinned).
+    [[nodiscard]] int caller_cpu() const noexcept { return caller_cpu_; }
 
     // When the latest run()'s last job ended (steady clock), on whichever thread ran it; stamped
     // before run() returns.

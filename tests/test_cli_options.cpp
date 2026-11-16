@@ -344,6 +344,40 @@ int run_tests() {
                               !off_after.hybrid_experts.host_graphs,
                           "CLI did not parse --expert-host-graphs as an opt-in switch");
     }
+    {
+        // Fork T1320: --expert-cache-free cuda|min (default cuda) and --expert-host-core
+        // first|last|sibling (default first); the last given wins.
+        const auto plain = parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+            "--expert-residency", "host"});
+        const auto min = parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+            "--expert-residency", "host", "--expert-cache-free", "min"});
+        const auto back = parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+            "--expert-cache-free", "min", "--expert-cache-free", "cuda"});
+        failures += check(!plain.hybrid_experts.cache_free_nvml && min.hybrid_experts.cache_free_nvml &&
+                              !back.hybrid_experts.cache_free_nvml,
+                          "CLI did not parse --expert-cache-free");
+        const auto last = parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+            "--expert-residency", "host", "--expert-host-core", "last"});
+        const auto sibling = parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+            "--expert-host-core", "last", "--expert-host-core", "sibling"});
+        const auto first = parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+            "--expert-host-core", "sibling", "--expert-host-core", "first"});
+        failures += check(plain.hybrid_experts.host_core == ninfer::ExpertHostCore::First &&
+                              last.hybrid_experts.host_core == ninfer::ExpertHostCore::Last &&
+                              sibling.hybrid_experts.host_core == ninfer::ExpertHostCore::Sibling &&
+                              first.hybrid_experts.host_core == ninfer::ExpertHostCore::First,
+                          "CLI did not parse --expert-host-core");
+        for (const auto* figure : {"nvml", "Min", "", "cuda,min"}) {
+            failures += check(rejects([&] {
+                (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--expert-cache-free", figure});
+            }), "CLI accepted an invalid --expert-cache-free");
+        }
+        for (const auto* core : {"0", "Last", "second", ""}) {
+            failures += check(rejects([&] {
+                (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--expert-host-core", core});
+            }), "CLI accepted an invalid --expert-host-core");
+        }
+    }
     for (const auto* share : {"-0.1", "1.1", "nan", "inf", "0.5x", "Auto"}) {
         failures += check(rejects([&] {
             (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--expert-dma-share", share});

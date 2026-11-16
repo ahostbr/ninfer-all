@@ -16,6 +16,7 @@
 #include "core/qtype.h"
 #include "core/stage_link.h"
 #include "core/tensor_parallel.h"
+#include "core/vram_free.h"
 #include "core/weight_view.h"
 #include "ninfer/ops/target_logprobs.h"
 #include "models/qwen4_exp/dflash2.h"
@@ -1307,6 +1308,15 @@ struct Executor::Impl {
              options.hybrid_experts.mapped_misses)) {
             throw std::invalid_argument(
                 "--expert-tail-skip needs GGUF host experts with staged misses");
+        }
+        // Fork T1320: the placement is the GGUF misses' pool's (ExpertMisses); native experts'
+        // pool keeps its own.
+        if (options.hybrid_experts.host_core != ExpertHostCore::First &&
+            (residency == ExpertResidency::Device || native_host)) {
+            throw std::invalid_argument("--expert-host-core needs GGUF host or disk experts");
+        }
+        if (options.hybrid_experts.cache_free_nvml && residency == ExpertResidency::Device) {
+            throw std::invalid_argument("--expert-cache-free needs host or disk experts");
         }
         if (options.hybrid_experts.prefill_buffers != 0 &&
             (residency != ExpertResidency::Host || native_host)) {
@@ -2685,8 +2695,9 @@ struct Executor::Impl {
         std::vector<std::uint64_t> bytes(device.size(), 0);
         for (std::size_t r = 0; r < device.size(); ++r) {
             RankBinding bind(device, r);
-            std::size_t free_bytes = 0, total = 0;
-            CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total));
+            // Fork T1320: --expert-cache-free min takes the smaller of CUDA's and NVML's figures.
+            const std::uint64_t free_bytes =
+                read_vram_free().for_cache(options.hybrid_experts.cache_free_nvml);
             const std::uint64_t available = free_bytes > kMargin ? free_bytes - kMargin : 0;
             bytes[r] = options.expert_cache_bytes == ExecutorOptions::kAutoExpertCache
                            ? available
@@ -2881,6 +2892,7 @@ struct Executor::Impl {
         miss.cpu_balance    = !options.hybrid_experts.dma_share && !options.hybrid_experts.mapped_misses;
         miss.cpu_share      = miss.cpu_balance ? 0.0 : 1.0 - double(options.hybrid_experts.dma_share.value_or(1.0F));
         miss.cpu_threads    = options.hybrid_experts.cpu_threads;
+        miss.host_core      = options.hybrid_experts.host_core;
         miss.staging_bytes  = kStagingBytes;
         miss.tail_skip_rank = options.hybrid_experts.tail_skip_rank;
         miss.in_place       = in_place;
@@ -6299,8 +6311,9 @@ struct Executor::Impl {
         for (std::size_t r = 0; r < device.size(); ++r) {
             RankBinding bind(device, r);
             CUDA_CHECK(ninfer::wait_for_device());
-            std::size_t free_bytes = 0, total = 0;
-            CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total));
+            // Fork T1320: --expert-cache-free min takes the smaller of CUDA's and NVML's figures.
+            const std::uint64_t free_bytes =
+                read_vram_free().for_cache(options.hybrid_experts.cache_free_nvml);
             bytes[r] = free_bytes > keep ? free_bytes - keep : 0;
         }
         const auto added = cache    ? cache->grow(bytes)

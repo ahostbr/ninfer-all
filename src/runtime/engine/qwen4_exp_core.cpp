@@ -11,6 +11,7 @@
 #include "core/pinned_memory.h"
 #include "core/startup.h"
 #include "core/tensor_parallel.h"
+#include "core/vram_free.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/program/vision_control.h"
 #include "models/qwen4_exp/ngram_component.h"
@@ -434,6 +435,34 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     }
     instance->free_after_weights = free_after_weights;
     instance->free_after_startup = free_bytes();
+    // Fork T1320: what the device has free once startup is done, by CUDA and by NVML, and the
+    // figure the expert cache sized from (--expert-cache-free). Under WDDM CUDA's figure leaves out
+    // what other processes hold, and a card filled to its end pages device memory to system RAM.
+    if (options.expert_residency != ExpertResidency::Device) {
+        RankBinding bind(device, 0);
+        const VramFree free     = read_vram_free();
+        const bool nvml_min     = options.hybrid_experts.cache_free_nvml;
+        const double chosen_mib = double(free.for_cache(nvml_min)) / 1048576.0;
+        const std::string nvml  = free.nvml ? std::to_string(std::llround(double(*free.nvml) / 1048576.0)) +
+                                                 " MiB (the whole card)"
+                                            : "unavailable (" + free.nvml_problem + ")";
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "Qwen3.8-Flash-Next: VRAM free after startup: CUDA %.0f MiB, NVML %s; "
+                           "the expert cache (%.0f MiB) sized from %s (--expert-cache-free %s)",
+                           double(free.cuda) / 1048576.0, nvml.c_str(),
+                           double(instance->executor->memory().expert_cache_bytes) / 1048576.0,
+                           nvml_min && free.nvml ? "the smaller figure" : "CUDA's figure",
+                           nvml_min ? "min" : "cuda");
+        if (serialized_copy_queue() && chosen_mib < 1024.0) {
+            publish_diagnostic(
+                options.diagnostic_observer, DiagnosticLevel::Warning,
+                "Qwen3.8-Flash-Next: %.0f MiB of VRAM free after startup, under 1 GiB: on this driver "
+                "model the driver may page device memory to system RAM, which slows decoding "
+                "sharply (edge0-strata measured up to 7x at 0 MiB free); an explicit, smaller "
+                "--expert-cache-mib leaves more free",
+                chosen_mib);
+        }
+    }
     std::string table_place      = has_ple ? "off" : "not used (no PLE layers)";
     if (!table.disabled && has_ple) {
         const std::string file = table.path.empty() ? "the artifact" : "its table artifact";

@@ -459,6 +459,13 @@ struct HybridExpertOptions {
     // copied from there as host experts are; every other expert is read from the files. 0
     // (default): every expert is read from the files.
     std::uint64_t expert_host_bytes = 0;
+    // Fork T1320: Qwen3.8-Flash-Next / Edge0 host and disk experts size the automatic expert cache
+    // from the smaller of CUDA's and NVML's free device memory (core/vram_free.h, as edge0-strata's
+    // opt-in STRATA_VRAM_FREE=device); false (default): CUDA's figure, as before.
+    bool cache_free_nvml = false;
+    // Fork T1320: Qwen3.8-Flash-Next / Edge0 host and disk experts: the logical CPU the CPU pool's
+    // own thread takes (ExpertHostCore; First, the default, is the placement before T1320).
+    ExpertHostCore host_core = ExpertHostCore::First;
 };
 
 // The n-gram table of Qwen3.8-Flash-Next's per-layer embedding or DeepSeek-V4.1-Flash's Engram: the

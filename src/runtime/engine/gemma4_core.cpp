@@ -148,6 +148,10 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
         throw std::invalid_argument("Gemma 4 has no mapped misses, tail skip, prefill buffers, host "
                                     "graphs or adaptive expert cache (Qwen3.8-Flash-Next options)");
     }
+    if (hybrid.cache_free_nvml || hybrid.host_core != ExpertHostCore::First) {
+        throw std::invalid_argument("Gemma 4 has no --expert-cache-free or --expert-host-core "
+                                    "(Qwen3.8-Flash-Next / Edge0 options)");
+    }
     if (options.expert_residency == ExpertResidency::Device &&
         (hybrid.dma_share || hybrid.cpu_threads != 0 || !hybrid.routing_profile.empty() ||
          !hybrid.record_profile.empty())) {

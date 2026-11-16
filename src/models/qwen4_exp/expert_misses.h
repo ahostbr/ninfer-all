@@ -31,6 +31,7 @@
 #include "core/weight.h"
 #include "models/qwen4_exp/expert_cache.h"
 #include "models/qwen4_exp/expert_location.h"
+#include "ninfer/model_enums.h"
 #include "ninfer/ops/moe_experts.h"
 
 #include <array>
@@ -97,6 +98,8 @@ struct MissOptions {
     // its CPU products end soonest, by times fitted to the earlier requests.
     bool cpu_balance             = false;
     std::uint32_t cpu_threads    = 0;    // 0: one per physical core (pool_cpu_count())
+    // Fork T1320 (--expert-host-core): the logical CPU of the pool's own thread, this service's.
+    ExpertHostCore host_core     = ExpertHostCore::First;
     // Device staging per rank, two halves. Disk experts also take pinned file staging of two
     // halves, each the larger of a device half and a narrow call's every missing expert.
     std::uint64_t staging_bytes = 128ULL << 20;

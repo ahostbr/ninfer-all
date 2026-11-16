@@ -52,7 +52,14 @@ inline constexpr const char* kHybridExpertHelp =
     "                                runs (default 2 with the automatic cache, which holds them\n"
     "                                as expert cache slots between prompts, else 1)\n"
     "  --expert-cache-adaptive       replace cold cached experts between calls;\n"
-    "                                changes the CPU/GPU arithmetic partition\n";
+    "                                changes the CPU/GPU arithmetic partition\n"
+    "  --expert-cache-free cuda|min  size the automatic expert cache from CUDA's free\n"
+    "                                memory (default) or the smaller of CUDA's and NVML's\n"
+    "                                (Windows WDDM: CUDA's leaves out other processes)\n"
+    "  --expert-host-core first|last|sibling\n"
+    "                                the logical CPU of the CPU pool's own thread: the first\n"
+    "                                physical core (default), the last one, or the first\n"
+    "                                core's second hardware thread\n";
 
 template<class Value>
 bool parse_hybrid_expert_option(std::string_view option, HybridExpertOptions& out, Value&& value) {
@@ -119,6 +126,26 @@ bool parse_hybrid_expert_option(std::string_view option, HybridExpertOptions& ou
                              [&](bool on) { out.adaptive_cache = on; })) {
     } else if (switch_option(option, "expert-host-graphs",
                              [&](bool on) { out.host_graphs = on; })) {
+    } else if (option == "--expert-cache-free") {
+        const std::string_view figure(value());
+        if (figure == "cuda") {
+            out.cache_free_nvml = false;
+        } else if (figure == "min") {
+            out.cache_free_nvml = true;
+        } else {
+            throw std::invalid_argument("--expert-cache-free takes cuda or min");
+        }
+    } else if (option == "--expert-host-core") {
+        const std::string_view core(value());
+        if (core == "first") {
+            out.host_core = ExpertHostCore::First;
+        } else if (core == "last") {
+            out.host_core = ExpertHostCore::Last;
+        } else if (core == "sibling") {
+            out.host_core = ExpertHostCore::Sibling;
+        } else {
+            throw std::invalid_argument("--expert-host-core takes first, last or sibling");
+        }
     } else if (option == "--expert-host-mib") {
         const std::string text(value());
         std::uint32_t mib = 0;

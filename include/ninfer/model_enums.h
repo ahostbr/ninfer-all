@@ -84,6 +84,20 @@ enum class ExpertDirect : std::uint8_t {
     Off,
 };
 
+// Fork T1320: which logical CPU the CPU expert pool's own thread takes (the misses' service
+// thread, which answers the graphs' waits and computes a share of the misses itself); the workers
+// take one physical core each of the rest. edge0-strata's STRATA_HOST_CORE (docs/DETAILS.md:1042).
+enum class ExpertHostCore : std::uint8_t {
+    // The first physical core, the workers the following ones (the default, as before).
+    First,
+    // The last physical core, away from the first core, which tends to take the GPU's
+    // interrupts; the workers the cores before it.
+    Last,
+    // The first core's other hardware thread, so the workers keep every physical core from the
+    // first on; First's placement where the first core has no second hardware thread.
+    Sibling,
+};
+
 // Qwen3.5-core tensor parallelism: how the devices divide a full-attention layer.
 enum class TensorAttention : std::uint8_t {
     // Each device holds a run of the KV heads with their cache and query heads; devices past the

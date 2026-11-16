@@ -171,17 +171,79 @@ void spin_hint() noexcept {
 #endif
 }
 
-CpuSpinPool::CpuSpinPool(std::uint32_t threads, bool pin) {
-    std::vector<int> cpus;
+int smt_sibling(int cpu) {
+    if (cpu < 0) { return -1; }
+#ifdef __linux__
+    const long package = topology(cpu, "physical_package_id");
+    const long core    = topology(cpu, "core_id");
+    if (core < 0) { return -1; }
+    for (const int other : allowed_cpus()) {
+        if (other != cpu && topology(other, "physical_package_id") == package &&
+            topology(other, "core_id") == core) {
+            return other;
+        }
+    }
+#elif defined(_WIN32)
+    DWORD length = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &length);
+    std::vector<char> buffer(length);
+    if (length != 0 &&
+        GetLogicalProcessorInformationEx(
+            RelationProcessorCore,
+            reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data()), &length)) {
+        for (DWORD at = 0; at < length;) {
+            const auto* entry =
+                reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data() + at);
+            const GROUP_AFFINITY& group = entry->Processor.GroupMask[0];
+            if (int(group.Group) == cpu / 64 && (group.Mask & (KAFFINITY(1) << (cpu % 64)))) {
+                for (int bit = 0; bit < 64; ++bit) {
+                    if (bit != cpu % 64 && (group.Mask & (KAFFINITY(1) << bit))) {
+                        return int(group.Group) * 64 + bit;
+                    }
+                }
+                return -1;
+            }
+            at += entry->Size;
+        }
+    }
+#endif
+    return -1;
+}
+
+std::vector<int> pool_placement(std::uint32_t threads, PoolHostCore host,
+                                std::span<const int> cores, int first_sibling) {
+    const std::size_t count = std::max(1U, threads);
+    // More threads than physical cores: the rest go unpinned rather than onto a busy core.
+    const auto core_of = [&](std::size_t i) { return i < cores.size() ? cores[i] : -1; };
+    std::vector<int> out(count, -1);
+    if (host == PoolHostCore::Last && cores.size() >= 2) {
+        out[0] = cores.back();
+        for (std::size_t i = 1; i < count; ++i) {
+            out[i] = i - 1 < cores.size() - 1 ? cores[i - 1] : -1;
+        }
+        return out;
+    }
+    if (host == PoolHostCore::Sibling && first_sibling >= 0 && !cores.empty()) {
+        out[0] = first_sibling;
+        for (std::size_t i = 1; i < count; ++i) { out[i] = core_of(i - 1); }
+        return out;
+    }
+    for (std::size_t i = 0; i < count; ++i) { out[i] = core_of(i); }
+    return out;
+}
+
+CpuSpinPool::CpuSpinPool(std::uint32_t threads, bool pin, PoolHostCore host) {
+    std::vector<int> cpus(std::max(1U, threads), -1);
     if (pin) {
-        cpus = physical_core_cpus();
-        // More threads than physical cores: the rest go unpinned rather than onto a busy core.
+        const std::vector<int> cores = physical_core_cpus();
+        const int sibling =
+            host == PoolHostCore::Sibling && !cores.empty() ? smt_sibling(cores.front()) : -1;
+        cpus    = pool_placement(threads, host, cores, sibling);
         pinned_ = true;
     }
-    const auto cpu_of = [&](std::size_t i) { return i < cpus.size() ? cpus[i] : -1; };
-    caller_cpu_ = cpu_of(0);
-    for (std::uint32_t i = 1; i < std::max(1U, threads); ++i) {
-        const int cpu = cpu_of(i);
+    caller_cpu_ = cpus[0];
+    for (std::size_t i = 1; i < cpus.size(); ++i) {
+        const int cpu = cpus[i];
         workers_.emplace_back([this, cpu] { work(cpu); });
     }
 }

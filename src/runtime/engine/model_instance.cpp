@@ -583,9 +583,14 @@ void install_device_route_profile_on(const EngineOptions& options, int device) {
         const auto compiled = compiled_device_route_profile(hardware_class, multiprocessors);
         profile = compiled ? layer_device_route_profiles(entry.profile, *compiled) : entry.profile;
     }
+    // The profile's origin is its tuning history (who measured it, when, at what power): a
+    // debugging fact, not something the person starting an engine needs in the startup log.
     publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
-                       "device profile %s: %zu routed keys (%s)", hardware_class.c_str(),
-                       profile->routes.size(), profile->origin.c_str());
+                       "device profile %s: %zu routed keys", hardware_class.c_str(),
+                       profile->routes.size());
+    publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Debug,
+                       "device profile %s origin: %s", hardware_class.c_str(),
+                       profile->origin.c_str());
     ops::install_device_route_profile(
         device, std::make_shared<const ops::DeviceRouteProfile>(std::move(*profile)));
 }
